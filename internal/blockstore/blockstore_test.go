@@ -90,22 +90,37 @@ func TestMidFillUnblock(t *testing.T) {
 	size := int64(32) * mib
 	bs := newStore(t, srv, Config{BlockSize: 32 << 20, MaxRange: 32 << 20})
 
-	go bs.Prefetch(context.Background(), k, 0, size) // slow fill of chunks 0..31
-	time.Sleep(40 * time.Millisecond)                // let the prefetch claim all chunks
+	// Ordering assertion (robust to absolute machine/runner speed): chunk 20
+	// completes before the whole run (chunk 31) does, because it lands earlier
+	// in the same stream. Per-chunk sleeps are wall-clock, so chunk 20 also
+	// cannot complete "instantly" — it must have waited for streaming.
+	var prefetchDone time.Time
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bs.Prefetch(context.Background(), k, 0, size) // slow fill of chunks 0..31
+		prefetchDone = time.Now()
+	}()
+	time.Sleep(40 * time.Millisecond) // let the prefetch claim all chunks
 
 	start := time.Now()
 	data, err := bs.GetRange(context.Background(), k, 20*mib, 4096, size)
-	elapsed := time.Since(start)
+	demandDone := time.Now()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if data[0] != 20 {
 		t.Errorf("chunk 20 data = %d", data[0])
 	}
-	// Chunk 20 lands ~20*12ms=240ms; the full run finishes ~31*12ms=372ms. The
-	// demand must return well before the run completes.
-	if elapsed > 26*12*time.Millisecond {
-		t.Errorf("demand for chunk 20 took %v; should unblock before the run finishes (~%v)", elapsed, 31*12*time.Millisecond)
+	wg.Wait()
+	if !demandDone.Before(prefetchDone) {
+		t.Errorf("demand for chunk 20 finished at %v but the full run finished at %v; chunk 20 should unblock mid-fill",
+			demandDone.Sub(start), prefetchDone.Sub(start))
+	}
+	// Chunk 20 needs ~20 per-chunk sleeps to land; it must have actually waited.
+	if got := demandDone.Sub(start); got < 8*srv.StreamChunkDelay {
+		t.Errorf("demand for chunk 20 returned in %v; expected to wait for streaming", got)
 	}
 	if srv.GetCalls != 1 {
 		t.Errorf("GetCalls=%d, want 1 (demand joined the in-flight fill)", srv.GetCalls)
