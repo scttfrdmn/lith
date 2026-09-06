@@ -41,4 +41,8 @@ type API interface {
 	// GetObject returns a reader for [off, off+length) of key. A length <= 0
 	// reads to the end of the object.
 	GetObject(ctx context.Context, key string, off, length int64) (io.ReadCloser, error)
+	// GetRange reads [off, off+length) of key fully into memory and returns the
+	// bytes together with the object's ETag (used for immutability checks). A
+	// length <= 0 reads to the end of the object.
+	GetRange(ctx context.Context, key string, off, length int64) (data []byte, etag string, err error)
 }

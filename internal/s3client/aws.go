@@ -202,6 +202,32 @@ func (c *Client) GetObject(ctx context.Context, key string, off, length int64) (
 	return out.Body, nil
 }
 
+// GetRange reads [off, off+length) of key into memory and returns the bytes
+// and the object's ETag.
+func (c *Client) GetRange(ctx context.Context, key string, off, length int64) ([]byte, string, error) {
+	var rng *string
+	if length > 0 {
+		rng = aws.String(fmt.Sprintf("bytes=%d-%d", off, off+length-1))
+	} else if off > 0 {
+		rng = aws.String(fmt.Sprintf("bytes=%d-", off))
+	}
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:       &c.bucket,
+		Key:          &key,
+		Range:        rng,
+		RequestPayer: c.payer(),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = out.Body.Close() }()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, aws.ToString(out.ETag), nil
+}
+
 func ptrOrNil(s string) *string {
 	if s == "" {
 		return nil

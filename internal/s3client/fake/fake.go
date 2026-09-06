@@ -38,6 +38,9 @@ type Server struct {
 	ListCalls int
 	GetCalls  int
 	HeadCalls int
+	// GetDelay, if set, is slept inside GetObject/GetRange to widen the
+	// in-flight window for singleflight tests.
+	GetDelay time.Duration
 }
 
 // New returns an empty fake server.
@@ -153,6 +156,37 @@ func (s *Server) GetObject(_ context.Context, key string, off, length int64) (io
 		end = off + length
 	}
 	return io.NopCloser(bytes.NewReader(o.data[off:end])), nil
+}
+
+// GetRange reads [off, off+length) of key into memory and returns the bytes and
+// the object's ETag.
+func (s *Server) GetRange(_ context.Context, key string, off, length int64) ([]byte, string, error) {
+	s.mu.Lock()
+	s.GetCalls++
+	delay := s.GetDelay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	o, ok := s.objs[key]
+	if !ok {
+		return nil, "", &NotFoundError{Key: key}
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off > int64(len(o.data)) {
+		off = int64(len(o.data))
+	}
+	end := int64(len(o.data))
+	if length > 0 && off+length < end {
+		end = off + length
+	}
+	out := make([]byte, end-off)
+	copy(out, o.data[off:end])
+	return out, o.etag, nil
 }
 
 // NotFoundError is returned for a missing key.
