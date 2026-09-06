@@ -22,5 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project documentation: `README`, `CONTRIBUTING`, `SECURITY`,
   `CODE_OF_CONDUCT`, issue templates, and a pull-request template.
 - Dependabot configuration for Go modules and GitHub Actions.
+- Namespace index: an immutable, sorted-arena snapshot of a bucket with local
+  `Lookup`, `Stat`, and constant-memory paginated `Readdir`; directory
+  structure is derived from sorted keys rather than stored. Includes POSIX key
+  sanitization, directory-shadows-object resolution, xxh3 inode assignment with
+  collision fallback, and a versioned, memory-mappable on-disk format.
+- Index builders: from a paginated `ListObjectsV2` pass (with optional
+  concurrent prefix sharding) and from an S3 Inventory manifest (CSV).
+- Tuned aws-sdk-go-v2 S3 client: region resolved from the bucket, HTTP/1.1 with
+  a large keep-alive connection pool, and `--no-sign-request`,
+  `--requester-pays`, `--endpoint`, and `--path-style` options.
+- `lith index build|refresh|inspect` commands.
+- In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
+  unit tests, which run with the race detector and touch no network.
 
 [Unreleased]: https://github.com/scttfrdmn/lith/commits/main
