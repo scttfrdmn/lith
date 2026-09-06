@@ -14,11 +14,14 @@ import (
 // compatibility promise before v1 (see the pinned Design issue, §10). Numeric
 // arrays are stored in host byte order so a built index can be memory-mapped
 // and queried without copying; a mismatched byte order is rejected on load.
+//
+// v2 adds the directory table (sorted dir paths, per-directory inodes and
+// mtimes). v1 files are rejected with a message to rebuild.
 
 const (
 	magic       = "LITHIDX1"
-	formatVer   = uint32(1)
-	headerSize  = 48 // magic(8)+ver(4)+flags(4)+keyCount(8)+dropped(8)+shadowed(8)+collisions(8)
+	formatVer   = uint32(2)
+	headerSize  = 56 // magic(8)+ver(4)+flags(4)+keyCount(8)+dropped(8)+shadowed(8)+collisions(8)+dirCount(8)
 	flagExec    = uint32(1) << 0
 	byteOrderLE = 0
 	byteOrderBE = 1
@@ -35,9 +38,10 @@ func hostByteOrder() uint32 {
 
 func align8(n int) int { return (n + 7) &^ 7 }
 
-// Marshal serializes the index to a byte slice in the v1 format.
+// Marshal serializes the index to a byte slice in the current format.
 func (ix *Index) Marshal() []byte {
 	n := ix.Len()
+	m := ix.dirCount()
 	ne := binary.NativeEndian
 
 	flags := hostByteOrder() << 1
@@ -61,7 +65,15 @@ func (ix *Index) Marshal() []byte {
 	etagsAt := off
 	off += n * 8
 	inosAt := off
-	off += n * 8
+	off = align8(inosAt + n*8)
+	dirArenaAt := off + 8 // dirArenaLen(8) precedes the bytes
+	off = align8(dirArenaAt + len(ix.dirArena))
+	dirOffsAt := off
+	off = align8(dirOffsAt + (m+1)*4)
+	dirMtimesAt := off
+	off += m * 8
+	dirInosAt := off
+	off += m * 8
 
 	buf := make([]byte, off)
 	copy(buf[0:8], magic)
@@ -71,6 +83,7 @@ func (ix *Index) Marshal() []byte {
 	ne.PutUint64(buf[24:], ix.dropped)
 	ne.PutUint64(buf[32:], ix.shadowed)
 	ne.PutUint64(buf[40:], ix.collisions)
+	ne.PutUint64(buf[48:], uint64(m))
 
 	p := headerSize
 	ne.PutUint32(buf[p:], uint32(len(ix.bucket)))
@@ -83,23 +96,24 @@ func (ix *Index) Marshal() []byte {
 
 	ne.PutUint64(buf[arenaAt-8:], uint64(len(ix.arena)))
 	copy(buf[arenaAt:], ix.arena)
-
 	copyU32(buf[offsAt:], ix.offs)
 	copyU64(buf[sizesAt:], ix.sizes)
 	copyI64(buf[mtimesAt:], ix.mtimes)
 	copyU64(buf[etagsAt:], ix.etags)
 	copyU64(buf[inosAt:], ix.inos)
+
+	ne.PutUint64(buf[dirArenaAt-8:], uint64(len(ix.dirArena)))
+	copy(buf[dirArenaAt:], ix.dirArena)
+	copyU32(buf[dirOffsAt:], ix.dirOffs)
+	copyI64(buf[dirMtimesAt:], ix.dirMtimes)
+	copyU64(buf[dirInosAt:], ix.dirInos)
 	return buf
 }
 
-// Unmarshal parses a v1 index image into a new, heap-owned Index (the arrays
-// are copied out of b).
+// Unmarshal parses an index image into a new, heap-owned Index (the arrays are
+// copied out of b).
 func Unmarshal(b []byte) (*Index, error) {
-	ix, err := parse(b, true)
-	if err != nil {
-		return nil, err
-	}
-	return ix, nil
+	return parse(b, true)
 }
 
 // Save writes the index to path atomically (temp file + rename).
@@ -121,9 +135,8 @@ func (ix *Index) Save(path string) error {
 	return os.Rename(tmpName, path)
 }
 
-// parse reads a v1 image. When copyOut is true the arrays are copied so they
-// do not alias b; otherwise they point directly into b (used by the mmap
-// loader).
+// parse reads an index image. When copyOut is true the arrays are copied so
+// they do not alias b; otherwise they point directly into b (mmap loader).
 func parse(b []byte, copyOut bool) (*Index, error) {
 	if len(b) < headerSize {
 		return nil, fmt.Errorf("index: image too small (%d bytes)", len(b))
@@ -133,13 +146,14 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 	}
 	ne := binary.NativeEndian
 	if v := ne.Uint32(b[8:]); v != formatVer {
-		return nil, fmt.Errorf("index: unsupported format version %d", v)
+		return nil, fmt.Errorf("index: unsupported format version %d (this build writes v%d); rebuild the index with `lith index build`", v, formatVer)
 	}
 	flags := ne.Uint32(b[12:])
 	if (flags>>1)&1 != hostByteOrder() {
-		return nil, fmt.Errorf("index: image byte order does not match host")
+		return nil, fmt.Errorf("index: image byte order does not match host; rebuild the index")
 	}
 	n := int(ne.Uint64(b[16:]))
+	m := int(ne.Uint64(b[48:]))
 
 	ix := &Index{
 		execMode:   flags&flagExec != 0,
@@ -171,7 +185,17 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 	etagsAt := p
 	p += n * 8
 	inosAt := p
-	p += n * 8
+	p = align8(inosAt + n*8)
+
+	dirArenaLen := int(ne.Uint64(b[p:]))
+	dirArenaAt := p + 8
+	p = align8(dirArenaAt + dirArenaLen)
+	dirOffsAt := p
+	p = align8(dirOffsAt + (m+1)*4)
+	dirMtimesAt := p
+	p += m * 8
+	dirInosAt := p
+	p += m * 8
 	if len(b) < p {
 		return nil, fmt.Errorf("index: image truncated (want %d, have %d)", p, len(b))
 	}
@@ -183,6 +207,10 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 		ix.mtimes = append([]int64(nil), asI64(b[mtimesAt:], n)...)
 		ix.etags = append([]uint64(nil), asU64(b[etagsAt:], n)...)
 		ix.inos = append([]uint64(nil), asU64(b[inosAt:], n)...)
+		ix.dirArena = append([]byte(nil), b[dirArenaAt:dirArenaAt+dirArenaLen]...)
+		ix.dirOffs = append([]uint32(nil), asU32(b[dirOffsAt:], m+1)...)
+		ix.dirMtimes = append([]int64(nil), asI64(b[dirMtimesAt:], m)...)
+		ix.dirInos = append([]uint64(nil), asU64(b[dirInosAt:], m)...)
 	} else {
 		ix.arena = b[arenaAt : arenaAt+arenaLen]
 		ix.offs = asU32(b[offsAt:], n+1)
@@ -190,6 +218,10 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 		ix.mtimes = asI64(b[mtimesAt:], n)
 		ix.etags = asU64(b[etagsAt:], n)
 		ix.inos = asU64(b[inosAt:], n)
+		ix.dirArena = b[dirArenaAt : dirArenaAt+dirArenaLen]
+		ix.dirOffs = asU32(b[dirOffsAt:], m+1)
+		ix.dirMtimes = asI64(b[dirMtimesAt:], m)
+		ix.dirInos = asU64(b[dirInosAt:], m)
 	}
 	return ix, nil
 }

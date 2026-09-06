@@ -55,6 +55,16 @@ type Index struct {
 	etags  []uint64
 	inos   []uint64
 
+	// Directory table (format v2): every directory, including the root (""),
+	// sorted by relative path. Inodes are drawn from the same collision
+	// namespace as file inodes; mtimes are the max LastModified over each
+	// directory's descendants (falling back to buildTime).
+	dirArena  []byte
+	dirOffs   []uint32
+	dirMtimes []int64  // Unix nanoseconds
+	dirInos   []uint64 // parallel to the dir table
+	buildTime int64    // Unix nanoseconds; mtime fallback for empty directories
+
 	execMode bool // when true, files are 0555 instead of 0444
 
 	// Build statistics, surfaced by inspect.
@@ -94,6 +104,25 @@ func (ix *Index) lowerBound(s string) int {
 	})
 }
 
+// dirCount returns the number of directories in the table (includes root).
+func (ix *Index) dirCount() int { return len(ix.dirOffs) - 1 }
+
+// dirPath returns the relative directory path at table position i.
+func (ix *Index) dirPath(i int) string {
+	return string(ix.dirArena[ix.dirOffs[i]:ix.dirOffs[i+1]])
+}
+
+// dirLookup finds the directory table entry for the relative path rel ("" is
+// root) and returns its inode and mtime.
+func (ix *Index) dirLookup(rel string) (ino uint64, mtime int64, ok bool) {
+	n := ix.dirCount()
+	i := sort.Search(n, func(i int) bool { return ix.dirPath(i) >= rel })
+	if i < n && ix.dirPath(i) == rel {
+		return ix.dirInos[i], ix.dirMtimes[i], true
+	}
+	return 0, 0, false
+}
+
 // findExact returns the index of an exact key match and whether it was found.
 func (ix *Index) findExact(rel string) (int, bool) {
 	i := ix.lowerBound(rel)
@@ -103,15 +132,10 @@ func (ix *Index) findExact(rel string) (int, bool) {
 	return 0, false
 }
 
-// dirExists reports whether rel names a directory: either a stored folder
-// marker "rel/" exists, or some stored key has "rel/" as a prefix.
+// dirExists reports whether rel names a directory, per the directory table.
 func (ix *Index) dirExists(rel string) bool {
-	if rel == "" {
-		return true // root
-	}
-	p := rel + "/"
-	i := ix.lowerBound(p)
-	return i < ix.Len() && strings.HasPrefix(ix.key(i), p)
+	_, _, ok := ix.dirLookup(rel)
+	return ok
 }
 
 // Lookup resolves a path to its FileInfo. path is slash-rooted relative to the
@@ -151,19 +175,21 @@ func (ix *Index) fileInfo(i int) FileInfo {
 	}
 }
 
-// dirInfo builds the FileInfo for the directory named by rel ("" is root).
+// dirInfo builds the FileInfo for the directory named by rel ("" is root). The
+// inode and mtime come from the directory table; if the directory is somehow
+// absent from the table (should not happen for a valid path), the inode and
+// mtime fall back to the root inode and build time.
 func (ix *Index) dirInfo(rel string) FileInfo {
-	ino := rootIno
-	var mtime time.Time
-	if rel != "" {
-		ino = dirIno(ix.prefix + rel + "/")
+	ino, mtimeNs, ok := ix.dirLookup(rel)
+	if !ok {
+		ino, mtimeNs = rootIno, ix.buildTime
 	}
 	// nlink for a directory is 2 + number of immediate subdirectories.
 	subdirs := ix.countSubdirs(rel)
 	return FileInfo{
 		Ino:   ino,
 		Size:  0,
-		MTime: mtime,
+		MTime: time.Unix(0, mtimeNs),
 		Mode:  fs.ModeDir | 0o555,
 		IsDir: true,
 		Nlink: 2 + subdirs,
@@ -244,9 +270,10 @@ func (ix *Index) Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, e
 		}
 		if slash := strings.IndexByte(rem, '/'); slash >= 0 {
 			name := rem[:slash]
+			childIno, _, _ := ix.dirLookup(prefix + name)
 			out = append(out, Dirent{
 				Name:  name,
-				Ino:   dirIno(ix.prefix + prefix + name + "/"),
+				Ino:   childIno,
 				IsDir: true,
 			})
 			i = ix.skipDir(prefix, name)

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Index file format bumped to **v2**: the directory table now stores a
+  per-directory inode and mtime. v1 index files are rejected on load with a
+  message to rebuild.
+
+### Fixed
+
+- Directory and file inodes now share a single build-time collision namespace,
+  so a directory inode can no longer silently collide with a file inode;
+  colliding directory inodes take the sequential fallback.
+- Directory mtime is the maximum `LastModified` over the directory's entire
+  subtree (falling back to the index build time when no descendant is dated),
+  replacing the previous zero value.
+
 ### Added
 
 - Repository scaffold: Go module `github.com/scttfrdmn/lith`, internal package

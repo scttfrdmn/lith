@@ -224,16 +224,16 @@ func TestInodesUniqueAndDeterministic(t *testing.T) {
 }
 
 // TestInodeCollisionFallback exercises the probing path directly by seeding
-// the used set with the hash a key would receive.
+// the used set with the base hash an entry would receive.
 func TestInodeCollisionFallback(t *testing.T) {
 	ix := &Index{prefix: ""}
 	used := map[uint64]struct{}{0: {}, rootIno: {}}
-	want := HashETag("collide") // xxh3 of the exact string we'll assign
+	base := hashKey("collide")
 	// Pre-take the natural hash so the next assignment must probe.
-	used[want] = struct{}{}
-	got := ix.assignIno("collide", used)
-	if got == want {
-		t.Fatalf("expected probing away from taken hash %d", want)
+	used[base] = struct{}{}
+	got := ix.assignIno(base, used)
+	if got == base {
+		t.Fatalf("expected probing away from taken hash %d", base)
 	}
 	if ix.collisions != 1 {
 		t.Errorf("collisions = %d, want 1", ix.collisions)
