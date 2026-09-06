@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+version: 2
+
+project_name: lith
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: lith
+    main: ./cmd/lith
+    binary: lith
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/scttfrdmn/lith/internal/version.Version={{ .Version }}
+      - -X github.com/scttfrdmn/lith/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/scttfrdmn/lith/internal/version.Date={{ .Date }}
+
+archives:
+  - id: lith
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  prerelease: auto
