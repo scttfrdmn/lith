@@ -34,6 +34,10 @@ type Recorder interface {
 	Miss()
 	S3Get(bytes int64, err bool)
 	StaleKey(key string)
+	// PrefetchIssued is called when a block is prefetched; PrefetchHit when a
+	// demand read consumes a previously prefetched block (accuracy = hit/issued).
+	PrefetchIssued()
+	PrefetchHit()
 }
 
 // Key identifies an object plus the ETag hash recorded in the index.
@@ -71,8 +75,9 @@ type BlockStore struct {
 
 	rec Recorder
 
-	mu    sync.Mutex
-	stale map[string]struct{}
+	mu         sync.Mutex
+	stale      map[string]struct{}
+	prefetched map[string]struct{} // cache keys fetched by prefetch, not yet demand-read
 }
 
 // New builds a BlockStore over src.
@@ -93,17 +98,18 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		return nil, err
 	}
 	bs := &BlockStore{
-		src:       src,
-		bucket:    cfg.Bucket,
-		blockSize: cfg.BlockSize,
-		maxRange:  maxRange,
-		mem:       newMem2Q(cfg.MemCache),
-		disk:      disk,
-		flight:    newFlightGroup(),
-		sem:       make(chan struct{}, conc),
-		prefetch:  make(chan struct{}, max(1, conc/2)),
-		rec:       cfg.Recorder,
-		stale:     make(map[string]struct{}),
+		src:        src,
+		bucket:     cfg.Bucket,
+		blockSize:  cfg.BlockSize,
+		maxRange:   maxRange,
+		mem:        newMem2Q(cfg.MemCache),
+		disk:       disk,
+		flight:     newFlightGroup(),
+		sem:        make(chan struct{}, conc),
+		prefetch:   make(chan struct{}, max(1, conc/2)),
+		rec:        cfg.Recorder,
+		stale:      make(map[string]struct{}),
+		prefetched: make(map[string]struct{}),
 	}
 	return bs, nil
 }
@@ -117,19 +123,48 @@ func (bs *BlockStore) cacheKey(k Key, blockIdx int64) string {
 
 func bucketTag(b string) string { return b }
 
-// cachedBlock returns a block from the memory or disk tier, if present.
-func (bs *BlockStore) cachedBlock(k Key, blockIdx int64) ([]byte, bool) {
+// lookup returns a block from cache without recording metrics. tier is "mem",
+// "disk", or "" (miss); a disk hit is promoted to memory.
+func (bs *BlockStore) lookup(k Key, blockIdx int64) ([]byte, string) {
 	ck := bs.cacheKey(k, blockIdx)
 	if data, ok := bs.mem.Get(ck); ok {
-		bs.record(func(r Recorder) { r.MemHit() })
-		return data, true
+		return data, "mem"
 	}
 	if data, ok := bs.disk.Get(ck); ok {
-		bs.record(func(r Recorder) { r.DiskHit() })
 		bs.mem.Put(ck, data) // promote to memory
-		return data, true
+		return data, "disk"
 	}
-	return nil, false
+	return nil, ""
+}
+
+// demandCached does a cache lookup for a demand read, recording the hit tier
+// and crediting prefetch accuracy when the block was prefetched.
+func (bs *BlockStore) demandCached(k Key, blockIdx int64) ([]byte, bool) {
+	data, tier := bs.lookup(k, blockIdx)
+	switch tier {
+	case "mem":
+		bs.record(func(r Recorder) { r.MemHit() })
+	case "disk":
+		bs.record(func(r Recorder) { r.DiskHit() })
+	default:
+		return nil, false
+	}
+	bs.notePrefetchHit(bs.cacheKey(k, blockIdx))
+	return data, true
+}
+
+// notePrefetchHit credits a prefetch as used the first time a demand read
+// consumes a block that prefetch had fetched.
+func (bs *BlockStore) notePrefetchHit(ck string) {
+	bs.mu.Lock()
+	_, ok := bs.prefetched[ck]
+	if ok {
+		delete(bs.prefetched, ck)
+	}
+	bs.mu.Unlock()
+	if ok {
+		bs.record(func(r Recorder) { r.PrefetchHit() })
+	}
 }
 
 func (bs *BlockStore) storeBlock(k Key, blockIdx int64, data []byte) {
@@ -141,7 +176,7 @@ func (bs *BlockStore) storeBlock(k Key, blockIdx int64, data []byte) {
 // Get returns a single block, serving from cache or fetching it (demand
 // priority). objSize bounds the final block's length.
 func (bs *BlockStore) Get(ctx context.Context, k Key, blockIdx, objSize int64) ([]byte, error) {
-	if data, ok := bs.cachedBlock(k, blockIdx); ok {
+	if data, ok := bs.demandCached(k, blockIdx); ok {
 		return data, nil
 	}
 	bs.record(func(r Recorder) { r.Miss() })
@@ -155,11 +190,17 @@ func (bs *BlockStore) Get(ctx context.Context, k Key, blockIdx, objSize int64) (
 // Prefetch fetches a single block at lower priority than demand reads. Errors
 // are swallowed (prefetch is best-effort).
 func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int64) {
-	if _, ok := bs.cachedBlock(k, blockIdx); ok {
+	if _, tier := bs.lookup(k, blockIdx); tier != "" {
+		return // already cached; nothing to prefetch
+	}
+	if _, err := bs.fetchRun(ctx, k, blockIdx, blockIdx, objSize, true); err != nil {
 		return
 	}
-	bs.record(func(r Recorder) { r.Miss() })
-	_, _ = bs.fetchRun(ctx, k, blockIdx, blockIdx, objSize, true)
+	ck := bs.cacheKey(k, blockIdx)
+	bs.mu.Lock()
+	bs.prefetched[ck] = struct{}{}
+	bs.mu.Unlock()
+	bs.record(func(r Recorder) { r.PrefetchIssued() })
 }
 
 // GetRange returns bytes for [off, off+length) of the object. It gathers the
@@ -184,7 +225,7 @@ func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize 
 
 	i := first
 	for i <= last {
-		if data, ok := bs.cachedBlock(k, i); ok {
+		if data, ok := bs.demandCached(k, i); ok {
 			blocks[i-first] = data
 			i++
 			continue
@@ -193,7 +234,7 @@ func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize 
 		// Extend a run of contiguous, uncached blocks (bounded by maxBlocks).
 		j := i
 		for j+1 <= last && (j-i+1) < maxBlocks {
-			if _, ok := bs.peekCached(k, j+1); ok {
+			if _, tier := bs.lookup(k, j+1); tier != "" {
 				break
 			}
 			j++

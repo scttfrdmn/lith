@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -67,6 +68,9 @@ type Index struct {
 
 	execMode bool // when true, files are 0555 instead of 0444
 
+	totalOnce sync.Once
+	totalSize int64
+
 	// Build statistics, surfaced by inspect.
 	dropped    uint64 // keys rejected by sanitization
 	shadowed   uint64 // file keys shadowed by a same-named directory
@@ -85,6 +89,19 @@ func (ix *Index) Len() int { return len(ix.offs) - 1 }
 // Stats returns the build statistics recorded when the index was created.
 func (ix *Index) Stats() (dropped, shadowed, collisions uint64) {
 	return ix.dropped, ix.shadowed, ix.collisions
+}
+
+// TotalSize returns the sum of all file sizes (computed once, then cached).
+// Used by statfs to report a total matching the data behind the mount.
+func (ix *Index) TotalSize() int64 {
+	ix.totalOnce.Do(func() {
+		var t int64
+		for _, s := range ix.sizes {
+			t += int64(s)
+		}
+		ix.totalSize = t
+	})
+	return ix.totalSize
 }
 
 // key returns the relative key at position i.
@@ -158,6 +175,19 @@ func (ix *Index) Stat(path string) (FileInfo, error) {
 		return ix.fileInfo(i), nil
 	}
 	return FileInfo{}, ErrNotExist
+}
+
+// ETagHashOf returns the stored ETag hash for the file at path, or 0 if path
+// is not a stored file (e.g. a directory or a missing path).
+func (ix *Index) ETagHashOf(path string) uint64 {
+	rel := toRel(path)
+	if rel == "" || strings.HasSuffix(rel, "/") {
+		return 0
+	}
+	if i, ok := ix.findExact(rel); ok {
+		return ix.etags[i]
+	}
+	return 0
 }
 
 func (ix *Index) fileInfo(i int) FileInfo {
