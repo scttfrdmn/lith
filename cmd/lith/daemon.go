@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -33,11 +34,20 @@ func daemonize() error {
 	if err != nil {
 		return err
 	}
+	logPath := filepath.Join(os.TempDir(), "lith-mount.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logFile.Close() }()
+
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Env = append(os.Environ(), daemonChildEnv+"=1")
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr // surface early failures; child closes-ish once serving
+	// Detach the child's output to a log file so it does not hold open the
+	// parent's terminal (which would keep an SSH session alive).
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	cmd.ExtraFiles = []*os.File{w}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
@@ -49,10 +59,10 @@ func daemonize() error {
 	line, _ := bufio.NewReader(r).ReadString('\n')
 	line = strings.TrimSpace(line)
 	if line == "ready" {
-		fmt.Printf("lith mounted in the background (pid %d)\n", cmd.Process.Pid)
+		fmt.Printf("lith mounted in the background (pid %d); logs: %s\n", cmd.Process.Pid, logPath)
 		return nil
 	}
-	return fmt.Errorf("daemon failed to start: %s", line)
+	return fmt.Errorf("daemon failed to start (see %s): %s", logPath, line)
 }
 
 // signalDaemonReady tells the parent (if we are a daemon child) that the mount
