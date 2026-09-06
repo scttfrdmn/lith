@@ -110,12 +110,12 @@ func (ix *Index) Save(path string) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(ix.Marshal()); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Rename(tmpName, path)

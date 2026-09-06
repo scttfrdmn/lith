@@ -280,7 +280,7 @@ func TestSaveAndOpenMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer closeFn()
+	defer func() { _ = closeFn() }()
 	if loaded.Len() != ix.Len() {
 		t.Fatalf("Len = %d, want %d", loaded.Len(), ix.Len())
 	}
