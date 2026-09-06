@@ -18,7 +18,14 @@ log() { echo "[devbox] $*"; }
 log "apt packages"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq fuse3 samtools fio awscli curl ca-certificates >/dev/null
+sudo apt-get install -y -qq fuse3 samtools fio curl ca-certificates unzip >/dev/null
+
+log "aws cli v2 (arm64)"
+if ! command -v aws >/dev/null 2>&1; then
+	curl -fsSL -o /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip
+	(cd /tmp && unzip -q -o awscliv2.zip && sudo ./aws/install --update)
+fi
+aws --version
 
 log "fuse: enable user_allow_other"
 if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
