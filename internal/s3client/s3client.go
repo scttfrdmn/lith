@@ -45,4 +45,9 @@ type API interface {
 	// bytes together with the object's ETag (used for immutability checks). A
 	// length <= 0 reads to the end of the object.
 	GetRange(ctx context.Context, key string, off, length int64) (data []byte, etag string, err error)
+	// GetRangeReader returns a streaming reader for [off, off+length) of key
+	// together with the object's ETag. The caller must Close the reader. This
+	// lets the block store complete each chunk's waiters as bytes arrive,
+	// rather than at the end of the range.
+	GetRangeReader(ctx context.Context, key string, off, length int64) (body io.ReadCloser, etag string, err error)
 }

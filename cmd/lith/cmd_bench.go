@@ -8,25 +8,29 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
 	"github.com/scttfrdmn/lith/internal/blockstore"
+	fusefs "github.com/scttfrdmn/lith/internal/fuse"
+	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/s3client"
 	"github.com/spf13/cobra"
-	"github.com/zeebo/xxh3"
 )
 
 type benchFlags struct {
-	pattern   string
-	against   string
-	blockSize string
-	memCache  string
-	diskCache string
-	diskPath  string
-	ops       int
+	pattern       string
+	against       string
+	blockSize     string
+	memCache      string
+	diskCache     string
+	diskPath      string
+	ops           int
+	s3Concurrency int
+	maxReadahead  int64
 
 	noSignRequest bool
 	requesterPays bool
@@ -39,7 +43,7 @@ func newBenchCmd() *cobra.Command {
 	var f benchFlags
 	cmd := &cobra.Command{
 		Use:   "bench s3://bucket/key",
-		Short: "Benchmark read patterns through lith (and optionally against another mount)",
+		Short: "Benchmark read patterns through a lith mount (and optionally against another mount)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			bucket, key, err := parseS3URL(args[0])
@@ -55,11 +59,13 @@ func newBenchCmd() *cobra.Command {
 	fl := cmd.Flags()
 	fl.StringVar(&f.pattern, "pattern", "seq", "access pattern: seq | rand4k | stride")
 	fl.StringVar(&f.against, "against", "", "also run the identical pattern on this file path (e.g. a mountpoint-s3 mount)")
-	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size")
+	fl.StringVar(&f.blockSize, "block-size", "8MiB", "fill/readahead block size")
 	fl.StringVar(&f.memCache, "mem-cache", "1GiB", "memory cache size")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk cache size (0 disables)")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory")
 	fl.IntVar(&f.ops, "ops", 10000, "number of ops for rand4k/stride")
+	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 64, "max concurrent S3 requests")
+	fl.Int64Var(&f.maxReadahead, "max-readahead", 32, "max sequential readahead window in blocks")
 	fl.BoolVar(&f.noSignRequest, "no-sign-request", false, "send anonymous requests (public buckets)")
 	fl.BoolVar(&f.requesterPays, "requester-pays", false, "add the requester-pays header")
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
@@ -68,54 +74,27 @@ func newBenchCmd() *cobra.Command {
 	return cmd
 }
 
-// countingRecorder tallies S3 requests and bytes for the cost estimate.
+// countingRecorder tallies S3 and prefetch activity for the cost estimate and
+// the prefetch-is-driven assertion.
 type countingRecorder struct {
-	reqs  int64
-	bytes int64
+	reqs           int64
+	bytes          int64
+	prefetchIssued int64
+	prefetchHit    int64
 }
 
-func (c *countingRecorder) MemHit()  {}
-func (c *countingRecorder) DiskHit() {}
-func (c *countingRecorder) Miss()    {}
+func (c *countingRecorder) MemHit()        {}
+func (c *countingRecorder) DiskHit()       {}
+func (c *countingRecorder) Miss()          {}
+func (c *countingRecorder) StartInflight() {}
+func (c *countingRecorder) EndInflight()   {}
 func (c *countingRecorder) S3Get(n int64, _ bool) {
 	atomic.AddInt64(&c.reqs, 1)
 	atomic.AddInt64(&c.bytes, n)
 }
 func (c *countingRecorder) StaleKey(string) {}
-func (c *countingRecorder) PrefetchIssued() {}
-func (c *countingRecorder) PrefetchHit()    {}
-
-// readerAt is a seekable, sized reader for a bench engine.
-type readerAt interface {
-	ReadAt(p []byte, off int64) (int, error)
-	Size() int64
-}
-
-// lithReader reads through the block store.
-type lithReader struct {
-	ctx  context.Context
-	bs   *blockstore.BlockStore
-	key  blockstore.Key
-	size int64
-}
-
-func (r *lithReader) Size() int64 { return r.size }
-func (r *lithReader) ReadAt(p []byte, off int64) (int, error) {
-	data, err := r.bs.GetRange(r.ctx, r.key, off, int64(len(p)), r.size)
-	if err != nil {
-		return 0, err
-	}
-	return copy(p, data), nil
-}
-
-// fileReader reads a local file (e.g. a mountpoint-s3 mount).
-type fileReader struct {
-	f    *os.File
-	size int64
-}
-
-func (r *fileReader) Size() int64                             { return r.size }
-func (r *fileReader) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }
+func (c *countingRecorder) PrefetchIssued() { atomic.AddInt64(&c.prefetchIssued, 1) }
+func (c *countingRecorder) PrefetchHit()    { atomic.AddInt64(&c.prefetchHit, 1) }
 
 type stats struct {
 	mbps       float64
@@ -138,6 +117,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	client, err := newS3Client(ctx, s3client.Config{
 		Bucket: bucket, Region: f.region, NoSignRequest: f.noSignRequest,
 		RequesterPays: f.requesterPays, Endpoint: f.endpoint, PathStyle: f.pathStyle,
+		Concurrency: f.s3Concurrency,
 	})
 	if err != nil {
 		return err
@@ -147,75 +127,113 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 		return fmt.Errorf("head %s: %w", key, err)
 	}
 
-	newLith := func() (*lithReader, *countingRecorder, error) {
-		rec := &countingRecorder{}
-		bs, berr := blockstore.New(client, blockstore.Config{
-			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
-			DiskCache: diskCache, DiskPath: f.diskPath, Recorder: rec,
-		})
-		if berr != nil {
-			return nil, nil, berr
-		}
-		return &lithReader{ctx: ctx, bs: bs, key: blockstore.Key{Key: key, ETagHash: xxh3.HashString(head.ETag)}, size: head.Size}, rec, nil
-	}
+	// Build a one-object index and mount it so reads exercise the real FUSE
+	// read path and its per-handle prefetcher (#36).
+	ix := index.Build([]index.Entry{{
+		Key: key, Size: head.Size, MTime: head.LastModified.UnixNano(), ETagHash: index.HashETag(head.ETag),
+	}}, index.Options{Bucket: bucket})
 
-	// lith: cold uses a fresh cache; warm reuses it.
-	lr, rec, err := newLith()
+	rec := &countingRecorder{}
+	diskPath := f.diskPath
+	if diskPath == "" {
+		diskPath, _ = os.MkdirTemp("", "lith-bench-cache-")
+		defer func() { _ = os.RemoveAll(diskPath) }()
+	}
+	bs, err := blockstore.New(client, blockstore.Config{
+		Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
+		DiskCache: diskCache, DiskPath: diskPath, S3Concurrency: f.s3Concurrency, Recorder: rec,
+	})
 	if err != nil {
 		return err
 	}
-	lithCold := runPattern(f.pattern, lr, f.ops)
+
+	mnt, err := os.MkdirTemp("", "lith-bench-mnt-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(mnt) }()
+	srv, err := fusefs.Mount(mnt, fusefs.Config{
+		Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: f.maxReadahead,
+	}, fusefs.MountOptions{FsName: "lith-bench"})
+	if err != nil {
+		return fmt.Errorf("bench mount: %w", err)
+	}
+	defer func() { _ = srv.Unmount() }()
+
+	lithPath := filepath.Join(mnt, key)
+
+	// lith: cold then warm.
+	lithCold, err := benchFile(f.pattern, lithPath, head.Size, f.ops)
+	if err != nil {
+		return err
+	}
 	lithCold.s3Requests, lithCold.s3Bytes = atomic.LoadInt64(&rec.reqs), atomic.LoadInt64(&rec.bytes)
-	before := atomic.LoadInt64(&rec.reqs)
-	lithWarm := runPattern(f.pattern, lr, f.ops)
-	lithWarm.s3Requests = atomic.LoadInt64(&rec.reqs) - before
-	lithWarm.s3Bytes = atomic.LoadInt64(&rec.bytes) - lithCold.s3Bytes
+	prefetchAfterCold := atomic.LoadInt64(&rec.prefetchIssued)
+	rBefore := atomic.LoadInt64(&rec.reqs)
+	lithWarm, err := benchFile(f.pattern, lithPath, head.Size, f.ops)
+	if err != nil {
+		return err
+	}
+	lithWarm.s3Requests = atomic.LoadInt64(&rec.reqs) - rBefore
 
 	cols := []string{"lith cold", "lith warm"}
 	results := []stats{lithCold, lithWarm}
 
 	if f.against != "" {
-		af, aerr := os.Open(f.against)
+		ac, aerr := benchFile(f.pattern, f.against, head.Size, f.ops)
 		if aerr != nil {
-			return fmt.Errorf("open --against %s: %w", f.against, aerr)
+			return fmt.Errorf("--against %s: %w", f.against, aerr)
 		}
-		defer func() { _ = af.Close() }()
-		fi, _ := af.Stat()
-		fr := &fileReader{f: af, size: fi.Size()}
-		againstCold := runPattern(f.pattern, fr, f.ops)
-		againstWarm := runPattern(f.pattern, fr, f.ops)
+		aw, aerr := benchFile(f.pattern, f.against, head.Size, f.ops)
+		if aerr != nil {
+			return err
+		}
 		cols = append(cols, "against cold", "against warm")
-		results = append(results, againstCold, againstWarm)
+		results = append(results, ac, aw)
 	}
 
 	printBenchTable(out, f.pattern, key, head.Size, cols, results)
+
+	// Assertion (#36): a sequential run must drive the prefetcher.
+	if f.pattern == "seq" {
+		if prefetchAfterCold == 0 {
+			_, _ = fmt.Fprintln(out, "\nWARNING: prefetch count was 0 during seq — the prefetcher was not driven (see #36).")
+		} else {
+			_, _ = fmt.Fprintf(out, "\nprefetch issued during seq (cold): %d blocks (prefetcher is driven).\n", prefetchAfterCold)
+		}
+	}
 	return nil
 }
 
-// runPattern executes the named pattern against r and returns timing stats.
-func runPattern(pattern string, r readerAt, ops int) stats {
+// benchFile runs a pattern against a file path using pread (ReadAt).
+func benchFile(pattern, path string, size int64, ops int) (stats, error) {
+	fd, err := os.Open(path)
+	if err != nil {
+		return stats{}, err
+	}
+	defer func() { _ = fd.Close() }()
 	switch pattern {
 	case "seq":
-		return runSeq(r)
+		return runSeq(fd, size), nil
 	case "rand4k":
-		return runRandom(r, ops, 4096)
+		return runRandom(fd, size, ops, 4096), nil
 	case "stride":
-		return runStride(r, ops, 4096)
+		return runStride(fd, size, ops, 4096), nil
 	default:
-		return runSeq(r)
+		return runSeq(fd, size), nil
 	}
 }
 
-func runSeq(r readerAt) stats {
+func runSeq(r io.ReaderAt, size int64) stats {
 	const chunk = 1 << 20
 	buf := make([]byte, chunk)
 	var lat []time.Duration
 	var total int64
 	start := time.Now()
-	for off := int64(0); off < r.Size(); off += chunk {
+	for off := int64(0); off < size; off += chunk {
 		n := int64(chunk)
-		if off+n > r.Size() {
-			n = r.Size() - off
+		if off+n > size {
+			n = size - off
 		}
 		t0 := time.Now()
 		got, err := r.ReadAt(buf[:n], off)
@@ -228,10 +246,10 @@ func runSeq(r readerAt) stats {
 	return summarize(lat, total, time.Since(start))
 }
 
-func runRandom(r readerAt, ops int, size int64) stats {
-	buf := make([]byte, size)
+func runRandom(r io.ReaderAt, size int64, ops int, rsize int64) stats {
+	buf := make([]byte, rsize)
 	rng := rand.New(rand.NewSource(1))
-	span := r.Size() - size
+	span := size - rsize
 	if span <= 0 {
 		span = 1
 	}
@@ -251,15 +269,15 @@ func runRandom(r readerAt, ops int, size int64) stats {
 	return summarize(lat, total, time.Since(start))
 }
 
-func runStride(r readerAt, ops int, size int64) stats {
+func runStride(r io.ReaderAt, size int64, ops int, rsize int64) stats {
 	const stride = 1 << 20
-	buf := make([]byte, size)
+	buf := make([]byte, rsize)
 	var lat []time.Duration
 	var total int64
 	off := int64(0)
 	start := time.Now()
 	for i := 0; i < ops; i++ {
-		if off+size > r.Size() {
+		if off+rsize > size {
 			off = 0
 		}
 		t0 := time.Now()
@@ -296,7 +314,6 @@ func printBenchTable(out io.Writer, pattern, key string, size int64, cols []stri
 		header += "\t" + c
 	}
 	_, _ = fmt.Fprintln(tw, header)
-
 	row := func(name string, fn func(stats) string) {
 		line := name
 		for _, r := range results {
@@ -313,10 +330,9 @@ func printBenchTable(out io.Writer, pattern, key string, size int64, cols []stri
 	row("S3 MB", func(s stats) string { return fmt.Sprintf("%.1f", float64(s.s3Bytes)/(1<<20)) })
 	row("est. cost", func(s stats) string { return fmt.Sprintf("$%.6f", benchCost(s)) })
 	_ = tw.Flush()
-	_, _ = fmt.Fprintln(out, "\nCost: S3 GET at $0.40/1M requests + egress at $0.09/GB (0 within-region to EC2).")
+	_, _ = fmt.Fprintln(out, "\nCost: S3 GET at $0.40/1M requests + egress at $0.09/GB (0 within-region to EC2). S3 columns are lith-only.")
 }
 
-// benchCost estimates request + egress cost at published us-east-1 prices.
 func benchCost(s stats) float64 {
 	const getPer = 0.40 / 1e6
 	const egressPerGB = 0.09

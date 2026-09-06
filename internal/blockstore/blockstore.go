@@ -1,41 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package blockstore implements lith's read-only block cache over S3 range
-// GETs: a byte-bounded 2Q memory tier, an NVMe disk tier, contiguous-miss
-// coalescing, singleflight de-duplication, a bounded worker pool that favors
-// demand reads over prefetch, and ETag-mismatch detection. See the pinned
-// Design issue, §4.2.
+// Package blockstore implements lith's read-only cache over S3 range GETs. The
+// cache unit is a fixed 1 MiB chunk; fills (and readahead) are done in
+// block-sized runs of chunks and coalesced into a single range GET. A chunk
+// singleflight keyed by (key, etagHash, chunkIdx) de-duplicates concurrent
+// fetches: a range fill registers every chunk it will produce as in-flight
+// before dispatching the GET and completes each chunk's waiters as its bytes
+// arrive, so a demand read for an in-flight chunk joins it rather than issuing
+// a second GET. See the pinned Design issue, §4.2, and issues #35 and #37.
 package blockstore
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
 	"sync"
 
 	"github.com/zeebo/xxh3"
 )
 
-// ErrStale is returned when a fetched block's ETag does not match the index;
-// the FUSE layer maps it to EIO. The key is recorded in the stale set.
+// ChunkSize is the fixed cache unit. Fills are multiples of it.
+const ChunkSize int64 = 1 << 20 // 1 MiB
+
+// diskFormat namespaces the on-disk cache layout; bumping it makes caches from
+// an older layout (e.g. session 2's block-indexed files) be ignored.
+const diskFormat = "chunkv1"
+
+// ErrStale is returned when a fetched object's ETag does not match the index;
+// the FUSE layer maps it to EIO and the key is recorded in the stale set.
 var ErrStale = errors.New("blockstore: object changed since index build (ETag mismatch)")
 
-// Source fetches byte ranges from the backing store (S3 or a fake). It matches
-// s3client.API's GetRange.
+// Source streams a byte range and reports the object's ETag. Satisfied by
+// s3client and the test fake.
 type Source interface {
-	GetRange(ctx context.Context, key string, off, length int64) (data []byte, etag string, err error)
+	GetRangeReader(ctx context.Context, key string, off, length int64) (body io.ReadCloser, etag string, err error)
 }
 
-// Recorder receives cache and S3 events for metrics. A nil Recorder is fine;
-// all calls are guarded.
+// Recorder receives cache and S3 events for metrics. A nil Recorder is fine.
 type Recorder interface {
 	MemHit()
 	DiskHit()
 	Miss()
-	S3Get(bytes int64, err bool)
+	S3Get(bytes int64, isErr bool)
+	StartInflight()
+	EndInflight()
 	StaleKey(key string)
-	// PrefetchIssued is called when a block is prefetched; PrefetchHit when a
-	// demand read consumes a previously prefetched block (accuracy = hit/issued).
 	PrefetchIssued()
 	PrefetchHit()
 }
@@ -49,7 +60,7 @@ type Key struct {
 // Config configures a BlockStore.
 type Config struct {
 	Bucket        string
-	BlockSize     int64
+	BlockSize     int64 // fill/readahead unit (default 8 MiB); rounded to a multiple of ChunkSize
 	MemCache      int64
 	DiskCache     int64
 	DiskPath      string
@@ -58,17 +69,22 @@ type Config struct {
 	Recorder      Recorder
 }
 
-// BlockStore is a read-only, tiered block cache.
+// chunkState is an in-flight (or just-completed) chunk fetch.
+type chunkState struct {
+	done chan struct{}
+	data []byte
+	err  error
+}
+
+// BlockStore is a read-only, chunk-granular tiered cache.
 type BlockStore struct {
-	src       Source
-	bucket    string
-	blockSize int64
-	maxRange  int64
+	src         Source
+	bucket      string
+	blockChunks int64 // BlockSize / ChunkSize
+	maxChunks   int64 // MaxRange / ChunkSize
 
 	mem  *mem2Q
 	disk *diskTier
-
-	flight *flightGroup
 
 	sem      chan struct{} // total S3 concurrency
 	prefetch chan struct{} // sub-limit so prefetch cannot starve demand
@@ -76,85 +92,320 @@ type BlockStore struct {
 	rec Recorder
 
 	mu         sync.Mutex
+	inflight   map[string]*chunkState
 	stale      map[string]struct{}
-	prefetched map[string]struct{} // cache keys fetched by prefetch, not yet demand-read
+	prefetched map[string]struct{}
 }
 
 // New builds a BlockStore over src.
 func New(src Source, cfg Config) (*BlockStore, error) {
-	if cfg.BlockSize <= 0 {
-		return nil, fmt.Errorf("blockstore: block size must be > 0")
+	block := cfg.BlockSize
+	if block <= 0 {
+		block = 8 << 20
+	}
+	blockChunks := block / ChunkSize
+	if blockChunks < 1 {
+		blockChunks = 1
+	}
+	maxChunks := cfg.MaxRange / ChunkSize
+	if maxChunks < blockChunks {
+		maxChunks = blockChunks
 	}
 	conc := cfg.S3Concurrency
 	if conc <= 0 {
 		conc = 64
 	}
-	maxRange := cfg.MaxRange
-	if maxRange < cfg.BlockSize {
-		maxRange = cfg.BlockSize
+	var disk *diskTier
+	if cfg.DiskCache > 0 {
+		d, err := newDiskTier(filepath.Join(cfg.DiskPath, diskFormat), cfg.DiskCache)
+		if err != nil {
+			return nil, err
+		}
+		disk = d
 	}
-	disk, err := newDiskTier(cfg.DiskPath, cfg.DiskCache)
-	if err != nil {
-		return nil, err
-	}
-	bs := &BlockStore{
-		src:        src,
-		bucket:     cfg.Bucket,
-		blockSize:  cfg.BlockSize,
-		maxRange:   maxRange,
-		mem:        newMem2Q(cfg.MemCache),
-		disk:       disk,
-		flight:     newFlightGroup(),
-		sem:        make(chan struct{}, conc),
-		prefetch:   make(chan struct{}, max(1, conc/2)),
-		rec:        cfg.Recorder,
-		stale:      make(map[string]struct{}),
-		prefetched: make(map[string]struct{}),
-	}
-	return bs, nil
+	return &BlockStore{
+		src:         src,
+		bucket:      cfg.Bucket,
+		blockChunks: blockChunks,
+		maxChunks:   maxChunks,
+		mem:         newMem2Q(cfg.MemCache),
+		disk:        disk,
+		sem:         make(chan struct{}, conc),
+		prefetch:    make(chan struct{}, max(1, conc/2)),
+		rec:         cfg.Recorder,
+		inflight:    make(map[string]*chunkState),
+		stale:       make(map[string]struct{}),
+		prefetched:  make(map[string]struct{}),
+	}, nil
 }
 
-// BlockSize returns the configured block size.
-func (bs *BlockStore) BlockSize() int64 { return bs.blockSize }
+// BlockSize returns the fill/readahead unit in bytes.
+func (bs *BlockStore) BlockSize() int64 { return bs.blockChunks * ChunkSize }
 
-func (bs *BlockStore) cacheKey(k Key, blockIdx int64) string {
-	return fmt.Sprintf("%s|%s|%016x|%d", bucketTag(bs.bucket), k.Key, k.ETagHash, blockIdx)
+// BlockChunks returns the number of chunks in a fill block.
+func (bs *BlockStore) BlockChunks() int64 { return bs.blockChunks }
+
+func (bs *BlockStore) cacheKey(k Key, chunkIdx int64) string {
+	return fmt.Sprintf("%s|%s|%016x|%d", bs.bucket, k.Key, k.ETagHash, chunkIdx)
 }
 
-func bucketTag(b string) string { return b }
-
-// lookup returns a block from cache without recording metrics. tier is "mem",
-// "disk", or "" (miss); a disk hit is promoted to memory.
-func (bs *BlockStore) lookup(k Key, blockIdx int64) ([]byte, string) {
-	ck := bs.cacheKey(k, blockIdx)
-	if data, ok := bs.mem.Get(ck); ok {
-		return data, "mem"
+// lookup returns a cached chunk without recording metrics; tier is "mem",
+// "disk", or "" (miss). A disk hit is promoted to memory.
+func (bs *BlockStore) lookup(k Key, ci int64) ([]byte, string) {
+	ck := bs.cacheKey(k, ci)
+	if d, ok := bs.mem.Get(ck); ok {
+		return d, "mem"
 	}
-	if data, ok := bs.disk.Get(ck); ok {
-		bs.mem.Put(ck, data) // promote to memory
-		return data, "disk"
+	if d, ok := bs.disk.Get(ck); ok {
+		bs.mem.Put(ck, d)
+		return d, "disk"
 	}
 	return nil, ""
 }
 
-// demandCached does a cache lookup for a demand read, recording the hit tier
-// and crediting prefetch accuracy when the block was prefetched.
-func (bs *BlockStore) demandCached(k Key, blockIdx int64) ([]byte, bool) {
-	data, tier := bs.lookup(k, blockIdx)
-	switch tier {
-	case "mem":
-		bs.record(func(r Recorder) { r.MemHit() })
-	case "disk":
-		bs.record(func(r Recorder) { r.DiskHit() })
-	default:
-		return nil, false
-	}
-	bs.notePrefetchHit(bs.cacheKey(k, blockIdx))
-	return data, true
+func (bs *BlockStore) storeChunk(k Key, ci int64, data []byte) {
+	ck := bs.cacheKey(k, ci)
+	bs.mem.Put(ck, data)
+	bs.disk.Put(ck, data)
 }
 
-// notePrefetchHit credits a prefetch as used the first time a demand read
-// consumes a block that prefetch had fetched.
+// claim registers chunk ci as in-flight. It returns the chunk's state and
+// whether this caller owns the fetch (mine); if the chunk is already cached in
+// memory it returns cachedData with cached=true; if a fetch is already in
+// flight it returns that state with mine=false (the caller should join it).
+func (bs *BlockStore) claim(k Key, ci int64) (cs *chunkState, mine bool, cachedData []byte, cached bool) {
+	ck := bs.cacheKey(k, ci)
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if d, ok := bs.mem.Get(ck); ok {
+		return nil, false, d, true
+	}
+	if existing, ok := bs.inflight[ck]; ok {
+		return existing, false, nil, false
+	}
+	cs = &chunkState{done: make(chan struct{})}
+	bs.inflight[ck] = cs
+	return cs, true, nil, false
+}
+
+// complete stores the chunk, wakes its waiters, and clears its in-flight entry.
+func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err error) {
+	if err == nil {
+		bs.storeChunk(k, ci, data)
+	}
+	cs.data, cs.err = data, err
+	close(cs.done)
+	ck := bs.cacheKey(k, ci)
+	bs.mu.Lock()
+	delete(bs.inflight, ck)
+	bs.mu.Unlock()
+}
+
+// ensureChunks guarantees chunks [c0, c1] are cached (or returns the first
+// error). It owns and fetches maximal contiguous runs of not-cached,
+// not-in-flight chunks (coalesced into one GET, bounded by maxChunks) and joins
+// chunks already in flight.
+func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize int64, isPrefetch bool) error {
+	i := c0
+	for i <= c1 {
+		if _, tier := bs.lookup(k, i); tier != "" {
+			i++
+			continue
+		}
+		cs, mine, _, cached := bs.claim(k, i)
+		if cached {
+			i++
+			continue
+		}
+		if !mine {
+			<-cs.done
+			if cs.err != nil {
+				return cs.err
+			}
+			i++
+			continue
+		}
+		// We own chunk i; extend the run over contiguous chunks we also own.
+		owned := []*chunkState{cs}
+		j := i
+		for j+1 <= c1 && int64(len(owned)) < bs.maxChunks {
+			if _, tier := bs.lookup(k, j+1); tier != "" {
+				break
+			}
+			cs2, mine2, _, cached2 := bs.claim(k, j+1)
+			if cached2 || !mine2 {
+				break
+			}
+			owned = append(owned, cs2)
+			j++
+		}
+		if err := bs.fillRun(ctx, k, i, j, objSize, isPrefetch, owned); err != nil {
+			return err
+		}
+		i = j + 1
+	}
+	return nil
+}
+
+// fillRun fetches chunks [first, last] in one streamed range GET, verifies the
+// ETag, and completes each chunk's waiters as its bytes arrive.
+func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize int64, isPrefetch bool, owned []*chunkState) error {
+	// Acquire concurrency (prefetch takes a sub-limited slot first so it cannot
+	// consume all demand capacity).
+	if isPrefetch {
+		select {
+		case bs.prefetch <- struct{}{}:
+			defer func() { <-bs.prefetch }()
+		case <-ctx.Done():
+			bs.failRun(k, first, owned, ctx.Err())
+			return ctx.Err()
+		}
+	}
+	select {
+	case bs.sem <- struct{}{}:
+		defer func() { <-bs.sem }()
+	case <-ctx.Done():
+		bs.failRun(k, first, owned, ctx.Err())
+		return ctx.Err()
+	}
+
+	off := first * ChunkSize
+	end := (last + 1) * ChunkSize
+	if end > objSize {
+		end = objSize
+	}
+	length := end - off
+
+	bs.record(func(r Recorder) { r.StartInflight() })
+	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)
+	bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
+	if err != nil {
+		bs.failRun(k, first, owned, err)
+		return err
+	}
+	defer func() { _ = body.Close() }()
+
+	if xxh3.HashString(etag) != k.ETagHash {
+		bs.markStale(k.Key)
+		bs.failRun(k, first, owned, ErrStale)
+		return ErrStale
+	}
+
+	for idx := range owned {
+		ci := first + int64(idx)
+		want := ChunkSize
+		if ci*ChunkSize+want > objSize {
+			want = objSize - ci*ChunkSize
+		}
+		if want < 0 {
+			want = 0
+		}
+		buf := make([]byte, want)
+		if _, rerr := io.ReadFull(body, buf); rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+			// Fail this and every remaining chunk in the run.
+			for r := idx; r < len(owned); r++ {
+				bs.complete(k, first+int64(r), owned[r], nil, rerr)
+			}
+			return rerr
+		}
+		bs.complete(k, ci, owned[idx], buf, nil)
+	}
+	return nil
+}
+
+// failRun completes every owned chunk in a run with err.
+func (bs *BlockStore) failRun(k Key, first int64, owned []*chunkState, err error) {
+	for idx := range owned {
+		bs.complete(k, first+int64(idx), owned[idx], nil, err)
+	}
+}
+
+// GetRange returns bytes for [off, off+length) of the object, fetching only the
+// chunks the read spans (contiguous misses coalesced into one GET). This is the
+// demand path: a small read fetches a single 1 MiB chunk.
+func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize int64) ([]byte, error) {
+	if off >= objSize || length <= 0 {
+		return []byte{}, nil
+	}
+	end := off + length
+	if end > objSize {
+		end = objSize
+	}
+	c0 := off / ChunkSize
+	c1 := (end - 1) / ChunkSize
+
+	// Record hit/miss per chunk and credit prefetch accuracy.
+	for ci := c0; ci <= c1; ci++ {
+		if _, tier := bs.lookup(k, ci); tier != "" {
+			switch tier {
+			case "mem":
+				bs.record(func(r Recorder) { r.MemHit() })
+			case "disk":
+				bs.record(func(r Recorder) { r.DiskHit() })
+			}
+			bs.notePrefetchHit(bs.cacheKey(k, ci))
+		} else {
+			bs.record(func(r Recorder) { r.Miss() })
+		}
+	}
+
+	if err := bs.ensureChunks(ctx, k, c0, c1, objSize, false); err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, 0, end-off)
+	for ci := c0; ci <= c1; ci++ {
+		data, tier := bs.lookup(k, ci)
+		if tier == "" {
+			return nil, fmt.Errorf("blockstore: chunk %d missing after fill", ci)
+		}
+		lo := int64(0)
+		start := ci * ChunkSize
+		if off > start {
+			lo = off - start
+		}
+		hi := int64(len(data))
+		if start+hi > end {
+			hi = end - start
+		}
+		if lo < hi {
+			out = append(out, data[lo:hi]...)
+		}
+	}
+	return out, nil
+}
+
+// Prefetch fills a whole block (blockChunks chunks) starting at blockIdx, at
+// prefetch priority. Errors are swallowed (best-effort).
+func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int64) {
+	c0 := blockIdx * bs.blockChunks
+	if c0*ChunkSize >= objSize {
+		return
+	}
+	c1 := c0 + bs.blockChunks - 1
+	lastChunk := (objSize - 1) / ChunkSize
+	if c1 > lastChunk {
+		c1 = lastChunk
+	}
+	// Mark not-yet-cached chunks as prefetched for accuracy accounting.
+	for ci := c0; ci <= c1; ci++ {
+		if _, tier := bs.lookup(k, ci); tier == "" {
+			ck := bs.cacheKey(k, ci)
+			bs.mu.Lock()
+			if _, dup := bs.prefetched[ck]; !dup {
+				bs.prefetched[ck] = struct{}{}
+				bs.mu.Unlock()
+				bs.record(func(r Recorder) { r.PrefetchIssued() })
+			} else {
+				bs.mu.Unlock()
+			}
+		}
+	}
+	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true)
+}
+
+// notePrefetchHit credits a prefetch the first time a demand read consumes a
+// chunk that prefetch had fetched.
 func (bs *BlockStore) notePrefetchHit(ck string) {
 	bs.mu.Lock()
 	_, ok := bs.prefetched[ck]
@@ -165,187 +416,6 @@ func (bs *BlockStore) notePrefetchHit(ck string) {
 	if ok {
 		bs.record(func(r Recorder) { r.PrefetchHit() })
 	}
-}
-
-func (bs *BlockStore) storeBlock(k Key, blockIdx int64, data []byte) {
-	ck := bs.cacheKey(k, blockIdx)
-	bs.mem.Put(ck, data)
-	bs.disk.Put(ck, data)
-}
-
-// Get returns a single block, serving from cache or fetching it (demand
-// priority). objSize bounds the final block's length.
-func (bs *BlockStore) Get(ctx context.Context, k Key, blockIdx, objSize int64) ([]byte, error) {
-	if data, ok := bs.demandCached(k, blockIdx); ok {
-		return data, nil
-	}
-	bs.record(func(r Recorder) { r.Miss() })
-	blocks, err := bs.fetchRun(ctx, k, blockIdx, blockIdx, objSize, false)
-	if err != nil {
-		return nil, err
-	}
-	return blocks[0], nil
-}
-
-// Prefetch fetches a single block at lower priority than demand reads. Errors
-// are swallowed (prefetch is best-effort).
-func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int64) {
-	if _, tier := bs.lookup(k, blockIdx); tier != "" {
-		return // already cached; nothing to prefetch
-	}
-	if _, err := bs.fetchRun(ctx, k, blockIdx, blockIdx, objSize, true); err != nil {
-		return
-	}
-	ck := bs.cacheKey(k, blockIdx)
-	bs.mu.Lock()
-	bs.prefetched[ck] = struct{}{}
-	bs.mu.Unlock()
-	bs.record(func(r Recorder) { r.PrefetchIssued() })
-}
-
-// GetRange returns bytes for [off, off+length) of the object. It gathers the
-// covered blocks from cache and fetches contiguous misses in a single coalesced
-// S3 GET (bounded by maxRange).
-func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize int64) ([]byte, error) {
-	if off >= objSize || length <= 0 {
-		return []byte{}, nil
-	}
-	end := off + length
-	if end > objSize {
-		end = objSize
-	}
-	first := off / bs.blockSize
-	last := (end - 1) / bs.blockSize
-	blocks := make([][]byte, last-first+1)
-
-	maxBlocks := bs.maxRange / bs.blockSize
-	if maxBlocks < 1 {
-		maxBlocks = 1
-	}
-
-	i := first
-	for i <= last {
-		if data, ok := bs.demandCached(k, i); ok {
-			blocks[i-first] = data
-			i++
-			continue
-		}
-		bs.record(func(r Recorder) { r.Miss() })
-		// Extend a run of contiguous, uncached blocks (bounded by maxBlocks).
-		j := i
-		for j+1 <= last && (j-i+1) < maxBlocks {
-			if _, tier := bs.lookup(k, j+1); tier != "" {
-				break
-			}
-			j++
-		}
-		fetched, err := bs.fetchRun(ctx, k, i, j, objSize, false)
-		if err != nil {
-			return nil, err
-		}
-		for b := i; b <= j; b++ {
-			blocks[b-first] = fetched[b-i]
-		}
-		i = j + 1
-	}
-
-	// Assemble the requested byte range from the gathered blocks.
-	out := make([]byte, 0, end-off)
-	for b := first; b <= last; b++ {
-		blkStart := b * bs.blockSize
-		lo := int64(0)
-		if off > blkStart {
-			lo = off - blkStart
-		}
-		hi := int64(len(blocks[b-first]))
-		if blkStart+hi > end {
-			hi = end - blkStart
-		}
-		if lo < hi {
-			out = append(out, blocks[b-first][lo:hi]...)
-		}
-	}
-	return out, nil
-}
-
-// peekCached checks presence without recording a hit or promoting tiers.
-func (bs *BlockStore) peekCached(k Key, blockIdx int64) ([]byte, bool) {
-	ck := bs.cacheKey(k, blockIdx)
-	if data, ok := bs.mem.Get(ck); ok {
-		return data, true
-	}
-	return nil, false
-}
-
-// fetchRun fetches blocks [firstBlk, lastBlk] in one coalesced GET, verifies
-// the ETag, stores each block, and returns them. Concurrent identical runs are
-// joined via singleflight; single-block runs also join with prefetch.
-func (bs *BlockStore) fetchRun(ctx context.Context, k Key, firstBlk, lastBlk, objSize int64, isPrefetch bool) ([][]byte, error) {
-	flightKey := fmt.Sprintf("%s|%016x|%d-%d", k.Key, k.ETagHash, firstBlk, lastBlk)
-
-	// Acquire concurrency slots (prefetch first takes a sub-limited slot so it
-	// cannot consume all demand capacity).
-	if isPrefetch {
-		select {
-		case bs.prefetch <- struct{}{}:
-			defer func() { <-bs.prefetch }()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	acquire := func() error {
-		select {
-		case bs.sem <- struct{}{}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	release := func() { <-bs.sem }
-
-	off := firstBlk * bs.blockSize
-	length := (lastBlk - firstBlk + 1) * bs.blockSize
-	if off+length > objSize {
-		length = objSize - off
-	}
-
-	data, err, _ := bs.flight.Do(flightKey, func() ([]byte, error) {
-		if aerr := acquire(); aerr != nil {
-			return nil, aerr
-		}
-		defer release()
-		buf, etag, gerr := bs.src.GetRange(ctx, k.Key, off, length)
-		bs.record(func(r Recorder) { r.S3Get(int64(len(buf)), gerr != nil) })
-		if gerr != nil {
-			return nil, gerr
-		}
-		if xxh3.HashString(etag) != k.ETagHash {
-			bs.markStale(k.Key)
-			return nil, ErrStale
-		}
-		return buf, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Split the coalesced buffer back into blocks and cache them.
-	n := int(lastBlk - firstBlk + 1)
-	blocks := make([][]byte, n)
-	for b := 0; b < n; b++ {
-		lo := int64(b) * bs.blockSize
-		hi := lo + bs.blockSize
-		if hi > int64(len(data)) {
-			hi = int64(len(data))
-		}
-		if lo > int64(len(data)) {
-			lo = int64(len(data))
-		}
-		blk := data[lo:hi]
-		blocks[b] = blk
-		bs.storeBlock(k, firstBlk+int64(b), blk)
-	}
-	return blocks, nil
 }
 
 func (bs *BlockStore) markStale(key string) {

@@ -37,10 +37,16 @@ type Server struct {
 	// "zero S3 calls after index build" property in tests.
 	ListCalls int
 	GetCalls  int
+	GetBytes  int64 // total bytes requested via GetRange/GetRangeReader
 	HeadCalls int
 	// GetDelay, if set, is slept inside GetObject/GetRange to widen the
 	// in-flight window for singleflight tests.
 	GetDelay time.Duration
+	// StreamChunkDelay, if set, makes GetRangeReader deliver bytes in
+	// StreamChunkBytes-sized pieces, sleeping between each, so tests can
+	// observe per-chunk (mid-fill) completion order.
+	StreamChunkDelay time.Duration
+	StreamChunkBytes int64
 }
 
 // New returns an empty fake server.
@@ -188,6 +194,76 @@ func (s *Server) GetRange(_ context.Context, key string, off, length int64) ([]b
 	copy(out, o.data[off:end])
 	return out, o.etag, nil
 }
+
+// GetRangeReader returns a streaming reader for [off, off+length) of key and
+// the object's ETag. If StreamChunkDelay is set, the reader delivers bytes in
+// StreamChunkBytes pieces with a sleep between each.
+func (s *Server) GetRangeReader(_ context.Context, key string, off, length int64) (io.ReadCloser, string, error) {
+	s.mu.Lock()
+	s.GetCalls++
+	if length > 0 {
+		s.GetBytes += length
+	}
+	delay, chunk, startDelay := s.StreamChunkDelay, s.StreamChunkBytes, s.GetDelay
+	s.mu.Unlock()
+	if startDelay > 0 {
+		time.Sleep(startDelay)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	o, ok := s.objs[key]
+	if !ok {
+		return nil, "", &NotFoundError{Key: key}
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off > int64(len(o.data)) {
+		off = int64(len(o.data))
+	}
+	end := int64(len(o.data))
+	if length > 0 && off+length < end {
+		end = off + length
+	}
+	buf := make([]byte, end-off)
+	copy(buf, o.data[off:end])
+	if delay > 0 && chunk > 0 {
+		return &delayReader{data: buf, chunk: chunk, delay: delay}, o.etag, nil
+	}
+	return io.NopCloser(bytes.NewReader(buf)), o.etag, nil
+}
+
+// delayReader delivers data in fixed-size pieces with a sleep between each, so
+// tests can observe streaming (mid-fill) completion order.
+type delayReader struct {
+	data  []byte
+	pos   int
+	chunk int64
+	delay time.Duration
+	first bool
+}
+
+func (r *delayReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.first {
+		time.Sleep(r.delay)
+	}
+	r.first = true
+	n := int(r.chunk)
+	if n > len(p) {
+		n = len(p)
+	}
+	if r.pos+n > len(r.data) {
+		n = len(r.data) - r.pos
+	}
+	copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+func (r *delayReader) Close() error { return nil }
 
 // NotFoundError is returned for a missing key.
 type NotFoundError struct{ Key string }

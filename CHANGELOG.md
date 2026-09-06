@@ -9,12 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The block cache is now **chunk-granular**: a fixed 1 MiB chunk is the cache
+  unit, and `--block-size` (default 8 MiB) is the fill/readahead unit (a run of
+  chunks coalesced into one range GET). The on-disk cache layout is versioned
+  (`chunkv1`); caches written by earlier builds are ignored, not misread.
+- `lith bench` now reads through an actual lith mount via `pread`, so the FUSE
+  per-handle prefetcher is exercised (it previously read the block store
+  directly and never prefetched).
 - Index file format bumped to **v2**: the directory table now stores a
   per-directory inode and mtime. v1 index files are rejected on load with a
   message to rebuild.
 
 ### Fixed
 
+- Cold read throughput: a single chunk singleflight keyed by
+  `(key, etagHash, chunkIdx)` with in-flight join replaces the range-keyed
+  singleflight. A demand read for a chunk a prefetch is already fetching now
+  joins that fetch (completing as the chunk's bytes arrive) instead of issuing a
+  duplicate GET — eliminating the ~11× GET amplification observed in session 2.
+- Random 4 KiB reads now fetch a single 1 MiB chunk instead of a whole 8 MiB
+  block.
 - Directory and file inodes now share a single build-time collision namespace,
   so a directory inode can no longer silently collide with a file inode;
   colliding directory inodes take the sequential fallback.
