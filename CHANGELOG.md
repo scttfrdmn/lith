@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `lith mount s3://bucket[/prefix] /mnt/point`: a read-only FUSE mount served
+  from the local index and a tiered block cache. Flags include `--index-file`
+  (auto-built under `--auto-index-limit` when absent), `--mem-cache`,
+  `--disk-cache`/`--disk-path`, `--block-size`, `--max-range`,
+  `--s3-concurrency`, `--max-readahead`, `--small-file`, `--metrics`,
+  `--allow-other`, `--uid`/`--gid`, `--exec`, and `--daemon`. Mutating
+  operations return `EROFS`; clean unmount on SIGINT/SIGTERM.
+- `lith bench s3://bucket/key --pattern seq|rand4k|stride [--against PATH]`:
+  measures MB/s, IOPS, p50/p99, S3 requests and bytes, and an estimated cost,
+  cold then warm, optionally alongside another mount (e.g. mountpoint-s3).
+- Read path: a 2Q memory + NVMe disk block cache with range coalescing,
+  singleflight, a demand-favoring worker pool, a per-handle prefetcher
+  (sequential/strided/random), and ETag-mismatch detection (`EIO`).
+- Prometheus metrics endpoint (`--metrics`): cache hits by tier, S3 bytes and
+  requests, in-flight gauge, prefetch accuracy, stale objects, and FUSE op
+  latency histograms.
 - Repository scaffold: Go module `github.com/scttfrdmn/lith`, internal package
   layout (`index`, `s3client`, `blockstore`, `prefetch`, `fuse`, `version`),
   and a `Makefile` with `build`, `test`, `lint`, `bench`, and `cover` targets.

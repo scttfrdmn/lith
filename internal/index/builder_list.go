@@ -4,6 +4,7 @@ package index
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,14 @@ type ListOptions struct {
 	PageSize int32
 	// ProgressEvery logs progress after this many keys (defaults to 100000).
 	ProgressEvery int
+	// MaxKeys, if > 0, aborts the build with ErrTooManyKeys once more than
+	// MaxKeys objects have been listed. Used by `mount` so it never silently
+	// lists a huge bucket without an explicit `index build`.
+	MaxKeys int
 }
+
+// ErrTooManyKeys is returned by BuildFromList when a build exceeds MaxKeys.
+var ErrTooManyKeys = errors.New("index: bucket exceeds the auto-index limit; run `lith index build` explicitly")
 
 // BuildFromList builds an index by listing the bucket with ListObjectsV2 (no
 // delimiter), optionally sharded across sub-prefixes, then finalizing.
@@ -37,10 +45,11 @@ func BuildFromList(ctx context.Context, api s3client.API, opts ListOptions) (*In
 	}
 
 	var (
-		mu      sync.Mutex
-		all     []Entry
-		total   int
-		lastLog int
+		mu        sync.Mutex
+		all       []Entry
+		total     int
+		lastLog   int
+		overLimit bool
 	)
 	appendPage := func(objs []s3client.Object) {
 		mu.Lock()
@@ -55,10 +64,18 @@ func BuildFromList(ctx context.Context, api s3client.API, opts ListOptions) (*In
 			})
 		}
 		total += len(objs)
+		if opts.MaxKeys > 0 && total > opts.MaxKeys {
+			overLimit = true
+		}
 		if opts.Logger != nil && total-lastLog >= every {
 			lastLog = total
 			opts.Logger.Info("listing progress", "keys", total)
 		}
+	}
+	isOver := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return overLimit
 	}
 
 	listPrefix := func(ctx context.Context, prefix string) error {
@@ -69,6 +86,9 @@ func BuildFromList(ctx context.Context, api s3client.API, opts ListOptions) (*In
 				return err
 			}
 			appendPage(page.Objects)
+			if isOver() {
+				return ErrTooManyKeys
+			}
 			if !page.IsTruncated || page.NextToken == "" {
 				return nil
 			}

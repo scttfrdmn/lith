@@ -52,14 +52,21 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
-func TestMountAndBenchNotImplemented(t *testing.T) {
-	for _, sub := range []string{"mount", "bench"} {
+// TestMountAndBenchArgValidation checks the arg counts for the read-path
+// commands (they are implemented in M2; full behavior is exercised on a Linux
+// devbox, not in unit tests).
+func TestMountAndBenchArgValidation(t *testing.T) {
+	cases := []struct{ sub, wantErr string }{
+		{"mount", "accepts 2 arg"},
+		{"bench", "accepts 1 arg"},
+	}
+	for _, tc := range cases {
 		root := newRootCmd()
-		root.SetArgs([]string{sub})
+		root.SetArgs([]string{tc.sub})
 		root.SetOut(&bytes.Buffer{})
 		root.SetErr(&bytes.Buffer{})
-		if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "not implemented") {
-			t.Errorf("%s: err = %v, want 'not implemented'", sub, err)
+		if err := root.Execute(); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s: err = %v, want %q", tc.sub, err, tc.wantErr)
 		}
 	}
 }
