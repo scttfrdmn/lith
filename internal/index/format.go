@@ -18,9 +18,12 @@ import (
 // v2 adds the directory table (sorted dir paths, per-directory inodes and
 // mtimes). v1 files are rejected with a message to rebuild.
 
+// FormatVersion is the current on-disk index format version.
+const FormatVersion = 2
+
 const (
 	magic       = "LITHIDX1"
-	formatVer   = uint32(2)
+	formatVer   = uint32(FormatVersion)
 	headerSize  = 56 // magic(8)+ver(4)+flags(4)+keyCount(8)+dropped(8)+shadowed(8)+collisions(8)+dirCount(8)
 	flagExec    = uint32(1) << 0
 	byteOrderLE = 0

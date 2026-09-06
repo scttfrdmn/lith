@@ -198,7 +198,7 @@ func newIndexInspectCmd() *cobra.Command {
 			}
 			var b strings.Builder
 			fmt.Fprintf(&b, "index-file:        %s\n", args[0])
-			fmt.Fprintf(&b, "format-version:    %d\n", 1)
+			fmt.Fprintf(&b, "format-version:    %d\n", index.FormatVersion)
 			fmt.Fprintf(&b, "bucket:            %s\n", ix.Bucket())
 			fmt.Fprintf(&b, "prefix:            %s\n", ix.Prefix())
 			fmt.Fprintf(&b, "keys:              %d\n", n)
