@@ -376,6 +376,8 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	}
 	_, _ = fmt.Fprintf(tw, "conn ramp :443 (t=1/2/3s, max)\t%s\t-\n", tl.connRamp())
 	_, _ = fmt.Fprintf(tw, "prefetch sem wait p99\t%s\t-\n", rec.waitP99())
+	_, _ = fmt.Fprintf(tw, "prefetch issued / uncovered\t%d / %d\t-\n",
+		atomic.LoadInt64(&rec.prefetchIssued), atomic.LoadInt64(&rec.uncovered))
 	_ = tw.Flush()
 	return nil
 }
