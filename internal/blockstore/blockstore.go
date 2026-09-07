@@ -407,10 +407,14 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 // ETag, and completes each chunk's waiters as its bytes arrive.
 func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize int64, isPrefetch bool, owned []*chunkState) error {
 	// Acquire concurrency (prefetch takes a sub-limited slot first so it cannot
-	// consume all demand capacity).
+	// consume all demand capacity). Time the wait so the bimodality
+	// investigation (#49) can see whether prefetch fills are starving on the
+	// semaphore.
 	if isPrefetch {
+		waitStart := time.Now()
 		select {
 		case bs.prefetch <- struct{}{}:
+			bs.recordPrefetchWait(time.Since(waitStart))
 			defer func() { <-bs.prefetch }()
 		case <-ctx.Done():
 			bs.failRun(k, first, owned, ctx.Err())
@@ -635,5 +639,19 @@ func (bs *BlockStore) StaleKeys() []string {
 func (bs *BlockStore) record(fn func(Recorder)) {
 	if bs.rec != nil {
 		fn(bs.rec)
+	}
+}
+
+// prefetchWaitRecorder is an optional Recorder extension: implementers receive
+// the time each prefetch fill spent blocked acquiring the prefetch semaphore.
+// Kept optional (type assertion) so existing Recorder implementers need not
+// change.
+type prefetchWaitRecorder interface {
+	PrefetchWait(d time.Duration)
+}
+
+func (bs *BlockStore) recordPrefetchWait(d time.Duration) {
+	if r, ok := bs.rec.(prefetchWaitRecorder); ok {
+		r.PrefetchWait(d)
 	}
 }

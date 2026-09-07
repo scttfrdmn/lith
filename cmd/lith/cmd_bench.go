@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +43,7 @@ type benchFlags struct {
 	maxReadahead  int64
 	diskWriters   int
 	inflightBytes string
+	timelineCSV   string
 
 	noSignRequest bool
 	requesterPays bool
@@ -80,6 +84,7 @@ func newBenchCmd() *cobra.Command {
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
+	fl.StringVar(&f.timelineCSV, "timeline-csv", "", "in --readers mode, write a per-second per-reader MB/s timeline to this CSV")
 	fl.BoolVar(&f.noSignRequest, "no-sign-request", false, "send anonymous requests (public buckets)")
 	fl.BoolVar(&f.requesterPays, "requester-pays", false, "add the requester-pays header")
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
@@ -95,6 +100,9 @@ type countingRecorder struct {
 	prefetchIssued int64
 	prefetchHit    int64
 	uncovered      int64
+
+	waitMu    sync.Mutex
+	waitNanos []int64 // prefetch-semaphore wait durations (ns)
 }
 
 func (c *countingRecorder) MemHit()        {}
@@ -110,6 +118,27 @@ func (c *countingRecorder) StaleKey(string) {}
 func (c *countingRecorder) PrefetchIssued() { atomic.AddInt64(&c.prefetchIssued, 1) }
 func (c *countingRecorder) PrefetchHit()    { atomic.AddInt64(&c.prefetchHit, 1) }
 func (c *countingRecorder) UncoveredMiss()  { atomic.AddInt64(&c.uncovered, 1) }
+func (c *countingRecorder) PrefetchWait(d time.Duration) {
+	c.waitMu.Lock()
+	c.waitNanos = append(c.waitNanos, d.Nanoseconds())
+	c.waitMu.Unlock()
+}
+
+// waitP99 returns the p99 prefetch-semaphore wait time.
+func (c *countingRecorder) waitP99() time.Duration {
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	if len(c.waitNanos) == 0 {
+		return 0
+	}
+	s := append([]int64(nil), c.waitNanos...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	i := int(0.99 * float64(len(s)))
+	if i >= len(s) {
+		i = len(s) - 1
+	}
+	return time.Duration(s[i])
+}
 
 // runResult captures one pattern run.
 type runResult struct {
@@ -132,11 +161,19 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	}
 	windowBytes := f.maxReadahead * blockSize
 
-	client, err := newS3Client(ctx, s3client.Config{
+	// In --readers mode, count every HTTP attempt by status so the report can
+	// separate 503s/retries (the #49 bimodality investigation).
+	var s3status *statusCounter
+	cfg := s3client.Config{
 		Bucket: bucket, Region: f.region, NoSignRequest: f.noSignRequest,
 		RequesterPays: f.requesterPays, Endpoint: f.endpoint, PathStyle: f.pathStyle,
 		Concurrency: f.s3Concurrency,
-	})
+	}
+	if f.readers > 0 {
+		s3status = &statusCounter{}
+		cfg.TransportWrap = s3status.wrap
+	}
+	client, err := newS3Client(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -160,7 +197,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	}
 
 	if f.readers > 0 {
-		return runMultiReader(ctx, out, f, client, mkStore, cacheBase)
+		return runMultiReader(ctx, out, f, client, mkStore, cacheBase, s3status)
 	}
 	if key == "" {
 		return fmt.Errorf("bench needs an object key: s3://bucket/key")
@@ -282,7 +319,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	return nil
 }
 
-func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3client.API, mkStore func(string) (*blockstore.BlockStore, *countingRecorder, error), cacheBase string) error {
+func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3client.API, mkStore func(string) (*blockstore.BlockStore, *countingRecorder, error), cacheBase string, s3status *statusCounter) error {
 	if f.objects == "" {
 		return fmt.Errorf("--readers requires --objects (comma-separated keys)")
 	}
@@ -306,7 +343,15 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	for i, k := range keys {
 		litPaths[i] = filepath.Join(mnt, k)
 	}
-	litAgg, litPer := runReadersPaths(litPaths)
+	litAgg, litPer, tl := runReadersTimeline(litPaths)
+
+	if f.timelineCSV != "" {
+		if werr := tl.writeCSV(f.timelineCSV); werr != nil {
+			_, _ = fmt.Fprintf(out, "timeline CSV write failed: %v\n", werr)
+		} else {
+			_, _ = fmt.Fprintf(out, "per-reader timeline written to %s\n", f.timelineCSV)
+		}
+	}
 
 	_, _ = fmt.Fprintf(out, "bench readers=%d objects=%d (cold)\n\n", len(keys), len(keys))
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -325,6 +370,12 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	_, _ = fmt.Fprintf(tw, "per-reader MB/s (min/med)\t%.0f / %.0f\t%s\n",
 		minFloat(litPer), medianFloat(litPer), perReaderCol(f.against != "", againstPer))
 	_, _ = fmt.Fprintf(tw, "S3 requests\t%d\t%s\n", atomic.LoadInt64(&rec.reqs), naIf(f.against != ""))
+	// #49 instrumentation.
+	if s3status != nil {
+		_, _ = fmt.Fprintf(tw, "S3 attempts (2xx/503/other-5xx/4xx)\t%s\t-\n", s3status.summary())
+	}
+	_, _ = fmt.Fprintf(tw, "conn ramp :443 (t=1/2/3s, max)\t%s\t-\n", tl.connRamp())
+	_, _ = fmt.Fprintf(tw, "prefetch sem wait p99\t%s\t-\n", rec.waitP99())
 	_ = tw.Flush()
 	return nil
 }
@@ -357,6 +408,202 @@ func runReadersPaths(paths []string) (float64, []float64) {
 		agg = float64(atomic.LoadInt64(&totalBytes)) / (1 << 20) / elapsed
 	}
 	return agg, per
+}
+
+// statusCounter wraps an http.RoundTripper and tallies every HTTP attempt by
+// status class (including SDK retries, since each attempt is one RoundTrip),
+// so the #49 report can separate 503 throttles from clean responses.
+type statusCounter struct {
+	ok2xx    int64
+	throttle int64 // HTTP 503
+	other5xx int64
+	err4xx   int64
+	rt       http.RoundTripper
+}
+
+func (s *statusCounter) wrap(rt http.RoundTripper) http.RoundTripper {
+	s.rt = rt
+	return s
+}
+
+func (s *statusCounter) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := s.rt.RoundTrip(r)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	switch {
+	case resp.StatusCode == 503:
+		atomic.AddInt64(&s.throttle, 1)
+	case resp.StatusCode >= 500:
+		atomic.AddInt64(&s.other5xx, 1)
+	case resp.StatusCode >= 400:
+		atomic.AddInt64(&s.err4xx, 1)
+	default:
+		atomic.AddInt64(&s.ok2xx, 1)
+	}
+	return resp, err
+}
+
+func (s *statusCounter) summary() string {
+	return fmt.Sprintf("%d / %d / %d / %d",
+		atomic.LoadInt64(&s.ok2xx), atomic.LoadInt64(&s.throttle),
+		atomic.LoadInt64(&s.other5xx), atomic.LoadInt64(&s.err4xx))
+}
+
+// timeline holds per-second per-reader throughput and :443 connection counts
+// sampled during a multi-reader run.
+type timeline struct {
+	perSec [][]float64 // [second][reader] MB/s during that second
+	conns  []int       // established :443 connections at each second
+}
+
+func (t *timeline) writeCSV(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = fmt.Fprint(f, "second,conns443")
+	if len(t.perSec) > 0 {
+		for i := range t.perSec[0] {
+			_, _ = fmt.Fprintf(f, ",reader%d_MBps", i)
+		}
+	}
+	_, _ = fmt.Fprintln(f)
+	for s, row := range t.perSec {
+		_, _ = fmt.Fprintf(f, "%d,%d", s+1, t.conns[s])
+		for _, v := range row {
+			_, _ = fmt.Fprintf(f, ",%.0f", v)
+		}
+		_, _ = fmt.Fprintln(f)
+	}
+	return nil
+}
+
+func (t *timeline) connRamp() string {
+	at := func(sec int) int {
+		if sec-1 >= 0 && sec-1 < len(t.conns) {
+			return t.conns[sec-1]
+		}
+		return 0
+	}
+	mx := 0
+	for _, c := range t.conns {
+		if c > mx {
+			mx = c
+		}
+	}
+	return fmt.Sprintf("%d/%d/%d, max %d", at(1), at(2), at(3), mx)
+}
+
+// runReadersTimeline is runReadersPaths plus a per-second sampler: it records
+// each reader's MB/s and the :443 connection count every second (#49).
+func runReadersTimeline(paths []string) (float64, []float64, *timeline) {
+	n := len(paths)
+	prog := make([]atomic.Int64, n) // cumulative bytes per reader
+	per := make([]float64, n)
+	sizes := make([]int64, n)
+	tl := &timeline{}
+	done := make(chan struct{})
+
+	var samplerWG sync.WaitGroup
+	samplerWG.Add(1)
+	go func() {
+		defer samplerWG.Done()
+		last := make([]int64, n)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				row := make([]float64, n)
+				for i := 0; i < n; i++ {
+					cur := prog[i].Load()
+					row[i] = float64(cur-last[i]) / (1 << 20) // MB in 1 s == MB/s
+					last[i] = cur
+				}
+				tl.perSec = append(tl.perSec, row)
+				tl.conns = append(tl.conns, sampleConns443())
+			}
+		}
+	}()
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			fi, err := os.Stat(p)
+			if err != nil {
+				return
+			}
+			sizes[i] = fi.Size()
+			per[i] = readSeqProgress(p, fi.Size(), &prog[i])
+		}(i, p)
+	}
+	wg.Wait()
+	close(done)
+	samplerWG.Wait()
+
+	elapsed := time.Since(start).Seconds()
+	var total int64
+	for _, s := range sizes {
+		total += s
+	}
+	agg := 0.0
+	if elapsed > 0 {
+		agg = float64(total) / (1 << 20) / elapsed
+	}
+	return agg, per, tl
+}
+
+// readSeqProgress reads path sequentially in 1 MiB preads, publishing
+// cumulative bytes to prog for the per-second sampler.
+func readSeqProgress(path string, size int64, prog *atomic.Int64) float64 {
+	fd, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = fd.Close() }()
+	const chunk = 1 << 20
+	buf := make([]byte, chunk)
+	start := time.Now()
+	var total int64
+	for off := int64(0); off < size; off += chunk {
+		nn := int64(chunk)
+		if off+nn > size {
+			nn = size - off
+		}
+		got, e := fd.ReadAt(buf[:nn], off)
+		total += int64(got)
+		prog.Add(int64(got))
+		if e != nil && e != io.EOF {
+			break
+		}
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed > 0 {
+		return float64(total) / (1 << 20) / elapsed
+	}
+	return 0
+}
+
+// sampleConns443 counts established connections to :443 via ss.
+func sampleConns443() int {
+	out, err := exec.Command("ss", "-tn", "state", "established").CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, ":443") {
+			n++
+		}
+	}
+	return n
 }
 
 // benchOnce runs a pattern over a file via pread, returning throughput, TTFB,
