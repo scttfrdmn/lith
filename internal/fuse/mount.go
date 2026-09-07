@@ -16,6 +16,10 @@ type MountOptions struct {
 // serving in the background. The caller waits on the returned server and calls
 // Unmount to tear it down.
 func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error) {
+	// Raise fs.pipe-max-size BEFORE go-fuse reads (and caches) it, so its splice
+	// pipe can grow to hold a 1 MiB reply. Best-effort (needs privilege).
+	_ = raisePipeMaxSize(2 << 20)
+
 	raw := NewRawFileSystem(cfg)
 
 	// [agent/fuse-splice] Negotiate 1 MiB requests (max_pages=256 via MaxWrite)
@@ -44,9 +48,7 @@ func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error)
 	// [agent/fuse-splice] Enable 1 MiB reads that still splice zero-copy:
 	// raise the readahead so the kernel issues 1 MiB reads, and raise
 	// fs.pipe-max-size so go-fuse can grow its splice pipe to fit the reply.
-	// Both best-effort (need privilege); a failure just falls back to the
-	// previous behaviour.
-	_ = raisePipeMaxSize(2 << 20)
+	// Best-effort (needs privilege); a failure just falls back to 128 KiB reads.
 	_ = setReadAheadKB(mountpoint, 1024)
 	return srv, nil
 }
