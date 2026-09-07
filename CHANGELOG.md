@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The memory tier is **sharded** into 64 independently-locked 2Q shards, keyed
+  by chunk hash. Under concurrent readers this removes the single memory-tier
+  mutex as a serialization point (profiling showed ~all mutex delay there,
+  held during an O(n) eviction scan).
+- New `--inflight-bytes` budget bounds total bytes in flight to S3 (default
+  2 × NIC bandwidth × 100 ms, detected via `ethtool`; 512 MiB fallback).
+  `--s3-concurrency` remains a request-count hard cap.
 - The disk cache tier is now **write-behind**: a fill completes its readers as
   soon as the bytes are in the memory tier, and the disk write is handed to a
   bounded pool (`--disk-writers`, default 4) off the fill path. Memory chunks

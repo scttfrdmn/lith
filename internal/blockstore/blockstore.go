@@ -72,7 +72,8 @@ type Config struct {
 	DiskPath      string
 	MaxRange      int64
 	S3Concurrency int
-	DiskWriters   int // write-behind workers for the disk tier (default 4)
+	DiskWriters   int   // write-behind workers for the disk tier (default 4)
+	InflightBytes int64 // bytes-in-flight budget (0 disables byte gating)
 	Recorder      Recorder
 }
 
@@ -93,8 +94,9 @@ type BlockStore struct {
 	mem  *memCache
 	disk *diskTier
 
-	sem      chan struct{} // total S3 concurrency
+	sem      chan struct{} // total S3 request-count hard cap
 	prefetch chan struct{} // sub-limit so prefetch cannot starve demand
+	budget   *bytesBudget  // bytes-in-flight budget (nil = disabled)
 
 	rec Recorder
 
@@ -152,6 +154,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		disk:        disk,
 		sem:         make(chan struct{}, conc),
 		prefetch:    make(chan struct{}, max(1, conc/2)),
+		budget:      newBytesBudget(cfg.InflightBytes),
 		rec:         cfg.Recorder,
 		inflight:    make(map[string]*chunkState),
 		stale:       make(map[string]struct{}),
@@ -407,6 +410,12 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 		end = objSize
 	}
 	length := end - off
+
+	// Bound total bytes in flight (bandwidth-delay product) on top of the
+	// request-count cap.
+	if got := bs.budget.acquire(length); got > 0 {
+		defer bs.budget.release(got)
+	}
 
 	bs.record(func(r Recorder) { r.StartInflight() })
 	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)

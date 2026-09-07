@@ -34,6 +34,7 @@ type mountFlags struct {
 	s3Concurrency  int
 	maxReadahead   int64
 	diskWriters    int
+	inflightBytes  string
 	metrics        string
 	allowOther     bool
 	uid            int
@@ -75,6 +76,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
 	fl.BoolVar(&f.allowOther, "allow-other", false, "allow other users to access the mount")
 	fl.IntVar(&f.uid, "uid", os.Getuid(), "owner uid for all files")
@@ -157,6 +159,8 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if f.metrics != "" {
 		met = metrics.New()
 	}
+	inflight, inflightDesc := computeInflightBytes(f.inflightBytes)
+	log.Info("inflight-bytes budget", "budget", inflightDesc)
 	bs, err := blockstore.New(client, blockstore.Config{
 		Bucket:        bucket,
 		BlockSize:     blockSize,
@@ -166,6 +170,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		MaxRange:      maxRange,
 		S3Concurrency: f.s3Concurrency,
 		DiskWriters:   f.diskWriters,
+		InflightBytes: inflight,
 		Recorder:      met, // nil-safe
 	})
 	if err != nil {

@@ -37,6 +37,7 @@ type benchFlags struct {
 	s3Concurrency int
 	maxReadahead  int64
 	diskWriters   int
+	inflightBytes string
 
 	noSignRequest bool
 	requesterPays bool
@@ -74,6 +75,7 @@ func newBenchCmd() *cobra.Command {
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.BoolVar(&f.noSignRequest, "no-sign-request", false, "send anonymous requests (public buckets)")
 	fl.BoolVar(&f.requesterPays, "requester-pays", false, "add the requester-pays header")
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
@@ -139,10 +141,11 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 
 	mkStore := func(cacheDir string) (*blockstore.BlockStore, *countingRecorder, error) {
 		rec := &countingRecorder{}
+		inflight, _ := computeInflightBytes(f.inflightBytes)
 		bs, berr := blockstore.New(client, blockstore.Config{
 			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
 			DiskCache: diskCache, DiskPath: cacheDir, S3Concurrency: f.s3Concurrency,
-			DiskWriters: f.diskWriters, Recorder: rec,
+			DiskWriters: f.diskWriters, InflightBytes: inflight, Recorder: rec,
 		})
 		return bs, rec, berr
 	}
