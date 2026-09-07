@@ -66,6 +66,15 @@ func tuneTransport(t *http.Transport, concurrency int) {
 	t.ExpectContinueTimeout = time.Second
 }
 
+// TransportInfo describes the tuned transport for a given concurrency, for
+// diagnostics/logging. It mirrors what tuneTransport sets.
+func TransportInfo(concurrency int) string {
+	if concurrency <= 0 {
+		concurrency = 64
+	}
+	return fmt.Sprintf("http2=off MaxConnsPerHost=0(unlimited) MaxIdleConnsPerHost=%d IdleConnTimeout=90s", concurrency)
+}
+
 // buildTransport returns a freshly tuned transport (used by tests).
 func buildTransport(concurrency int) *http.Transport {
 	t := &http.Transport{}

@@ -72,9 +72,14 @@ type Config struct {
 	DiskPath      string
 	MaxRange      int64
 	S3Concurrency int
-	DiskWriters   int   // write-behind workers for the disk tier (default 4)
-	InflightBytes int64 // bytes-in-flight budget (0 disables byte gating)
-	Recorder      Recorder
+	// PrefetchConcurrency caps concurrent prefetch fills. <=0 defaults to
+	// S3Concurrency (prefetch may use the whole request budget). A value below
+	// S3Concurrency reserves the remainder for demand fills so prefetch cannot
+	// starve them.
+	PrefetchConcurrency int
+	DiskWriters         int   // write-behind workers for the disk tier (default 4)
+	InflightBytes       int64 // bytes-in-flight budget (0 disables byte gating)
+	Recorder            Recorder
 }
 
 // chunkState is an in-flight (or just-completed) chunk fetch.
@@ -95,7 +100,7 @@ type BlockStore struct {
 	disk *diskTier
 
 	sem      chan struct{} // total S3 request-count hard cap
-	prefetch chan struct{} // sub-limit so prefetch cannot starve demand
+	prefetch chan struct{} // cap on concurrent prefetch fills (<= sem)
 	budget   *bytesBudget  // bytes-in-flight budget (nil = disabled)
 
 	rec Recorder
@@ -137,6 +142,13 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	if conc <= 0 {
 		conc = 64
 	}
+	prefetchConc := cfg.PrefetchConcurrency
+	if prefetchConc <= 0 {
+		prefetchConc = conc
+	}
+	if prefetchConc > conc {
+		prefetchConc = conc
+	}
 	var disk *diskTier
 	if cfg.DiskCache > 0 {
 		d, err := newDiskTier(filepath.Join(cfg.DiskPath, diskFormat), cfg.DiskCache)
@@ -153,7 +165,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		mem:         newMemCache(cfg.MemCache, 64),
 		disk:        disk,
 		sem:         make(chan struct{}, conc),
-		prefetch:    make(chan struct{}, max(1, conc/2)),
+		prefetch:    make(chan struct{}, max(1, prefetchConc)),
 		budget:      newBytesBudget(cfg.InflightBytes),
 		rec:         cfg.Recorder,
 		inflight:    make(map[string]*chunkState),

@@ -35,6 +35,8 @@ type benchFlags struct {
 	readers       int
 	objects       string
 	s3Concurrency int
+	prefetchConc  int
+	maxRange      string
 	maxReadahead  int64
 	diskWriters   int
 	inflightBytes string
@@ -73,6 +75,8 @@ func newBenchCmd() *cobra.Command {
 	fl.IntVar(&f.readers, "readers", 0, "concurrent readers (multi-object mode); requires --objects")
 	fl.StringVar(&f.objects, "objects", "", "comma-separated keys for --readers mode")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
+	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
+	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
@@ -122,6 +126,10 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	}
 	memCache, _ := parseSize(f.memCache)
 	diskCache, _ := parseSize(f.diskCache)
+	maxRange, err := parseSize(f.maxRange)
+	if err != nil {
+		return err
+	}
 	windowBytes := f.maxReadahead * blockSize
 
 	client, err := newS3Client(ctx, s3client.Config{
@@ -144,7 +152,8 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 		inflight, _ := computeInflightBytes(f.inflightBytes)
 		bs, berr := blockstore.New(client, blockstore.Config{
 			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
-			DiskCache: diskCache, DiskPath: cacheDir, S3Concurrency: f.s3Concurrency,
+			DiskCache: diskCache, DiskPath: cacheDir, MaxRange: maxRange,
+			S3Concurrency: f.s3Concurrency, PrefetchConcurrency: f.prefetchConc,
 			DiskWriters: f.diskWriters, InflightBytes: inflight, Recorder: rec,
 		})
 		return bs, rec, berr
