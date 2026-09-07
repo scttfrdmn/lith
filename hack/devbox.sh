@@ -78,4 +78,7 @@ mount_nvme() {
 }
 mount_nvme
 
+log "raise fs.pipe-max-size for go-fuse splice of 1 MiB reads"
+sudo sysctl -w fs.pipe-max-size=2097152 >/dev/null 2>&1 || true
+
 log "done"
