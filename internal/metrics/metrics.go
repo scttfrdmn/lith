@@ -25,6 +25,7 @@ type Metrics struct {
 	prefetchIss prometheus.Counter
 	prefetchHit prometheus.Counter
 	uncovered   prometheus.Counter
+	straddle    prometheus.Counter
 	staleTotal  prometheus.Counter
 	fuseLatency *prometheus.HistogramVec // op
 }
@@ -58,6 +59,9 @@ func New() *Metrics {
 		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",
 		}),
+		straddle: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_read_straddle_total", Help: "Reads spanning a chunk boundary (assembled with a copy).",
+		}),
 		staleTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_stale_objects_total", Help: "Objects whose ETag no longer matched the index.",
 		}),
@@ -68,7 +72,7 @@ func New() *Metrics {
 		}, []string{"op"}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
-		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.staleTotal, m.fuseLatency)
+		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency)
 	return m
 }
 
@@ -137,6 +141,13 @@ func (m *Metrics) PrefetchHit() {
 func (m *Metrics) UncoveredMiss() {
 	if m != nil {
 		m.uncovered.Inc()
+	}
+}
+
+// ReadStraddle records a read that spanned a chunk boundary (assembled copy).
+func (m *Metrics) ReadStraddle() {
+	if m != nil {
+		m.straddle.Inc()
 	}
 }
 

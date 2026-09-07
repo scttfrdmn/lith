@@ -17,13 +17,18 @@ type MountOptions struct {
 // Unmount to tear it down.
 func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error) {
 	raw := NewRawFileSystem(cfg)
-	blockSize := int(cfg.Store.BlockSize())
 
+	// Ask the kernel for 1 MiB requests (max_pages = 256): go-fuse derives
+	// max_pages from MaxWrite, and the kernel caps read/readahead at it. One
+	// chunk per FUSE read means the read stays on the zero-copy single-chunk
+	// path (see Read) instead of being split into many small requests.
+	const oneMiB = 1 << 20
 	opts := &fuse.MountOptions{
 		AllowOther:   mo.AllowOther,
 		FsName:       mo.FsName,
 		Name:         "lith",
-		MaxReadAhead: blockSize,
+		MaxWrite:     oneMiB,
+		MaxReadAhead: oneMiB,
 		// Read-only mount; the kernel enforces it and lith returns EROFS anyway.
 		Options: []string{"ro"},
 	}

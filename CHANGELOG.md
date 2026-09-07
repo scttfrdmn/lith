@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The FUSE mount now negotiates 1 MiB requests (`max_pages` = 256 via
+  `MaxWrite`), so the kernel issues one read per 1 MiB chunk (~1024 read
+  ops/GiB instead of ~8192) and reads stay on the zero-copy path.
+- A read contained within one chunk returns a sub-slice of the (immutable,
+  cached) chunk buffer directly to the kernel — no allocation and no copy on a
+  cache hit. Boundary-straddling reads still assemble and are counted in
+  `lith_read_straddle_total` (≈0 for aligned sequential reads).
 - The memory tier is **sharded** into 64 independently-locked 2Q shards, keyed
   by chunk hash. Under concurrent readers this removes the single memory-tier
   mutex as a serialization point (profiling showed ~all mutex delay there,

@@ -454,6 +454,39 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 	return nil
 }
 
+// Chunk returns the bytes of a single chunk (the whole chunk, short for the
+// last one), for a demand read fully contained in that chunk. It returns the
+// cached/fetched buffer directly — no copy and, on a cache hit, no allocation —
+// so the FUSE layer can hand a sub-slice straight to the kernel. The buffer is
+// immutable; the Go runtime keeps it alive while the reply references it.
+func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]byte, error) {
+	if d, tier := bs.lookup(k, ci); tier != "" {
+		switch tier {
+		case "mem":
+			bs.record(func(r Recorder) { r.MemHit() })
+		case "disk":
+			bs.record(func(r Recorder) { r.DiskHit() })
+		}
+		bs.notePrefetchHit(bs.cacheKey(k, ci))
+		return d, nil
+	}
+	bs.record(func(r Recorder) { r.Miss() })
+	cs, mine, cachedData, cached := bs.claim(k, ci)
+	if cached {
+		return cachedData, nil
+	}
+	if !mine {
+		<-cs.done
+		return cs.data, cs.err
+	}
+	bs.record(func(r Recorder) { r.UncoveredMiss() })
+	owned := []*chunkState{cs}
+	if err := bs.fillRun(ctx, k, ci, ci, objSize, false, owned); err != nil {
+		return nil, err
+	}
+	return owned[0].data, nil
+}
+
 // failRun completes every owned chunk in a run with err.
 func (bs *BlockStore) failRun(k Key, first int64, owned []*chunkState, err error) {
 	for idx := range owned {

@@ -223,21 +223,45 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fu
 
 	f.maybeWholeFile(h)
 
-	data, err := f.store.GetRange(f.ctx, h.key, int64(input.Offset), int64(len(buf)), h.size)
-	if err == blockstore.ErrStale {
-		return nil, fuse.EIO
-	}
-	if err != nil {
-		return nil, fuse.EIO
+	off := int64(input.Offset)
+	length := int64(len(buf))
+	end := off + length
+	if end > h.size {
+		end = h.size
 	}
 
-	// Drive the prefetcher off the first block of this read.
-	blk := int64(input.Offset) / f.blockSize
+	var res fuse.ReadResult
+	if off < end && off/blockstore.ChunkSize == (end-1)/blockstore.ChunkSize {
+		// Read lies within one chunk: return a sub-slice of the (immutable)
+		// chunk buffer directly — no copy, no allocation on a cache hit.
+		ci := off / blockstore.ChunkSize
+		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size)
+		if err != nil {
+			return nil, fuse.EIO
+		}
+		lo := off - ci*blockstore.ChunkSize
+		hi := lo + (end - off)
+		if hi > int64(len(chunk)) {
+			hi = int64(len(chunk))
+		}
+		res = fuse.ReadResultData(chunk[lo:hi])
+	} else {
+		// Straddles a chunk boundary: assemble (a copy).
+		f.cfg.Metrics.ReadStraddle()
+		data, err := f.store.GetRange(f.ctx, h.key, off, length, h.size)
+		if err != nil {
+			return nil, fuse.EIO
+		}
+		res = fuse.ReadResultData(data)
+	}
+
+	// Drive the prefetcher off the block this read falls in.
+	blk := off / f.blockSize
 	for _, pb := range h.pf.observe(blk) {
 		pb := pb
 		go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 	}
-	return fuse.ReadResultData(data), fuse.OK
+	return res, fuse.OK
 }
 
 // maybeWholeFile fetches an entire small file on first read.
