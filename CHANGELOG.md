@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lith bench` now reads through an actual lith mount via `pread`, so the FUSE
   per-handle prefetcher is exercised (it previously read the block store
   directly and never prefetched).
+- Default `--s3-concurrency` raised to **128** and `--max-readahead` to **64**
+  (from 64 and 32). On a c8gd.4xlarge in-region against `s3://1000genomes`,
+  128/64 won on both cold sequential (1248 MB/s vs 1126 at 64/32) and cold
+  stride, so it wins on both workloads the tuning grid measured.
 - Index file format bumped to **v2**: the directory table now stores a
   per-directory inode and mtime. v1 index files are rejected on load with a
   message to rebuild.
