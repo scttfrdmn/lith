@@ -18,17 +18,17 @@ type MountOptions struct {
 func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error) {
 	raw := NewRawFileSystem(cfg)
 
-	// Ask the kernel for 1 MiB requests (max_pages = 256): go-fuse derives
-	// max_pages from MaxWrite, and the kernel caps read/readahead at it. One
-	// chunk per FUSE read means the read stays on the zero-copy single-chunk
-	// path (see Read) instead of being split into many small requests.
-	const oneMiB = 1 << 20
+	// Leave MaxWrite at the go-fuse default (128 KiB): the kernel then issues
+	// 128 KiB reads that fit go-fuse's splice pipe, so each read reply is
+	// spliced to the kernel with no copy. Forcing 1 MiB reads (bumping the bdi
+	// readahead) cut FUSE syscalls but made each reply exceed the pipe, forcing
+	// a copy — a net loss for the CPU-bound multi-reader path. Each 128 KiB
+	// read still lands within one 1 MiB chunk and takes the zero-copy
+	// single-chunk path in Read.
 	opts := &fuse.MountOptions{
-		AllowOther:   mo.AllowOther,
-		FsName:       mo.FsName,
-		Name:         "lith",
-		MaxWrite:     oneMiB,
-		MaxReadAhead: oneMiB,
+		AllowOther: mo.AllowOther,
+		FsName:     mo.FsName,
+		Name:       "lith",
 		// Read-only mount; the kernel enforces it and lith returns EROFS anyway.
 		Options: []string{"ro"},
 	}
@@ -41,8 +41,5 @@ func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error)
 	if err := srv.WaitMount(); err != nil {
 		return nil, err
 	}
-	// Raise the kernel readahead so it issues 1 MiB reads (one chunk).
-	// Best-effort: needs privilege to write /sys.
-	_ = setReadAheadKB(mountpoint, 1024)
 	return srv, nil
 }
