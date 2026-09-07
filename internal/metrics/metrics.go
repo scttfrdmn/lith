@@ -76,6 +76,17 @@ func New() *Metrics {
 	return m
 }
 
+// RegisterQueueDepth registers a gauge that samples f on each scrape (used for
+// the disk write-behind queue depth).
+func (m *Metrics) RegisterQueueDepth(f func() float64) {
+	if m == nil {
+		return
+	}
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_disk_write_queue_depth", Help: "Chunks queued for the write-behind disk writer.",
+	}, f))
+}
+
 // Handler returns the Prometheus HTTP handler for this registry.
 func (m *Metrics) Handler() http.Handler {
 	if m == nil {

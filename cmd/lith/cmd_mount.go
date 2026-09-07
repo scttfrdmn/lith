@@ -177,6 +177,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 	defer bs.Close()
+	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 
 	fcfg := fusefs.Config{
 		Index:        ix,

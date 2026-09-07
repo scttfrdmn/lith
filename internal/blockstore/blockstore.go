@@ -216,6 +216,15 @@ func (bs *BlockStore) Close() {
 	})
 }
 
+// QueueDepth returns the number of chunks queued for the write-behind disk
+// writer (0 when the disk tier is disabled).
+func (bs *BlockStore) QueueDepth() int {
+	if bs.diskWrites == nil {
+		return 0
+	}
+	return len(bs.diskWrites)
+}
+
 // BlockSize returns the fill/readahead unit in bytes.
 func (bs *BlockStore) BlockSize() int64 { return bs.blockChunks * ChunkSize }
 
