@@ -16,7 +16,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -32,27 +31,15 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/scttfrdmn/lith/internal/s3client"
 )
 
-// tuneTransport mirrors internal/s3client.tuneTransport (design §4.5) so the
-// harness exercises the exact transport lith uses. readBuffer, when > 0, sets
-// http.Transport.ReadBufferSize (0 = Go default 4 KiB) — a diagnostic knob.
+// tuneTransport applies lith's exact transport tuning (via the shared
+// s3client.TuneTransport, design §4.5) and layers on the diagnostic-only
+// readBuffer knob: when > 0 it sets http.Transport.ReadBufferSize (0 = Go
+// default 4 KiB).
 func tuneTransport(t *http.Transport, concurrency, readBuffer int) {
-	if concurrency <= 0 {
-		concurrency = 64
-	}
-	t.Proxy = http.ProxyFromEnvironment
-	t.DialContext = (&net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext
-	t.ForceAttemptHTTP2 = false
-	t.MaxConnsPerHost = 0
-	t.MaxIdleConns = concurrency * 2
-	t.MaxIdleConnsPerHost = concurrency
-	t.IdleConnTimeout = 90 * time.Second
-	t.TLSHandshakeTimeout = 10 * time.Second
-	t.ExpectContinueTimeout = time.Second
+	s3client.TuneTransport(t, concurrency)
 	if readBuffer > 0 {
 		t.ReadBufferSize = readBuffer
 	}
