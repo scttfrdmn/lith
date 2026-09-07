@@ -45,10 +45,12 @@ type Client struct {
 
 var _ API = (*Client)(nil)
 
-// tuneTransport configures t for many concurrent range GETs against S3: a
+// TuneTransport configures t for many concurrent range GETs against S3: a
 // large connection pool, keep-alives, and HTTP/1.1 (S3 does not benefit from
 // HTTP/2). Fields are set individually to avoid copying the Transport's lock.
-func tuneTransport(t *http.Transport, concurrency int) {
+// Exported so diagnostic tooling (cmd/lith-s3bench) exercises the exact same
+// transport lith uses, rather than a divergent copy.
+func TuneTransport(t *http.Transport, concurrency int) {
 	if concurrency <= 0 {
 		concurrency = 64
 	}
@@ -66,10 +68,19 @@ func tuneTransport(t *http.Transport, concurrency int) {
 	t.ExpectContinueTimeout = time.Second
 }
 
+// TransportInfo describes the tuned transport for a given concurrency, for
+// diagnostics/logging. It mirrors what TuneTransport sets.
+func TransportInfo(concurrency int) string {
+	if concurrency <= 0 {
+		concurrency = 64
+	}
+	return fmt.Sprintf("http2=off MaxConnsPerHost=0(unlimited) MaxIdleConnsPerHost=%d IdleConnTimeout=90s", concurrency)
+}
+
 // buildTransport returns a freshly tuned transport (used by tests).
 func buildTransport(concurrency int) *http.Transport {
 	t := &http.Transport{}
-	tuneTransport(t, concurrency)
+	TuneTransport(t, concurrency)
 	return t
 }
 
@@ -78,7 +89,7 @@ func buildTransport(concurrency int) *http.Transport {
 // unit tests use the fake instead.
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-		tuneTransport(t, cfg.Concurrency)
+		TuneTransport(t, cfg.Concurrency)
 	})
 
 	loadOpts := []func(*config.LoadOptions) error{

@@ -32,6 +32,7 @@ type mountFlags struct {
 	maxRange       string
 	smallFile      string
 	s3Concurrency  int
+	prefetchConc   int
 	maxReadahead   int64
 	diskWriters    int
 	inflightBytes  string
@@ -74,6 +75,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
+	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
@@ -162,16 +164,17 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	inflight, inflightDesc := computeInflightBytes(f.inflightBytes)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
 	bs, err := blockstore.New(client, blockstore.Config{
-		Bucket:        bucket,
-		BlockSize:     blockSize,
-		MemCache:      memCache,
-		DiskCache:     diskCache,
-		DiskPath:      diskPath,
-		MaxRange:      maxRange,
-		S3Concurrency: f.s3Concurrency,
-		DiskWriters:   f.diskWriters,
-		InflightBytes: inflight,
-		Recorder:      met, // nil-safe
+		Bucket:              bucket,
+		BlockSize:           blockSize,
+		MemCache:            memCache,
+		DiskCache:           diskCache,
+		DiskPath:            diskPath,
+		MaxRange:            maxRange,
+		S3Concurrency:       f.s3Concurrency,
+		PrefetchConcurrency: f.prefetchConc,
+		DiskWriters:         f.diskWriters,
+		InflightBytes:       inflight,
+		Recorder:            met, // nil-safe
 	})
 	if err != nil {
 		return err
@@ -197,6 +200,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return fmt.Errorf("mount: %w", err)
 	}
 	log.Info("mounted", "bucket", bucket, "prefix", prefix, "mountpoint", mountpoint, "keys", ix.Len())
+	log.Info("s3 transport", "info", s3client.TransportInfo(f.s3Concurrency), "s3_concurrency", f.s3Concurrency)
 
 	// Serve metrics (and pprof) if requested.
 	var metricsSrv *http.Server
