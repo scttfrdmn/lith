@@ -24,6 +24,8 @@ type diskTier struct {
 
 	mu   sync.Mutex
 	size int64
+
+	putDelay time.Duration // test-only: simulate a slow disk in Put
 }
 
 func newDiskTier(root string, capacity int64) (*diskTier, error) {
@@ -64,6 +66,9 @@ func (d *diskTier) Get(cacheKey string) ([]byte, bool) {
 func (d *diskTier) Put(cacheKey string, data []byte) {
 	if d == nil || int64(len(data)) > d.capacity {
 		return
+	}
+	if d.putDelay > 0 {
+		time.Sleep(d.putDelay)
 	}
 	p := d.path(cacheKey)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {

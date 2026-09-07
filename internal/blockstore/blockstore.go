@@ -17,6 +17,8 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/zeebo/xxh3"
 )
@@ -70,6 +72,7 @@ type Config struct {
 	DiskPath      string
 	MaxRange      int64
 	S3Concurrency int
+	DiskWriters   int // write-behind workers for the disk tier (default 4)
 	Recorder      Recorder
 }
 
@@ -99,6 +102,17 @@ type BlockStore struct {
 	inflight   map[string]*chunkState
 	stale      map[string]struct{}
 	prefetched map[string]struct{}
+
+	// Write-behind disk tier: fills enqueue here and never block on the disk.
+	diskWrites    chan diskWriteReq
+	writersWG     sync.WaitGroup
+	closeOnce     sync.Once
+	pendingWrites atomic.Int64
+}
+
+type diskWriteReq struct {
+	cacheKey string
+	data     []byte
 }
 
 // New builds a BlockStore over src.
@@ -127,7 +141,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		}
 		disk = d
 	}
-	return &BlockStore{
+	bs := &BlockStore{
 		src:         src,
 		bucket:      cfg.Bucket,
 		blockChunks: blockChunks,
@@ -140,7 +154,50 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		inflight:    make(map[string]*chunkState),
 		stale:       make(map[string]struct{}),
 		prefetched:  make(map[string]struct{}),
-	}, nil
+	}
+	if disk != nil {
+		writers := cfg.DiskWriters
+		if writers <= 0 {
+			writers = 4
+		}
+		// Bounded queue so a fill enqueues without blocking; on overflow the
+		// disk write is dropped (best-effort cache) and the chunk unpinned.
+		bs.diskWrites = make(chan diskWriteReq, writers*64)
+		for i := 0; i < writers; i++ {
+			bs.writersWG.Add(1)
+			go bs.diskWriter()
+		}
+	}
+	return bs, nil
+}
+
+// diskWriter drains queued disk writes off the fill path.
+func (bs *BlockStore) diskWriter() {
+	defer bs.writersWG.Done()
+	for req := range bs.diskWrites {
+		bs.disk.Put(req.cacheKey, req.data)
+		bs.mem.Unpin(req.cacheKey)
+		bs.pendingWrites.Add(-1)
+	}
+}
+
+// Flush blocks until all queued disk writes have been persisted. Useful before
+// asserting disk-tier state and to guarantee the cache is durable at unmount.
+func (bs *BlockStore) Flush() {
+	for bs.pendingWrites.Load() > 0 {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Close stops the write-behind workers and waits for pending writes. Safe to
+// call once per store (e.g. at unmount).
+func (bs *BlockStore) Close() {
+	bs.closeOnce.Do(func() {
+		if bs.diskWrites != nil {
+			close(bs.diskWrites)
+			bs.writersWG.Wait()
+		}
+	})
 }
 
 // BlockSize returns the fill/readahead unit in bytes.
@@ -170,7 +227,20 @@ func (bs *BlockStore) lookup(k Key, ci int64) ([]byte, string) {
 func (bs *BlockStore) storeChunk(k Key, ci int64, data []byte) {
 	ck := bs.cacheKey(k, ci)
 	bs.mem.Put(ck, data)
-	bs.disk.Put(ck, data)
+	if bs.diskWrites == nil {
+		return
+	}
+	// Write-behind: pin the chunk in memory so it is not evicted before its
+	// disk write completes, then enqueue. If the queue is full, drop the write
+	// (the disk cache is best-effort) and unpin so the fill path never blocks.
+	bs.mem.Pin(ck)
+	bs.pendingWrites.Add(1)
+	select {
+	case bs.diskWrites <- diskWriteReq{cacheKey: ck, data: data}:
+	default:
+		bs.pendingWrites.Add(-1)
+		bs.mem.Unpin(ck)
+	}
 }
 
 // claim registers chunk ci as in-flight. It returns the chunk's state and
@@ -205,19 +275,27 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err
 	bs.mu.Unlock()
 }
 
-// ensureChunks guarantees chunks [c0, c1] are cached (or returns the first
-// error). It owns and fetches maximal contiguous runs of not-cached,
-// not-in-flight chunks (coalesced into one GET, bounded by maxChunks) and joins
-// chunks already in flight.
-func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize int64, isPrefetch bool) error {
+// ensureChunks guarantees chunks [c0, c1] are available, coalescing maximal
+// contiguous runs of not-cached, not-in-flight chunks into one GET (bounded by
+// maxChunks) and joining chunks already in flight. When out is non-nil it is
+// populated with each chunk's bytes, so a demand read assembles from the
+// fetched data directly rather than a second cache lookup (which the async
+// write-behind disk tier cannot guarantee is present yet).
+func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize int64, isPrefetch bool, out map[int64][]byte) error {
 	i := c0
 	for i <= c1 {
-		if _, tier := bs.lookup(k, i); tier != "" {
+		if d, tier := bs.lookup(k, i); tier != "" {
+			if out != nil {
+				out[i] = d
+			}
 			i++
 			continue
 		}
-		cs, mine, _, cached := bs.claim(k, i)
+		cs, mine, cachedData, cached := bs.claim(k, i)
 		if cached {
+			if out != nil {
+				out[i] = cachedData
+			}
 			i++
 			continue
 		}
@@ -225,6 +303,9 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			<-cs.done
 			if cs.err != nil {
 				return cs.err
+			}
+			if out != nil {
+				out[i] = cs.data
 			}
 			i++
 			continue
@@ -250,6 +331,11 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 		}
 		if err := bs.fillRun(ctx, k, i, j, objSize, isPrefetch, owned); err != nil {
 			return err
+		}
+		if out != nil {
+			for idx := range owned {
+				out[i+int64(idx)] = owned[idx].data
+			}
 		}
 		i = j + 1
 	}
@@ -358,14 +444,15 @@ func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize 
 		}
 	}
 
-	if err := bs.ensureChunks(ctx, k, c0, c1, objSize, false); err != nil {
+	chunks := make(map[int64][]byte, c1-c0+1)
+	if err := bs.ensureChunks(ctx, k, c0, c1, objSize, false, chunks); err != nil {
 		return nil, err
 	}
 
 	out := make([]byte, 0, end-off)
 	for ci := c0; ci <= c1; ci++ {
-		data, tier := bs.lookup(k, ci)
-		if tier == "" {
+		data, ok := chunks[ci]
+		if !ok {
 			return nil, fmt.Errorf("blockstore: chunk %d missing after fill", ci)
 		}
 		lo := int64(0)
@@ -410,7 +497,7 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 			}
 		}
 	}
-	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true)
+	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
 }
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a

@@ -36,6 +36,7 @@ type benchFlags struct {
 	objects       string
 	s3Concurrency int
 	maxReadahead  int64
+	diskWriters   int
 
 	noSignRequest bool
 	requesterPays bool
@@ -72,6 +73,7 @@ func newBenchCmd() *cobra.Command {
 	fl.StringVar(&f.objects, "objects", "", "comma-separated keys for --readers mode")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
+	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.BoolVar(&f.noSignRequest, "no-sign-request", false, "send anonymous requests (public buckets)")
 	fl.BoolVar(&f.requesterPays, "requester-pays", false, "add the requester-pays header")
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
@@ -139,7 +141,8 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 		rec := &countingRecorder{}
 		bs, berr := blockstore.New(client, blockstore.Config{
 			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
-			DiskCache: diskCache, DiskPath: cacheDir, S3Concurrency: f.s3Concurrency, Recorder: rec,
+			DiskCache: diskCache, DiskPath: cacheDir, S3Concurrency: f.s3Concurrency,
+			DiskWriters: f.diskWriters, Recorder: rec,
 		})
 		return bs, rec, berr
 	}
@@ -204,6 +207,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 		_ = dropPageCache()
 		res := benchOnce(filepath.Join(mnt, key), f.pattern, size, f.ops, windowBytes)
 		cleanup()
+		bs.Close()
 		_ = os.RemoveAll(cacheDir)
 
 		coldMBps = append(coldMBps, res.mbps)
@@ -229,6 +233,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	_ = benchOnce(filepath.Join(mnt, key), f.pattern, size, f.ops, windowBytes) // warm the cache
 	warm := benchOnce(filepath.Join(mnt, key), f.pattern, size, f.ops, windowBytes)
 	cleanup()
+	bs.Close()
 	_ = os.RemoveAll(warmCache)
 
 	// against
@@ -282,7 +287,7 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	if merr != nil {
 		return merr
 	}
-	defer func() { cleanup(); _ = os.RemoveAll(cacheDir) }()
+	defer func() { cleanup(); bs.Close(); _ = os.RemoveAll(cacheDir) }()
 
 	_ = dropPageCache()
 	litPaths := make([]string, len(keys))

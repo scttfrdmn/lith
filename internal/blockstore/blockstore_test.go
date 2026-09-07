@@ -208,6 +208,7 @@ func TestDiskTierServesWithMemoryDisabled(t *testing.T) {
 	if _, err := bs.GetRange(context.Background(), k, 0, 4096, size); err != nil {
 		t.Fatal(err)
 	}
+	bs.Flush() // wait for the write-behind disk write to land
 	first := srv.GetCalls
 	if _, err := bs.GetRange(context.Background(), k, 0, 4096, size); err != nil {
 		t.Fatal(err)

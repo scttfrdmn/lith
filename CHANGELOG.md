@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-directory inode and mtime. v1 index files are rejected on load with a
   message to rebuild.
 
+### Changed
+
+- The disk cache tier is now **write-behind**: a fill completes its readers as
+  soon as the bytes are in the memory tier, and the disk write is handed to a
+  bounded pool (`--disk-writers`, default 4) off the fill path. Memory chunks
+  with a pending disk write are pinned so they are not evicted before the write
+  lands. The metrics endpoint (`--metrics`) also serves Go `pprof`.
+
 ### Fixed
 
 - Prefetch now dispatches the readahead window **ahead of the demand cursor** —

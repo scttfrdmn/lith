@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/scttfrdmn/lith/internal/blockstore"
@@ -31,6 +33,7 @@ type mountFlags struct {
 	smallFile      string
 	s3Concurrency  int
 	maxReadahead   int64
+	diskWriters    int
 	metrics        string
 	allowOther     bool
 	uid            int
@@ -71,7 +74,8 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
-	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
+	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
 	fl.BoolVar(&f.allowOther, "allow-other", false, "allow other users to access the mount")
 	fl.IntVar(&f.uid, "uid", os.Getuid(), "owner uid for all files")
 	fl.IntVar(&f.gid, "gid", os.Getgid(), "owner gid for all files")
@@ -161,11 +165,13 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		DiskPath:      diskPath,
 		MaxRange:      maxRange,
 		S3Concurrency: f.s3Concurrency,
+		DiskWriters:   f.diskWriters,
 		Recorder:      met, // nil-safe
 	})
 	if err != nil {
 		return err
 	}
+	defer bs.Close()
 
 	fcfg := fusefs.Config{
 		Index:        ix,
@@ -186,10 +192,19 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	}
 	log.Info("mounted", "bucket", bucket, "prefix", prefix, "mountpoint", mountpoint, "keys", ix.Len())
 
-	// Serve metrics if requested.
+	// Serve metrics (and pprof) if requested.
 	var metricsSrv *http.Server
 	if met != nil {
-		metricsSrv = &http.Server{Addr: f.metrics, Handler: met.Handler()}
+		runtime.SetMutexProfileFraction(1)
+		runtime.SetBlockProfileRate(1)
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", met.Handler())
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		metricsSrv = &http.Server{Addr: f.metrics, Handler: mux}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Warn("metrics server stopped", "err", err)

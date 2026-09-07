@@ -55,3 +55,23 @@ func TestMem2QGhostPromotesToMain(t *testing.T) {
 		t.Errorf("re-inserted ghost key %q should be present", ghostKey)
 	}
 }
+
+func TestMem2QPinSurvivesEviction(t *testing.T) {
+	c := newMem2Q(50) // 5 x 10-byte blocks
+	blk := make([]byte, 10)
+	c.Put("keep", blk)
+	c.Pin("keep")
+	for i := 0; i < 30; i++ { // heavy pressure while pinned
+		c.Put("p"+strconv.Itoa(i), blk)
+	}
+	if _, ok := c.Get("keep"); !ok {
+		t.Fatal("pinned chunk was evicted under pressure")
+	}
+	c.Unpin("keep")
+	for i := 30; i < 60; i++ { // pressure after unpin
+		c.Put("p"+strconv.Itoa(i), blk)
+	}
+	if _, ok := c.Get("keep"); ok {
+		t.Error("unpinned chunk survived heavy eviction pressure")
+	}
+}
