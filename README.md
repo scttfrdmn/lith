@@ -77,6 +77,32 @@ be slower than just re-fetching it from S3 in-region. `lith mount` prints a
 warning if the `--disk-cache` path resolves onto the root filesystem or a
 network volume.
 
+## Sizing the node
+
+For cold reads the network is the ceiling: lith streams from S3, so its
+throughput is bounded by the instance's NIC, not by CPU or disk. Size the node
+to the bandwidth you want.
+
+- **Match the NIC baseline to your sustained demand.** Many instance classes
+  advertise a burst bandwidth well above their baseline (e.g. `c8gd.4xlarge` is
+  7.5 Gbps baseline, 15 Gbps burst). A short read stays in burst; a long or
+  many-file read drains the burst credits and settles at the baseline. In
+  measurement, a single cold sequential read of a >1 GiB object showed a
+  post-first-window p99 of **~4.9 ms on a 30 Gbps `c8gd.16xlarge`** versus
+  **~7.4 ms on a `c8gd.4xlarge`** once its burst credits depleted — same code,
+  different NIC headroom.
+- **For sustained or multi-reader workloads, pick a class whose *baseline*
+  meets your target,** or a 16xlarge+ where the advertised bandwidth is
+  sustained (no burst-credit model). A `c8gd.16xlarge` (30 Gbps) sustains
+  multi-GB/s aggregate; a 4xlarge will settle at ~0.9 GB/s under a long
+  many-reader run.
+- **Local NVMe (`d` instance types) is worth it for re-read and random
+  workloads** — point `--disk-cache` at the instance-store mount. Without it,
+  see "No NVMe?" above.
+- `lith` sizes its S3 concurrency to the bandwidth-delay product automatically
+  (`--inflight-bytes`, default 2 × NIC × 100 ms via `ethtool`); override it if
+  the NIC speed can't be detected.
+
 ## Testing
 
 Unit tests run with the race detector and touch no network:
