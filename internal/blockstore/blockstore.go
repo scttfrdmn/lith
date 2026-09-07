@@ -103,8 +103,10 @@ type BlockStore struct {
 	stale      map[string]struct{}
 	prefetched map[string]struct{}
 
-	// Write-behind disk tier: fills enqueue here and never block on the disk.
+	// Write-behind disk tier: prefetch fills apply backpressure on this queue
+	// (bounded), demand fills never block; shutdown drains via stop.
 	diskWrites    chan diskWriteReq
+	stop          chan struct{}
 	writersWG     sync.WaitGroup
 	closeOnce     sync.Once
 	pendingWrites atomic.Int64
@@ -160,9 +162,8 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		if writers <= 0 {
 			writers = 4
 		}
-		// Bounded queue so a fill enqueues without blocking; on overflow the
-		// disk write is dropped (best-effort cache) and the chunk unpinned.
 		bs.diskWrites = make(chan diskWriteReq, writers*64)
+		bs.stop = make(chan struct{})
 		for i := 0; i < writers; i++ {
 			bs.writersWG.Add(1)
 			go bs.diskWriter()
@@ -171,11 +172,24 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	return bs, nil
 }
 
-// diskWriter drains queued disk writes off the fill path.
+// diskWriter drains queued disk writes off the fill path until stopped, then
+// drains anything remaining in the queue.
 func (bs *BlockStore) diskWriter() {
 	defer bs.writersWG.Done()
-	for req := range bs.diskWrites {
-		bs.writeOne(req)
+	for {
+		select {
+		case req := <-bs.diskWrites:
+			bs.writeOne(req)
+		case <-bs.stop:
+			for {
+				select {
+				case req := <-bs.diskWrites:
+					bs.writeOne(req)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -192,8 +206,8 @@ func (bs *BlockStore) Flush() {
 func (bs *BlockStore) Close() {
 	bs.closeOnce.Do(func() {
 		if bs.diskWrites != nil {
-			bs.Flush() // let queued and detached writes finish (durable cache)
-			close(bs.diskWrites)
+			bs.Flush() // drain pending writes (durable cache) while workers run
+			close(bs.stop)
 			bs.writersWG.Wait()
 		}
 	})
@@ -223,29 +237,37 @@ func (bs *BlockStore) lookup(k Key, ci int64) ([]byte, string) {
 	return nil, ""
 }
 
-func (bs *BlockStore) storeChunk(k Key, ci int64, data []byte) {
-	ck := bs.cacheKey(k, ci)
-	bs.mem.Put(ck, data)
+// enqueueDiskWrite hands a chunk to the write-behind pool. A prefetch fill
+// blocks on a full queue (backpressure — prefetch should not outrun the disk),
+// keeping the pipeline bounded; a demand fill never blocks (it drops the disk
+// write on a full queue rather than delay the reader). The chunk is pinned in
+// memory until its write lands so it is not evicted and re-fetched.
+func (bs *BlockStore) enqueueDiskWrite(ck string, data []byte, blocking bool) {
 	if bs.diskWrites == nil {
 		return
 	}
-	// Write-behind: pin the chunk in memory so it is not evicted before its
-	// disk write completes, then enqueue. The fill path never blocks on the
-	// disk and the write is never dropped (see the full-queue case below).
 	bs.mem.Pin(ck)
 	bs.pendingWrites.Add(1)
 	req := diskWriteReq{cacheKey: ck, data: data}
+	if blocking {
+		select {
+		case bs.diskWrites <- req:
+		case <-bs.stop:
+			bs.writeOne(req) // shutting down: write inline so nothing is lost
+		}
+		return
+	}
 	select {
 	case bs.diskWrites <- req:
+	case <-bs.stop:
+		bs.writeOne(req)
 	default:
-		// Pool queue full: write in a detached goroutine rather than block the
-		// fill path or drop the write. Dropping would leave the chunk in memory
-		// only; once unpinned and evicted it would be re-fetched from S3.
-		go bs.writeOne(req)
+		bs.pendingWrites.Add(-1) // demand fill, queue full: skip disk
+		bs.mem.Unpin(ck)
 	}
 }
 
-// writeOne persists a single chunk (used when the write-behind queue is full).
+// writeOne persists a single chunk and releases its pin.
 func (bs *BlockStore) writeOne(req diskWriteReq) {
 	bs.disk.Put(req.cacheKey, req.data)
 	bs.mem.Unpin(req.cacheKey)
@@ -271,17 +293,23 @@ func (bs *BlockStore) claim(k Key, ci int64) (cs *chunkState, mine bool, cachedD
 	return cs, true, nil, false
 }
 
-// complete stores the chunk, wakes its waiters, and clears its in-flight entry.
-func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err error) {
+// complete wakes the chunk's waiters (with its bytes) and clears its in-flight
+// entry, then hands the disk write to the write-behind pool. Waiters are woken
+// before the (possibly blocking) disk enqueue so a joining demand read is never
+// delayed by disk backpressure. blocking is true for prefetch fills.
+func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err error, blocking bool) {
+	ck := bs.cacheKey(k, ci)
 	if err == nil {
-		bs.storeChunk(k, ci, data)
+		bs.mem.Put(ck, data)
 	}
 	cs.data, cs.err = data, err
 	close(cs.done)
-	ck := bs.cacheKey(k, ci)
 	bs.mu.Lock()
 	delete(bs.inflight, ck)
 	bs.mu.Unlock()
+	if err == nil {
+		bs.enqueueDiskWrite(ck, data, blocking)
+	}
 }
 
 // ensureChunks guarantees chunks [c0, c1] are available, coalescing maximal
@@ -408,11 +436,11 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 		if _, rerr := io.ReadFull(body, buf); rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
 			// Fail this and every remaining chunk in the run.
 			for r := idx; r < len(owned); r++ {
-				bs.complete(k, first+int64(r), owned[r], nil, rerr)
+				bs.complete(k, first+int64(r), owned[r], nil, rerr, isPrefetch)
 			}
 			return rerr
 		}
-		bs.complete(k, ci, owned[idx], buf, nil)
+		bs.complete(k, ci, owned[idx], buf, nil, isPrefetch)
 	}
 	return nil
 }
@@ -420,7 +448,7 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 // failRun completes every owned chunk in a run with err.
 func (bs *BlockStore) failRun(k Key, first int64, owned []*chunkState, err error) {
 	for idx := range owned {
-		bs.complete(k, first+int64(idx), owned[idx], nil, err)
+		bs.complete(k, first+int64(idx), owned[idx], nil, err, false)
 	}
 }
 
