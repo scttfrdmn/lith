@@ -175,9 +175,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 func (bs *BlockStore) diskWriter() {
 	defer bs.writersWG.Done()
 	for req := range bs.diskWrites {
-		bs.disk.Put(req.cacheKey, req.data)
-		bs.mem.Unpin(req.cacheKey)
-		bs.pendingWrites.Add(-1)
+		bs.writeOne(req)
 	}
 }
 
@@ -194,6 +192,7 @@ func (bs *BlockStore) Flush() {
 func (bs *BlockStore) Close() {
 	bs.closeOnce.Do(func() {
 		if bs.diskWrites != nil {
+			bs.Flush() // let queued and detached writes finish (durable cache)
 			close(bs.diskWrites)
 			bs.writersWG.Wait()
 		}
@@ -235,12 +234,22 @@ func (bs *BlockStore) storeChunk(k Key, ci int64, data []byte) {
 	// (the disk cache is best-effort) and unpin so the fill path never blocks.
 	bs.mem.Pin(ck)
 	bs.pendingWrites.Add(1)
+	req := diskWriteReq{cacheKey: ck, data: data}
 	select {
-	case bs.diskWrites <- diskWriteReq{cacheKey: ck, data: data}:
+	case bs.diskWrites <- req:
 	default:
-		bs.pendingWrites.Add(-1)
-		bs.mem.Unpin(ck)
+		// Pool queue full: write in a detached goroutine rather than block the
+		// fill path or drop the write. Dropping would leave the chunk in memory
+		// only; once unpinned and evicted it would be re-fetched from S3.
+		go bs.writeOne(req)
 	}
+}
+
+// writeOne persists a single chunk (used when the write-behind queue is full).
+func (bs *BlockStore) writeOne(req diskWriteReq) {
+	bs.disk.Put(req.cacheKey, req.data)
+	bs.mem.Unpin(req.cacheKey)
+	bs.pendingWrites.Add(-1)
 }
 
 // claim registers chunk ci as in-flight. It returns the chunk's state and
