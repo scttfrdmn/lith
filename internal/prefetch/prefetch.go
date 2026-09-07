@@ -58,7 +58,19 @@ type Prefetcher struct {
 	state     State
 	window    int64
 	frontier  int64 // next block index not yet dispatched
+
+	// Diagnostics for the #49 investigation (single-threaded via pfWrapper).
+	resets     int64 // times the window collapsed to Random (window -> 0)
+	peakWindow int64 // largest window ever reached
 }
+
+// Resets reports how many times the pattern detector collapsed to Random
+// (window -> 0). Under the kernel's concurrent readahead, reads can arrive
+// out of order and trip this even on a sequential file.
+func (p *Prefetcher) Resets() int64 { return p.resets }
+
+// PeakWindow reports the largest readahead window this handle ever reached.
+func (p *Prefetcher) PeakWindow() int64 { return p.peakWindow }
 
 // New returns a Prefetcher with the given max readahead window in blocks
 // (values < 2 are raised to 2).
@@ -110,6 +122,9 @@ func (p *Prefetcher) Observe(blockIdx int64) []int64 {
 				p.window = initialWindow
 			}
 		}
+		if p.window > p.peakWindow {
+			p.peakWindow = p.window
+		}
 		p.lastDelta = 1
 		// Never dispatch behind the cursor.
 		if p.frontier < blockIdx+1 {
@@ -130,6 +145,9 @@ func (p *Prefetcher) Observe(blockIdx int64) []int64 {
 
 	default:
 		// New or broken delta: not (yet) a pattern.
+		if p.state == Sequential {
+			p.resets++
+		}
 		p.lastDelta = d
 		p.state = Random
 		p.window = 0

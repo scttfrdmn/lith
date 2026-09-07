@@ -207,7 +207,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 
 // mountObjects builds an index over the given keys and mounts it, returning the
 // mount dir, the server, the recorder, and a cleanup func.
-func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64) (string, *fusefs.Config, func(), error) {
+func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64, stats *fusefs.PrefetchStats) (string, *fusefs.Config, func(), error) {
 	entries := make([]index.Entry, 0, len(keys))
 	for _, k := range keys {
 		h, err := client.HeadObject(ctx, k)
@@ -221,7 +221,7 @@ func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.Block
 	if err != nil {
 		return "", nil, nil, err
 	}
-	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead}
+	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead, PrefetchStats: stats}
 	srv, err := fusefs.Mount(mnt, *cfg, fusefs.MountOptions{FsName: "lith-bench"})
 	if err != nil {
 		_ = os.RemoveAll(mnt)
@@ -249,7 +249,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 		if berr != nil {
 			return berr
 		}
-		mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead)
+		mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil)
 		if merr != nil {
 			return merr
 		}
@@ -275,7 +275,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	if berr != nil {
 		return berr
 	}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead)
+	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil)
 	if merr != nil {
 		return merr
 	}
@@ -332,7 +332,8 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	if berr != nil {
 		return berr
 	}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, benchBucket, keys, f.maxReadahead)
+	pfStats := &fusefs.PrefetchStats{}
+	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, benchBucket, keys, f.maxReadahead, pfStats)
 	if merr != nil {
 		return merr
 	}
@@ -344,6 +345,7 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 		litPaths[i] = filepath.Join(mnt, k)
 	}
 	litAgg, litPer, tl := runReadersTimeline(litPaths)
+	time.Sleep(300 * time.Millisecond) // let FUSE Release fire so PrefetchStats populate
 
 	if f.timelineCSV != "" {
 		if werr := tl.writeCSV(f.timelineCSV); werr != nil {
@@ -378,6 +380,9 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	_, _ = fmt.Fprintf(tw, "prefetch sem wait p99\t%s\t-\n", rec.waitP99())
 	_, _ = fmt.Fprintf(tw, "prefetch issued / uncovered\t%d / %d\t-\n",
 		atomic.LoadInt64(&rec.prefetchIssued), atomic.LoadInt64(&rec.uncovered))
+	resets, pw := pfStats.Snapshot()
+	sort.Slice(pw, func(i, j int) bool { return pw[i] < pw[j] })
+	_, _ = fmt.Fprintf(tw, "prefetch window resets / peak windows\t%d / %v\t-\n", resets, pw)
 	_ = tw.Flush()
 	return nil
 }
