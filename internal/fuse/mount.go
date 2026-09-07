@@ -41,5 +41,8 @@ func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error)
 	if err := srv.WaitMount(); err != nil {
 		return nil, err
 	}
+	// Raise the kernel readahead so it issues 1 MiB reads (one chunk).
+	// Best-effort: needs privilege to write /sys.
+	_ = setReadAheadKB(mountpoint, 1024)
 	return srv, nil
 }
