@@ -49,6 +49,10 @@ type Recorder interface {
 	StaleKey(key string)
 	PrefetchIssued()
 	PrefetchHit()
+	// UncoveredMiss is a demand read whose chunk was neither cached nor in
+	// flight, so the demand read had to originate the fetch itself — a sign the
+	// readahead frontier did not lead far enough (#38).
+	UncoveredMiss()
 }
 
 // Key identifies an object plus the ETag hash recorded in the index.
@@ -225,7 +229,12 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			i++
 			continue
 		}
-		// We own chunk i; extend the run over contiguous chunks we also own.
+		// We own chunk i and must fetch it ourselves. For a demand read that
+		// means the readahead frontier did not cover it.
+		if !isPrefetch {
+			bs.record(func(r Recorder) { r.UncoveredMiss() })
+		}
+		// Extend the run over contiguous chunks we also own.
 		owned := []*chunkState{cs}
 		j := i
 		for j+1 <= c1 && int64(len(owned)) < bs.maxChunks {

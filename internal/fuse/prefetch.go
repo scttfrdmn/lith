@@ -24,3 +24,9 @@ func (w *pfWrapper) observe(block int64) []int64 {
 	defer w.mu.Unlock()
 	return w.pf.Observe(block)
 }
+
+func (w *pfWrapper) open() []int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.Open()
+}

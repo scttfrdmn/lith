@@ -54,6 +54,14 @@ func New() *Server {
 	return &Server{objs: make(map[string]object), DefaultPageSize: 1000}
 }
 
+// GetCallCount returns the GetObject/GetRange/GetRangeReader call count under
+// lock, safe to read while fetches are in flight.
+func (s *Server) GetCallCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.GetCalls
+}
+
 // Put stores an object with the given key, contents, and modification time.
 func (s *Server) Put(key string, data []byte, modified time.Time) {
 	s.mu.Lock()

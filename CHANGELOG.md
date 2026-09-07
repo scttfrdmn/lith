@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lith bench` now reads through an actual lith mount via `pread`, so the FUSE
   per-handle prefetcher is exercised (it previously read the block store
   directly and never prefetched).
+- `--mem-cache` now defaults to **25% of system memory** (from `/proc/meminfo`,
+  1 GiB fallback), replacing the fixed 1 GiB default; `--disk-cache` stays off
+  by default. `lith mount` warns if the `--disk-cache` path resolves onto the
+  root filesystem or a network volume. README gains a "No NVMe?" section.
+- `lith bench` gains `--runs N` (N cold runs; min/median/max reported, then a
+  warm run), `--readers N --objects k1,k2,...` (concurrent multi-object
+  readers; aggregate MB/s and S3 request count), per-read latency percentiles
+  split at the first readahead window, time-to-first-byte, and `--cache-dir`.
 - Default `--s3-concurrency` raised to **128** and `--max-readahead` to **64**
   (from 64 and 32). On a c8gd.4xlarge in-region against `s3://1000genomes`,
   128/64 won on both cold sequential (1248 MB/s vs 1126 at 64/32) and cold
@@ -26,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prefetch now dispatches the readahead window **ahead of the demand cursor** —
+  on `open` (initial 2-block window) and on every window advance — instead of
+  reactively on the read that reveals a gap. A demand read that finds its chunk
+  neither cached nor in flight is counted as `lith_prefetch_uncovered_total`.
 - Cold read throughput: a single chunk singleflight keyed by
   `(key, etagHash, chunkIdx)` with in-flight join replaces the range-keyed
   singleflight. A demand read for a chunk a prefetch is already fetching now

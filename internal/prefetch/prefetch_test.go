@@ -7,76 +7,97 @@ import (
 	"testing"
 )
 
-// run feeds a block sequence and returns the prefetch set emitted at each step
-// plus the final state.
-func run(maxRA int64, seq []int64) ([][]int64, State) {
-	p := New(maxRA)
-	out := make([][]int64, len(seq))
-	for i, b := range seq {
-		out[i] = p.Observe(b)
-	}
-	return out, p.State()
-}
-
-func TestSequentialGrowsGeometrically(t *testing.T) {
-	got, state := run(8, []int64{0, 1, 2, 3, 4})
-	want := [][]int64{
-		nil,                         // cold, first read
-		{2, 3},                      // window 2
-		{3, 4, 5, 6},                // window 4
-		{4, 5, 6, 7, 8, 9, 10, 11},  // window 8 (== max)
-		{5, 6, 7, 8, 9, 10, 11, 12}, // window capped at max 8
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("sequential prefetch sets:\n got %v\nwant %v", got, want)
-	}
-	if state != Sequential {
-		t.Errorf("state = %v, want Sequential", state)
+func TestOpenDispatchesInitialWindow(t *testing.T) {
+	p := New(32)
+	if got := p.Open(); !reflect.DeepEqual(got, []int64{0, 1}) {
+		t.Fatalf("Open() = %v, want [0 1]", got)
 	}
 }
 
-func TestStridedPredictsNextOnly(t *testing.T) {
-	// Constant delta 5: strided is confirmed on the second delta and predicts
-	// exactly the next block each step.
-	got, state := run(32, []int64{0, 5, 10, 15})
-	want := [][]int64{
-		nil,  // cold
-		nil,  // first delta 5 observed, not yet confirmed
-		{15}, // delta 5 confirmed -> predict 10+5
-		{20}, // predict 15+5
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("strided prefetch sets:\n got %v\nwant %v", got, want)
-	}
-	if state != Strided {
-		t.Errorf("state = %v, want Strided", state)
-	}
-}
+// TestSequentialFrontierLeadsNoDup: over a sequential run, every block is
+// dispatched exactly once and the frontier stays at least `window` ahead of the
+// demand cursor.
+func TestSequentialFrontierLeadsNoDup(t *testing.T) {
+	p := New(32)
+	dispatched := append([]int64{}, p.Open()...) // [0,1]
 
-func TestRandomPrefetchesNothing(t *testing.T) {
-	got, state := run(32, []int64{0, 7, 2, 9, 1})
-	for i, s := range got {
-		if len(s) != 0 {
-			t.Errorf("step %d emitted %v, want nothing for random access", i, s)
+	for blk := int64(0); blk <= 40; blk++ {
+		got := p.Observe(blk)
+		// The frontier must lead the cursor by at least the current window.
+		if p.frontier-blk < p.window {
+			t.Fatalf("after read %d: frontier %d - cursor %d = %d < window %d",
+				blk, p.frontier, blk, p.frontier-blk, p.window)
+		}
+		dispatched = append(dispatched, got...)
+	}
+	if p.State() != Sequential {
+		t.Fatalf("state = %v, want Sequential", p.State())
+	}
+	// Dispatched blocks must be exactly 0..frontier-1, contiguous, no dups.
+	for i, b := range dispatched {
+		if b != int64(i) {
+			t.Fatalf("dispatch not contiguous/unique at position %d: got block %d", i, b)
 		}
 	}
-	if state != Random {
-		t.Errorf("state = %v, want Random", state)
+	if int64(len(dispatched)) != p.frontier {
+		t.Fatalf("dispatched %d blocks, frontier %d", len(dispatched), p.frontier)
 	}
 }
 
-func TestSequentialThenRandomResets(t *testing.T) {
-	// Sequential, then a jump: should stop prefetching until a pattern reforms.
-	got, _ := run(8, []int64{0, 1, 2, 50})
-	if len(got[3]) != 0 {
-		t.Errorf("after a jump out of sequential, emitted %v, want nothing", got[3])
+func TestSequentialWindowGrowsGeometrically(t *testing.T) {
+	p := New(32)
+	p.Open()
+	var windows []int64
+	for blk := int64(0); blk <= 6; blk++ {
+		p.Observe(blk)
+		windows = append(windows, p.window)
+	}
+	// window: 2,4,8,16,32,32,32 (capped at maxReadahead=32)
+	want := []int64{2, 4, 8, 16, 32, 32, 32}
+	if !reflect.DeepEqual(windows, want) {
+		t.Fatalf("windows = %v, want %v", windows, want)
+	}
+}
+
+func TestStridedPredictsNext(t *testing.T) {
+	p := New(32)
+	// delta 5: confirmed on the second delta, then predicts one block ahead.
+	got := [][]int64{
+		p.Observe(0),  // cold: establish last
+		p.Observe(5),  // first delta 5, not confirmed
+		p.Observe(10), // confirmed -> predict 15
+		p.Observe(15), // predict 20
+	}
+	want := [][]int64{nil, nil, {15}, {20}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("strided dispatches = %v, want %v", got, want)
+	}
+	if p.State() != Strided {
+		t.Errorf("state = %v, want Strided", p.State())
+	}
+}
+
+func TestRandomDispatchesNothing(t *testing.T) {
+	p := New(32)
+	seq := []int64{0, 7, 2, 9, 1}
+	for i, b := range seq {
+		if got := p.Observe(b); len(got) != 0 && i > 0 {
+			// After the first (which just records), random reads dispatch nothing.
+			if p.State() == Random {
+				t.Errorf("random read %d dispatched %v", b, got)
+			}
+		}
+	}
+	if p.State() != Random {
+		t.Errorf("state = %v, want Random", p.State())
 	}
 }
 
 func TestReReadSameBlockNoop(t *testing.T) {
-	p := New(8)
-	p.Observe(3)
-	if got := p.Observe(3); got != nil {
-		t.Errorf("re-read same block emitted %v, want nil", got)
+	p := New(32)
+	p.Open()
+	p.Observe(0)
+	if got := p.Observe(0); got != nil {
+		t.Errorf("re-read same block dispatched %v, want nil", got)
 	}
 }

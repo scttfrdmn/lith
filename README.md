@@ -57,6 +57,26 @@ ls -l /mnt/1kg
 cat /mnt/1kg/changelog_details_20081219
 ```
 
+## Caching / No NVMe?
+
+lith serves file reads from a two-tier cache: a bounded in-memory tier
+(`--mem-cache`, default 25% of system memory) and an optional on-disk tier
+(`--disk-cache`, default off). The disk tier is worth it only on **fast local
+storage** — an instance-store NVMe volume.
+
+If the machine has no local NVMe (most instances, laptops, cluster head
+nodes), either:
+
+- leave `--disk-cache` off and rely on the memory tier plus the kernel page
+  cache (sequential and re-read workloads still benefit), or
+- point `--disk-cache` at **`/dev/shm`** (tmpfs, i.e. RAM): `--disk-cache 8GiB
+  --disk-path /dev/shm/lith`.
+
+Do **not** put the disk cache on EBS, EFS, or NFS — caching a block there can
+be slower than just re-fetching it from S3 in-region. `lith mount` prints a
+warning if the `--disk-cache` path resolves onto the root filesystem or a
+network volume.
+
 ## Testing
 
 Unit tests run with the race detector and touch no network:

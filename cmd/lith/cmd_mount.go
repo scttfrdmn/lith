@@ -63,7 +63,7 @@ func newMountCmd() *cobra.Command {
 	}
 	fl := cmd.Flags()
 	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built automatically if absent and under --auto-index-limit)")
-	fl.StringVar(&f.memCache, "mem-cache", "1GiB", "memory block cache size")
+	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables)")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
 	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size (1MiB-64MiB)")
@@ -99,9 +99,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if blockSize < 1<<20 || blockSize > 64<<20 {
 		return fmt.Errorf("block size must be between 1MiB and 64MiB")
 	}
-	memCache, err := parseSize(f.memCache)
-	if err != nil {
-		return err
+	memCache := defaultMemCacheBytes()
+	if f.memCache != "" {
+		memCache, err = parseSize(f.memCache)
+		if err != nil {
+			return err
+		}
 	}
 	diskCache, err := parseSize(f.diskCache)
 	if err != nil {
@@ -118,6 +121,11 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	diskPath := f.diskPath
 	if diskPath == "" {
 		diskPath = filepath.Join(os.TempDir(), "lith-cache")
+	}
+	if diskCache > 0 {
+		if w := diskCacheWarning(diskPath); w != "" {
+			log.Warn("disk cache location", "path", diskPath, "warning", w)
+		}
 	}
 
 	client, err := newS3Client(ctx, s3client.Config{

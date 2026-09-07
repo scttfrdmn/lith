@@ -196,6 +196,15 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	f.handles[fh] = h
 	f.mu.Unlock()
 
+	// Dispatch the initial readahead window at open (before the first read)
+	// for files worth prefetching, so the frontier leads from the start (#38).
+	if fi.Size > f.cfg.SmallFile {
+		for _, pb := range h.pf.open() {
+			pb := pb
+			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+		}
+	}
+
 	out.Fh = fh
 	out.OpenFlags = fuse.FOPEN_KEEP_CACHE // content is immutable
 	return fuse.OK

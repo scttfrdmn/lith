@@ -24,6 +24,7 @@ type Metrics struct {
 	inflight    prometheus.Gauge
 	prefetchIss prometheus.Counter
 	prefetchHit prometheus.Counter
+	uncovered   prometheus.Counter
 	staleTotal  prometheus.Counter
 	fuseLatency *prometheus.HistogramVec // op
 }
@@ -54,6 +55,9 @@ func New() *Metrics {
 		prefetchHit: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_used_total", Help: "Prefetched blocks later read on demand.",
 		}),
+		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",
+		}),
 		staleTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_stale_objects_total", Help: "Objects whose ETag no longer matched the index.",
 		}),
@@ -64,7 +68,7 @@ func New() *Metrics {
 		}, []string{"op"}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
-		m.inflight, m.prefetchIss, m.prefetchHit, m.staleTotal, m.fuseLatency)
+		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.staleTotal, m.fuseLatency)
 	return m
 }
 
@@ -127,6 +131,12 @@ func (m *Metrics) PrefetchIssued() {
 func (m *Metrics) PrefetchHit() {
 	if m != nil {
 		m.prefetchHit.Inc()
+	}
+}
+
+func (m *Metrics) UncoveredMiss() {
+	if m != nil {
+		m.uncovered.Inc()
 	}
 }
 
