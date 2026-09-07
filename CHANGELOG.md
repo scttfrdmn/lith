@@ -74,6 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--prefetch-concurrency` on `lith mount` and `lith bench` caps concurrent
+  prefetch fills; it defaults to `--s3-concurrency` (previously the prefetch
+  sub-limit was hardwired to half of `--s3-concurrency`, capping concurrent
+  fills at 64 at the default and holding the 8-reader aggregate near the
+  ~64-connection ceiling). Isolating this one change lifted the cold 8-reader
+  aggregate on a c8gd.16xlarge from ~2300 to ~3000 MB/s. See #40.
+- `--max-range` on `lith bench` (already present on `lith mount`): caps the
+  coalesced range-GET size; the bench previously coalesced at most one block.
+- `cmd/lith-s3bench`: a standalone diagnostic that isolates the S3
+  client/transport (N workers, back-to-back ranged GETs, no cache/prefetch/
+  FUSE). It established that the Go client sustains ~3.5 GB/s at 128 concurrent
+  GETs on a 30 Gbps box — above mountpoint-s3 — so the multi-reader ceiling is
+  in lith, not the transport. Tooling; not part of the shipped filesystem.
 - `lith mount s3://bucket[/prefix] /mnt/point`: a read-only FUSE mount served
   from the local index and a tiered block cache. Flags include `--index-file`
   (auto-built under `--auto-index-limit` when absent), `--mem-cache`,
