@@ -90,7 +90,7 @@ type BlockStore struct {
 	blockChunks int64 // BlockSize / ChunkSize
 	maxChunks   int64 // MaxRange / ChunkSize
 
-	mem  *mem2Q
+	mem  *memCache
 	disk *diskTier
 
 	sem      chan struct{} // total S3 concurrency
@@ -146,7 +146,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		bucket:      cfg.Bucket,
 		blockChunks: blockChunks,
 		maxChunks:   maxChunks,
-		mem:         newMem2Q(cfg.MemCache),
+		mem:         newMemCache(cfg.MemCache, 64),
 		disk:        disk,
 		sem:         make(chan struct{}, conc),
 		prefetch:    make(chan struct{}, max(1, conc/2)),
@@ -230,8 +230,8 @@ func (bs *BlockStore) storeChunk(k Key, ci int64, data []byte) {
 		return
 	}
 	// Write-behind: pin the chunk in memory so it is not evicted before its
-	// disk write completes, then enqueue. If the queue is full, drop the write
-	// (the disk cache is best-effort) and unpin so the fill path never blocks.
+	// disk write completes, then enqueue. The fill path never blocks on the
+	// disk and the write is never dropped (see the full-queue case below).
 	bs.mem.Pin(ck)
 	bs.pendingWrites.Add(1)
 	req := diskWriteReq{cacheKey: ck, data: data}
