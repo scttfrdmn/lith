@@ -16,19 +16,23 @@ type MountOptions struct {
 // serving in the background. The caller waits on the returned server and calls
 // Unmount to tear it down.
 func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error) {
+	// Raise fs.pipe-max-size BEFORE go-fuse reads (and caches) it, so its splice
+	// pipe can grow to hold a 1 MiB reply. Best-effort (needs privilege).
+	_ = raisePipeMaxSize(2 << 20)
+
 	raw := NewRawFileSystem(cfg)
 
-	// Leave MaxWrite at the go-fuse default (128 KiB): the kernel then issues
-	// 128 KiB reads that fit go-fuse's splice pipe, so each read reply is
-	// spliced to the kernel with no copy. Forcing 1 MiB reads (bumping the bdi
-	// readahead) cut FUSE syscalls but made each reply exceed the pipe, forcing
-	// a copy — a net loss for the CPU-bound multi-reader path. Each 128 KiB
-	// read still lands within one 1 MiB chunk and takes the zero-copy
-	// single-chunk path in Read.
+	// [agent/fuse-splice] Negotiate 1 MiB requests (max_pages=256 via MaxWrite)
+	// so the kernel issues one read per chunk (~8x fewer FUSE requests). This
+	// only stays zero-copy if go-fuse can grow its splice pipe past 1 MiB to
+	// hold the reply (data+header) — see raisePipeMaxSize below.
+	const oneMiB = 1 << 20
 	opts := &fuse.MountOptions{
-		AllowOther: mo.AllowOther,
-		FsName:     mo.FsName,
-		Name:       "lith",
+		AllowOther:   mo.AllowOther,
+		FsName:       mo.FsName,
+		Name:         "lith",
+		MaxWrite:     oneMiB,
+		MaxReadAhead: oneMiB,
 		// Read-only mount; the kernel enforces it and lith returns EROFS anyway.
 		Options: []string{"ro"},
 	}
@@ -41,5 +45,10 @@ func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error)
 	if err := srv.WaitMount(); err != nil {
 		return nil, err
 	}
+	// [agent/fuse-splice] Enable 1 MiB reads that still splice zero-copy:
+	// raise the readahead so the kernel issues 1 MiB reads, and raise
+	// fs.pipe-max-size so go-fuse can grow its splice pipe to fit the reply.
+	// Best-effort (needs privilege); a failure just falls back to 128 KiB reads.
+	_ = setReadAheadKB(mountpoint, 1024)
 	return srv, nil
 }
