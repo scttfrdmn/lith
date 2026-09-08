@@ -36,7 +36,12 @@ func effectiveReadahead(userBlocks, inflightBytes, blockSize int64) int64 {
 	if blockSize <= 0 {
 		blockSize = 8 << 20
 	}
-	n := inflightBytes / blockSize
+	// 1.5 × the BDP in blocks: the window must lead by more than inflight-bytes
+	// because completed chunks sit cached-unread ahead of the cursor, so the
+	// bytes actually in flight are less than the window. Measured knee on a
+	// 30 Gbps box: a raw BDP window (~89 blocks) reached only 88% of mount-s3,
+	// 1.5× (~134) reaches parity+ (#56).
+	n := inflightBytes * 3 / (2 * blockSize)
 	if n < 8 {
 		n = 8
 	}
