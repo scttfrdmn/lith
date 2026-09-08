@@ -156,6 +156,50 @@ faster and cheaper: no staging wall-clock, and for a selective query lith moves 
 tiny fraction of the bytes (a 1% region query pulled 49 MB instead of the whole
 14 GiB object).
 
+## Real workloads
+
+Real applications on a `c8gd.4xlarge` in `us-east-1`, mounting the source
+bucket with lith vs the substrates you'd otherwise stage to. Each cell is
+**minutes-to-result / dollars / GB pulled from S3**; full data and rates in
+[`bench/results/apps-v0.1.0.csv`](bench/results/apps-v0.1.0.csv). A copy path
+must stage the whole object; lith fetches only what the app touches. (io2 is
+never needed — every app's peak IOPS was far under gp3's 3000 baseline; FSx
+Lustre and EFS are dominated by their minimums for these working sets.)
+
+**Streaming** (read most of an object front to back):
+
+| app | lith cold | lith warm | copy→gp3 | copy→NVMe |
+|---|---|---|---|---|
+| `samtools flagstat` (3.8 GB CRAM) | 0.79 / $0.011 / 3.6 | 0.78 / $0.010 / 3.6 | 1.26 / $0.016 / 3.6 | 0.84 / $0.011 / 3.6 |
+| `fastp` (3.9 GB FASTQ pair) | 0.89 / $0.012 / 3.7 | 1.02 / $0.014 / 3.7 | 1.43 / $0.019 / 3.8 | 0.98 / $0.013 / 3.8 |
+| `xarray` yearly mean (Zarr) | 0.67 / $0.009 / 0.8 | 0.09 / $0.001 / 0.8 | — impractical — | — impractical — |
+
+*Streaming is CPU-bound at these sizes (samtools/fastp decode), so lith, which
+overlaps its fetch with compute, matches or beats a stage-then-compute copy; a
+local-NVMe copy ties it when the app is purely CPU-bound. For a chunked Zarr
+store, copying the (multi-TB) store to read one year is infeasible — lith reads
+just the year's chunks.*
+
+**Random / selective** (touch a fraction, or seek):
+
+| app | lith cold | lith warm | copy→gp3 | copy→NVMe |
+|---|---|---|---|---|
+| `tabix` 1000×10 kb regions (VCF) | 0.13 / $0.002 / 0.32 | 0.12 / $0.002 / 0.32 | 0.17 / $0.002 / 0.33 | 0.13 / $0.002 / 0.33 |
+| `samtools view` 1000×1 Mb (14 GB CRAM) | 0.83 / $0.011 / **0.81** | 0.74 / $0.010 / 0.81 | 2.53 / $0.033 / **13.1** | 0.96 / $0.013 / 13.1 |
+| `h5py` 500 hyperslabs (31 MB .nc) | 0.02 / $0.0002 / 0.03 | 0.004 / — / 0.03 | 0.01 / — / 0.03 | 0.004 / — / 0.03 |
+| `pyarrow` predicate pushdown (2.5 %) | 0.04 / $0.0006 / 0.31 | 0.004 / — / 0.31 | 0.06 / $0.0007 / 0.39 | 0.01 / — / 0.39 |
+
+*Selectivity is where mounting pays: reading 1000 regions of a 14 GB CRAM pulls
+0.81 GB with lith vs 13.1 GB to copy the file first — 16× less data and 3× less
+wall than a gp3 copy. When the object is small (a 31 MB granule) or the "random"
+access actually touches most of it (a scattered but dense VCF scan), a fast
+local copy ties lith on the first read; lith's warm read (near-instant, zero new
+GETs) then wins every repeat query. The full-object-copy penalty and the
+warm-repeat advantage are the two axes to reason about.*
+
+Reproduce with the harness and dataset keys recorded in the
+[application-benchmarks issue](https://github.com/scttfrdmn/lith/issues/61).
+
 ## Testing
 
 Unit tests run with the race detector and touch no network:
