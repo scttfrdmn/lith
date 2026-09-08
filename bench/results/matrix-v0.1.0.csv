@@ -3,3 +3,4 @@
 # single = 14GiB CRAM seq; readers8 = 8 heterogeneous phase3 CRAMs (3.8-14GiB) cold; rand4k warm; metadata from prebuilt local index.
 # NIC_Gbps = advertised ("up to" for <16xlarge; 16xlarge sustained). On-demand $/hr via AWS Price List API.
 instance,vCPU,RAM_GiB,NIC_Gbps,local_nvme,usd_per_hr,lith_seq_cold_min,lith_seq_cold_med,lith_seq_cold_max,lith_seq_warm,ms3_seq_cold_med,lith_r8_min,lith_r8_med,lith_r8_max,ms3_r8_med,lith_cpu_pct_r8,lith_rand4k_warm,lith_ls_sec,lith_stat_n,lith_stat_sec,lith_stat_s3reqs,notes
+c8g.2xlarge,8,16,15(up to),no,0.31904,1222,1321,1336,1274,1584,172,180,223,1657,49%(1core/~6%box),543433,0.035,100000,0.157,0,"mem-cache 3.9GiB(25%),disk-cache 0; 8-reader PATHOLOGICAL: prefetch windows (8x512MiB) exceed cache with no disk tier -> thrash; warm~cold (14GiB file > cache)"
