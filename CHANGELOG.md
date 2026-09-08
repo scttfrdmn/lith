@@ -68,7 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults to 1.5× the bandwidth-delay product (`inflight-bytes / block`) instead
   of a fixed 64 blocks, so one reader holds enough in flight to saturate the
   link. On a 30 Gbps `c8gd.16xlarge`, cold single-reader went 1737 → ~2850 MB/s
-  (67% → ~109% of mountpoint-s3) (#56).
+  (67% → ~109% of mountpoint-s3) (#56). The **1.5× multiplier is empirical, not
+  theory** — derived from measurement on that box: a raw-BDP window (~89 blocks)
+  reached only 88% of mountpoint-s3 because completed chunks sit cached-unread
+  ahead of the cursor, so the bytes actually in flight are less than the window;
+  1.5× closes the gap. Re-derive if the workload or instance profile changes.
 
 - The per-handle prefetcher is now **tolerant of out-of-order reads**. The kernel
   issues a single file handle's readahead concurrently, so reads can reach the
