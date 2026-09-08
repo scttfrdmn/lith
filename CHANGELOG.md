@@ -54,6 +54,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Aggregate readahead is now bounded by the memory tier**, so concurrent
+  readers no longer thrash a small cache (#55). Each open handle's readahead
+  window is capped at `prefetch-budget / open-handles` (floor 2, capped by
+  `--max-readahead`), and memory-tier eviction prefers already-read chunks over
+  prefetched-but-unread ones. On a 16 GiB `c8g.2xlarge`, the cold 8-reader
+  aggregate went from 180 MB/s (prefetch thrash: prefetched chunks evicted
+  before use and re-fetched) to **1550 MB/s, 97% of mountpoint-s3**; a 32 GiB
+  `c8gd.4xlarge` went 1095 → 1688 (65% → 103%). New `--prefetch-budget`
+  (default 50% of `--mem-cache`) and metric `lith_prefetch_evicted_unread_total`
+  (the thrash signal, ~0 after the fix).
+- **Single-reader cold sequential now fills a fat NIC.** `--max-readahead`
+  defaults to 1.5× the bandwidth-delay product (`inflight-bytes / block`) instead
+  of a fixed 64 blocks, so one reader holds enough in flight to saturate the
+  link. On a 30 Gbps `c8gd.16xlarge`, cold single-reader went 1737 → ~2850 MB/s
+  (67% → ~109% of mountpoint-s3) (#56).
+
 - The per-handle prefetcher is now **tolerant of out-of-order reads**. The kernel
   issues a single file handle's readahead concurrently, so reads can reach the
   FUSE layer out of order even for a strictly sequential file; the old detector
