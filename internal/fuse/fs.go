@@ -229,7 +229,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// Dispatch the initial readahead window at open (before the first read)
 	// for files worth prefetching, so the frontier leads from the start (#38).
 	if fi.Size > f.cfg.SmallFile {
-		for _, pb := range h.pf.open() {
+		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
@@ -287,7 +287,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fu
 
 	// Drive the prefetcher off the block this read falls in.
 	blk := off / f.blockSize
-	for _, pb := range h.pf.observe(blk) {
+	for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 		pb := pb
 		go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 	}
@@ -449,4 +449,31 @@ func (f *rawFS) maxReadahead() int64 {
 		return f.cfg.MaxReadahead
 	}
 	return 32
+}
+
+// perHandleWindow is the readahead window (blocks) each open handle may use so
+// their windows share the prefetch budget: budgetBlocks / openHandles, floored
+// at 2 and capped by the configured --max-readahead. With one handle it returns
+// the full configured window; with many, a fair share that keeps aggregate
+// readahead within the memory tier (#55).
+func (f *rawFS) perHandleWindow() int64 {
+	maxW := f.maxReadahead()
+	budgetBlocks := f.store.PrefetchBudgetBlocks()
+	if budgetBlocks <= 0 {
+		return maxW
+	}
+	f.mu.RLock()
+	n := int64(len(f.handles))
+	f.mu.RUnlock()
+	if n < 1 {
+		n = 1
+	}
+	share := budgetBlocks / n
+	if share < 2 {
+		share = 2
+	}
+	if share > maxW {
+		share = maxW
+	}
+	return share
 }

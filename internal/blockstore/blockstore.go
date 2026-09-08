@@ -103,10 +103,12 @@ type BlockStore struct {
 	mem  *memCache
 	disk *diskTier
 
-	sem      chan struct{}   // total S3 request-count hard cap
-	prefetch chan struct{}   // cap on concurrent prefetch fills (<= sem)
-	budget   *bytesBudget    // bytes-in-flight budget (nil = disabled)
-	pfBudget *prefetchBudget // prefetched-not-yet-demanded byte budget (#55)
+	sem      chan struct{} // total S3 request-count hard cap
+	prefetch chan struct{} // cap on concurrent prefetch fills (<= sem)
+	budget   *bytesBudget  // bytes-in-flight budget (nil = disabled)
+	// pfBudgetBytes bounds aggregate un-demanded prefetch; the FUSE layer turns
+	// it into a per-handle window = pfBudgetBytes/handles (#55). 0 disables.
+	pfBudgetBytes int64
 
 	rec Recorder
 
@@ -170,19 +172,19 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		pfBudgetCap = cfg.MemCache / 2
 	}
 	bs := &BlockStore{
-		src:         src,
-		bucket:      cfg.Bucket,
-		blockChunks: blockChunks,
-		maxChunks:   maxChunks,
-		mem:         newMemCache(cfg.MemCache, 64),
-		disk:        disk,
-		sem:         make(chan struct{}, conc),
-		prefetch:    make(chan struct{}, max(1, prefetchConc)),
-		budget:      newBytesBudget(cfg.InflightBytes),
-		pfBudget:    newPrefetchBudget(pfBudgetCap),
-		rec:         cfg.Recorder,
-		inflight:    make(map[string]*chunkState),
-		stale:       make(map[string]struct{}),
+		src:           src,
+		bucket:        cfg.Bucket,
+		blockChunks:   blockChunks,
+		maxChunks:     maxChunks,
+		mem:           newMemCache(cfg.MemCache, 64),
+		disk:          disk,
+		sem:           make(chan struct{}, conc),
+		prefetch:      make(chan struct{}, max(1, prefetchConc)),
+		budget:        newBytesBudget(cfg.InflightBytes),
+		pfBudgetBytes: pfBudgetCap,
+		rec:           cfg.Recorder,
+		inflight:      make(map[string]*chunkState),
+		stale:         make(map[string]struct{}),
 	}
 	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
@@ -233,7 +235,6 @@ func (bs *BlockStore) Flush() {
 // call once per store (e.g. at unmount).
 func (bs *BlockStore) Close() {
 	bs.closeOnce.Do(func() {
-		bs.pfBudget.stop() // wake any prefetch goroutine blocked on the budget
 		if bs.diskWrites != nil {
 			bs.Flush() // drain pending writes (durable cache) while workers run
 			close(bs.stop)
@@ -348,10 +349,8 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err
 			bs.mem.Put(ck, data)
 		}
 	} else if blocking {
-		// Prefetch fill failed: release its reservation so the budget doesn't leak.
-		if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
-			bs.pfBudget.release(ChunkSize)
-		}
+		// Prefetch fill failed: drop its prefetched marker.
+		bs.prefetched.LoadAndDelete(ck)
 	}
 	cs.data, cs.err = data, err
 	close(cs.done)
@@ -619,29 +618,35 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	if c1 > lastChunk {
 		c1 = lastChunk
 	}
-	// Reserve each not-yet-cached chunk against the prefetch budget and mark it
-	// prefetched. The reservation blocks until the budget has room, so this
-	// prefetch goroutine waits behind demand consumption rather than skipping a
-	// block — bounding aggregate un-demanded prefetch to the budget without
-	// leaving a gap the demand read would miss (#55).
+	// Mark not-yet-cached chunks as prefetched (unread) so a demand read can
+	// credit the hit and eviction can prefer already-read chunks over them. The
+	// aggregate readahead is bounded by the per-handle window the FUSE layer
+	// derives from the prefetch budget and the live handle count (#55), so this
+	// path does not gate.
 	for ci := c0; ci <= c1; ci++ {
 		if _, tier := bs.lookup(k, ci); tier != "" {
 			continue
 		}
 		ck := bs.cacheKey(k, ci)
-		if _, dup := bs.prefetched.Load(ck); dup {
-			continue
-		}
-		if !bs.pfBudget.reserve(ChunkSize) {
-			return // store stopped
-		}
-		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); dup {
-			bs.pfBudget.release(ChunkSize) // lost a race; undo the reservation
-		} else {
+		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); !dup {
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
 		}
 	}
 	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
+}
+
+// PrefetchBudgetBlocks is the number of readahead blocks the prefetch budget
+// allows to be outstanding across all handles; the FUSE layer divides it by the
+// live handle count to size each handle's window (#55).
+func (bs *BlockStore) PrefetchBudgetBlocks() int64 {
+	if bs.pfBudgetBytes <= 0 || bs.blockChunks <= 0 {
+		return 0
+	}
+	n := bs.pfBudgetBytes / (bs.blockChunks * ChunkSize)
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // onEvictUnread is invoked by the memory tier when a prefetched-but-unread chunk
@@ -650,7 +655,6 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 // sync.Map).
 func (bs *BlockStore) onEvictUnread(ck string) {
 	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
-		bs.pfBudget.release(ChunkSize)
 		bs.recordPrefetchEvicted()
 	}
 }
@@ -660,7 +664,6 @@ func (bs *BlockStore) onEvictUnread(ck string) {
 // prefetch-budget reservation.
 func (bs *BlockStore) notePrefetchHit(ck string) {
 	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
-		bs.pfBudget.release(ChunkSize)
 		bs.mem.ClearUnread(ck)
 		bs.record(func(r Recorder) { r.PrefetchHit() })
 	}
