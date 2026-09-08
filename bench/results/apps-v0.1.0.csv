@@ -27,3 +27,7 @@ R4,random,lith-cold,0.04,0.00058,0.31,65,ookla us-west-2 (demand region-indep); 
 R4,random,lith-warm,0.00,0.00006,0.31,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
 R4,random,gp3-copy,0.06,0.00072,0.39,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
 R4,random,nvme-copy,0.01,0.00011,0.39,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
+S3,mixed,inplace-s3fs-cold,0.17,0.00243,0.80,40,"xarray+s3fs concurrent async chunk fetch; 4x faster COLD than lith (40.1s)"
+S3,mixed,inplace-s3fs-warm,0.14,0.00214,0.80,40,"s3fs no cross-run chunk cache -> warm~=cold; lith warm 5.4s wins"
+R3,random,inplace-s3fs-cold,0.02,0.00029,0.03,10,"h5py over s3fs file-obj; ros3 driver UNAUTHORIZED anonymous (HDF5 1.14 conda-forge 2026-09-08)"
+R3,random,inplace-s3fs-warm,0.01,0.00013,0.03,10,"h5py over s3fs"

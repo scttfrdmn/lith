@@ -168,34 +168,49 @@ Lustre and EFS are dominated by their minimums for these working sets.)
 
 **Streaming** (read most of an object front to back):
 
-| app | lith cold | lith warm | copy→gp3 | copy→NVMe |
-|---|---|---|---|---|
-| `samtools flagstat` (3.8 GB CRAM) | 0.79 / $0.011 / 3.6 | 0.78 / $0.010 / 3.6 | 1.26 / $0.016 / 3.6 | 0.84 / $0.011 / 3.6 |
-| `fastp` (3.9 GB FASTQ pair) | 0.89 / $0.012 / 3.7 | 1.02 / $0.014 / 3.7 | 1.43 / $0.019 / 3.8 | 0.98 / $0.013 / 3.8 |
-| `xarray` yearly mean (Zarr) | 0.67 / $0.009 / 0.8 | 0.09 / $0.001 / 0.8 | — impractical — | — impractical — |
+| app | lith cold | lith warm | in-place lib | copy→gp3 | copy→NVMe |
+|---|---|---|---|---|---|
+| `samtools flagstat` (3.8 GB CRAM) | 0.79 / $0.011 / 3.6 | 0.78 / $0.010 / 3.6 | — | 1.26 / $0.016 / 3.6 | 0.84 / $0.011 / 3.6 |
+| `fastp` (3.9 GB FASTQ pair) | 0.89 / $0.012 / 3.7 | 1.02 / $0.014 / 3.7 | — | 1.43 / $0.019 / 3.8 | 0.98 / $0.013 / 3.8 |
+| `xarray` yearly mean (Zarr) | 0.67 / $0.009 / 0.8 | **0.09 / $0.001 / 0.8** | **0.17 / $0.002 / 0.8** (s3fs) | — copy = whole store — | — |
 
 *Streaming is CPU-bound at these sizes (samtools/fastp decode), so lith, which
 overlaps its fetch with compute, matches or beats a stage-then-compute copy; a
 local-NVMe copy ties it when the app is purely CPU-bound. For a chunked Zarr
-store, copying the (multi-TB) store to read one year is infeasible — lith reads
-just the year's chunks.*
+store, staging the (multi-TB) store to read one year is infeasible, so the real
+comparison is the in-place library: **`xarray`+`s3fs` reads the year's chunks in
+9.9 s cold — ~4× faster than lith's 40.1 s cold**, because it fetches the many
+small chunk objects concurrently while lith's per-file prefetcher pays a serial
+cold time-to-first-byte per object (see [#63](https://github.com/scttfrdmn/lith/issues/63)).
+lith wins the **warm** repeat (5.4 s vs `s3fs`'s ~8.6 s — `s3fs` re-fetches, lith
+serves from cache). Sibling readahead (#63) targets closing lith's cold gap.*
 
 **Random / selective** (touch a fraction, or seek):
 
-| app | lith cold | lith warm | copy→gp3 | copy→NVMe |
-|---|---|---|---|---|
-| `tabix` 1000×10 kb regions (VCF) | 0.13 / $0.002 / 0.32 | 0.12 / $0.002 / 0.32 | 0.17 / $0.002 / 0.33 | 0.13 / $0.002 / 0.33 |
-| `samtools view` 1000×1 Mb (14 GB CRAM) | 0.83 / $0.011 / **0.81** | 0.74 / $0.010 / 0.81 | 2.53 / $0.033 / **13.1** | 0.96 / $0.013 / 13.1 |
-| `h5py` 500 hyperslabs (31 MB .nc) | 0.02 / $0.0002 / 0.03 | 0.004 / — / 0.03 | 0.01 / — / 0.03 | 0.004 / — / 0.03 |
-| `pyarrow` predicate pushdown (2.5 %) | 0.04 / $0.0006 / 0.31 | 0.004 / — / 0.31 | 0.06 / $0.0007 / 0.39 | 0.01 / — / 0.39 |
+| app | lith cold | lith warm | in-place lib | copy→gp3 | copy→NVMe |
+|---|---|---|---|---|---|
+| `tabix` 1000×10 kb regions (VCF) | 0.13 / $0.002 / 0.32 | 0.12 / $0.002 / 0.32 | — | 0.17 / $0.002 / 0.33 | 0.13 / $0.002 / 0.33 |
+| `samtools view` 1000×1 Mb (14 GB CRAM) | 0.83 / $0.011 / **0.81** | 0.74 / $0.010 / 0.81 | — | 2.53 / $0.033 / **13.1** | 0.96 / $0.013 / 13.1 |
+| `h5py` 500 hyperslabs (31 MB .nc) | 0.02 / $0.0002 / 0.03 | 0.004 / — / 0.03 | 0.02 / — / 0.03 (s3fs) | 0.01 / — / 0.03 | 0.004 / — / 0.03 |
+| `pyarrow` predicate pushdown (2.5 %) | 0.04 / $0.0006 / 0.31 | 0.004 / — / 0.31 | see note | 0.06 / $0.0007 / 0.39 | 0.01 / — / 0.39 |
 
 *Selectivity is where mounting pays: reading 1000 regions of a 14 GB CRAM pulls
 0.81 GB with lith vs 13.1 GB to copy the file first — 16× less data and 3× less
-wall than a gp3 copy. When the object is small (a 31 MB granule) or the "random"
-access actually touches most of it (a scattered but dense VCF scan), a fast
-local copy ties lith on the first read; lith's warm read (near-instant, zero new
-GETs) then wins every repeat query. The full-object-copy penalty and the
-warm-repeat advantage are the two axes to reason about.*
+wall than a gp3 copy. For the 31 MB HDF5 granule everything is sub-second;
+`h5py`-over-`s3fs` in-place reads it in 1.3 s cold / 0.6 s warm, lith 0.9 s /
+0.2 s — a wash on a small file. When the object is small, or the "random" access
+actually touches most of it (a scattered but dense VCF scan), a fast local copy
+ties lith on the first read; lith's warm read (near-instant, zero new GETs) then
+wins every repeat query. The full-object-copy penalty and the warm-repeat
+advantage are the two axes to reason about.*
+
+> **Notes.** HDF5 `ros3` was not usable here — the conda-forge HDF5 1.14 build
+> rejects anonymous access to the public bucket ("unauthorized"), so the in-place
+> HDF5 row uses `h5py` over an `s3fs` file object. The `pyarrow` predicate-pushdown
+> row is demand-only: no anonymous-listable us-east-1 Parquet dataset was found
+> (nyc-tlc is us-east-1 but blocks anonymous `LIST`, so lith can't index it;
+> ookla is us-west-2), and its demand is region-independent — an in-region
+> in-place `pyarrow`-S3 comparison is a gap, tracked for a future run.
 
 Reproduce with the harness and dataset keys recorded in the
 [application-benchmarks issue](https://github.com/scttfrdmn/lith/issues/61).
