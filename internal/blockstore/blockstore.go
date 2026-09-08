@@ -233,6 +233,7 @@ func (bs *BlockStore) Flush() {
 // call once per store (e.g. at unmount).
 func (bs *BlockStore) Close() {
 	bs.closeOnce.Do(func() {
+		bs.pfBudget.stop() // wake any prefetch goroutine blocked on the budget
 		if bs.diskWrites != nil {
 			bs.Flush() // drain pending writes (durable cache) while workers run
 			close(bs.stop)
@@ -619,36 +620,28 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 		c1 = lastChunk
 	}
 	// Reserve each not-yet-cached chunk against the prefetch budget and mark it
-	// prefetched. When the budget is exhausted, stop fetching further ahead
-	// (#55): shrink the run to the last reserved chunk so we never dispatch more
-	// prefetch than the memory tier can hold unread.
-	hi := c0 - 1
+	// prefetched. The reservation blocks until the budget has room, so this
+	// prefetch goroutine waits behind demand consumption rather than skipping a
+	// block — bounding aggregate un-demanded prefetch to the budget without
+	// leaving a gap the demand read would miss (#55).
 	for ci := c0; ci <= c1; ci++ {
 		if _, tier := bs.lookup(k, ci); tier != "" {
-			if ci == hi+1 {
-				hi = ci // already cached and contiguous; keep the run going
-			}
 			continue
 		}
 		ck := bs.cacheKey(k, ci)
 		if _, dup := bs.prefetched.Load(ck); dup {
-			hi = ci
 			continue
 		}
-		if !bs.pfBudget.tryReserve(ChunkSize) {
-			break // budget full: do not prefetch further ahead
+		if !bs.pfBudget.reserve(ChunkSize) {
+			return // store stopped
 		}
 		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); dup {
 			bs.pfBudget.release(ChunkSize) // lost a race; undo the reservation
 		} else {
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
 		}
-		hi = ci
 	}
-	if hi < c0 {
-		return
-	}
-	_ = bs.ensureChunks(ctx, k, c0, hi, objSize, true, nil)
+	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
 }
 
 // onEvictUnread is invoked by the memory tier when a prefetched-but-unread chunk
