@@ -103,6 +103,54 @@ to the bandwidth you want.
   (`--inflight-bytes`, default 2 × NIC × 100 ms via `ethtool`); override it if
   the NIC speed can't be detected.
 
+## Expectations
+
+Measured against `s3://1000genomes` in `us-east-1`, lith vs mountpoint-s3, all
+MB/s. lith `--disk-cache 0`, `--mem-cache` 25% of RAM; single = a 14 GiB CRAM
+read sequentially; 8-reader = eight 3.8–14 GiB CRAMs read concurrently; warm =
+re-read from cache; metadata = 100k `stat`s from a prebuilt local index. Full
+data and every per-run number are in [`bench/results/`](bench/results/); the S3
+client ceiling can be reproduced independently with `cmd/lith-s3bench`.
+
+| instance | RAM | NVMe | cold seq (lith / mnt-s3) | warm seq (lith) | 8-reader (lith / mnt-s3) | 100k stat | warm rand4k |
+|---|---|---|---|---|---|---|---|
+| c8g.2xlarge | 16 GiB | no | 1321 / 1584 | 1274 | **180** / 1657 ⚠ | 0.16 s, 0 S3 | 543k IOPS |
+| c8gd.4xlarge | 32 GiB | yes | 1406 / 1569 | 1428 | 1095 / 1683 | 0.17 s, 0 S3 | — |
+| c8gd.8xlarge | 64 GiB | yes | 1361 / 1581 | **19214** | 1696 / 1686 | 0.16 s, 0 S3 | 547k IOPS |
+| c8gd.16xlarge | 128 GiB | yes | 1970 / 2652 | **20845** | 3245 / 3270 | 0.16 s, 0 S3 | 617k IOPS |
+| c8i.4xlarge (x86) | 32 GiB | no | 1295 / 1545 | 1402 | 1137 / 1683 | 0.12 s, 0 S3 | 687k IOPS |
+| m8g.4xlarge | 64 GiB | no | 1398 / 1611 | **20408** | 1703 / 1704 | 0.16 s, 0 S3 | 518k IOPS |
+
+**Reading guide: cold sequential is your NIC; warm and random are your cache;
+metadata is free.** With RAM ≥ ~2× your working file, warm reads come from cache
+at 19–21 GB/s and the 8-reader aggregate reaches mountpoint-s3 parity (it is
+**RAM**, not local NVMe, that determines multi-reader health — the one
+pathological cell, c8g.2xlarge at 180 MB/s, is a 16 GiB box whose cache is
+smaller than eight readers' combined prefetch window, with no disk tier to spill
+to). Metadata is served entirely from the local index: 100k `stat`s in ~0.15 s
+with **zero** S3 requests on every class. Cold sequential tracks the instance
+NIC baseline; mountpoint-s3 rides burst credits higher on the smaller boxes and
+converges with lith on the sustained-bandwidth 16xlarge and on multi-reader.
+
+## Copy first, or mount?
+
+Cost-to-result on a `c8gd.4xlarge`, in-region (transfer/egress $0). Each cell is
+**wall-to-result / dollars / bytes pulled from S3** (full data in
+[`bench/results/copy-vs-mount-v0.1.0.csv`](bench/results/)):
+
+| access path | region query (1% of 14 GiB) | full read (3.8 GiB) | parallel batch (8 × = 60 GiB) |
+|---|---|---|---|
+| copy → gp3 EBS, then compute | 1.3 min / $0.019 / 14.1 GB | 0.95 min / $0.013 / 3.8 GB | 15.5 min / $0.21 / 60 GB |
+| copy → local NVMe, then compute | 0.45 min / $0.006 / 14.1 GB | 0.90 min / $0.012 / 3.8 GB | 3.4 min / $0.05 / 60 GB |
+| **mount with lith, compute in place** | **0.007 min / $0.0001 / 0.05 GB** | **0.79 min / $0.011 / 3.8 GB** | **3.1 min / $0.05 / 68 GB** |
+
+Copying first pays off only when you re-read a dataset many times from fast local
+storage and the copy amortizes — and a local-NVMe copy always beats an EBS copy
+for later compute. For query-once or selective-access workloads, mounting is both
+faster and cheaper: no staging wall-clock, and for a selective query lith moves a
+tiny fraction of the bytes (a 1% region query pulled 49 MB instead of the whole
+14 GiB object).
+
 ## Testing
 
 Unit tests run with the race detector and touch no network:
