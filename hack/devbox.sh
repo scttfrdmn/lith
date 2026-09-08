@@ -78,4 +78,23 @@ mount_nvme() {
 }
 mount_nvme
 
+# bgrun: run a long benchmark detached to a file so its progress survives the
+# SSH connection and can be polled. `spawn connect` block-buffers a remote
+# command's stdout (spore-host/spawn#582), so a multi-minute run shows nothing
+# until it exits — and if the box hits its TTL first the output is lost. Instead:
+#   spawn connect <box> --user ubuntu -- bgrun ./bench.sh      # returns at once
+#   spawn connect <box> --user ubuntu -- tail -n +1 /tmp/bgrun.out   # poll
+log "install bgrun helper (detached-to-file runner for long benchmarks)"
+sudo tee /usr/local/bin/bgrun >/dev/null <<'BGRUN'
+#!/usr/bin/env bash
+# bgrun [-o OUT] CMD...  — run CMD detached, append stdout+stderr to OUT
+# (default /tmp/bgrun.out), print the output path, and return immediately.
+out=/tmp/bgrun.out
+if [ "$1" = "-o" ]; then out="$2"; shift 2; fi
+: >"$out"
+nohup "$@" >>"$out" 2>&1 &
+echo "bgrun pid=$! out=$out"
+BGRUN
+sudo chmod +x /usr/local/bin/bgrun
+
 log "done"
