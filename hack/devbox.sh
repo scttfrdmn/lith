@@ -90,19 +90,21 @@ if [ "${LITH_BENCH_APPS:-0}" = "1" ]; then
 	log "app-bench tools: apt (samtools, tabix, fastp)"
 	sudo apt-get install -y -qq tabix fastp python3-venv python3-pip >/dev/null 2>&1 || true
 	samtools --version | head -1; tabix --version 2>&1 | head -1; fastp --version 2>&1 | head -1
-	log "app-bench tools: python venv /opt/lithapps (pinned)"
-	python3 -m venv /opt/lithapps
-	/opt/lithapps/bin/pip -q install --upgrade pip >/dev/null 2>&1
-	/opt/lithapps/bin/pip -q install \
-		numpy==1.26.4 \
-		'xarray==2024.6.0' \
-		'zarr==2.18.2' \
-		's3fs==2024.6.1' \
-		'h5py==3.11.0' \
-		'pyarrow==17.0.0' \
-		'webdataset==0.2.100' \
-		'torch==2.4.1' --extra-index-url https://download.pytorch.org/whl/cpu >/dev/null 2>&1 \
+	# venv under $HOME (devbox runs as the login user; /opt is root-owned, which
+	# silently aborted the block in session 13). Wheels-only (--only-binary): the
+	# strict pins had no arm64/py3.12 wheels and fell back to failing source
+	# builds, so let pip pick compatible wheel versions. torch/webdataset only for
+	# the S4 dataloader bench; install them separately so a torch hiccup doesn't
+	# block the data-science stack.
+	log "app-bench tools: python venv \$HOME/lithapps (wheels-only)"
+	python3 -m venv "$HOME/lithapps"
+	"$HOME/lithapps/bin/pip" -q install --upgrade pip >/dev/null 2>&1
+	"$HOME/lithapps/bin/pip" install --only-binary=:all: \
+		xarray 'zarr<3' s3fs h5py pyarrow >/dev/null 2>&1 \
 		&& echo "lithapps venv ready" || echo "WARN: some app wheels failed; see box"
+	"$HOME/lithapps/bin/pip" install --only-binary=:all: \
+		webdataset torch --extra-index-url https://download.pytorch.org/whl/cpu >/dev/null 2>&1 \
+		|| echo "WARN: torch/webdataset (S4) not installed; see box"
 fi
 
 log "install bgrun helper (detached-to-file runner for long benchmarks)"
