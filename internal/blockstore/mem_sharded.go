@@ -30,7 +30,17 @@ func (m *memCache) shard(key string) *mem2Q {
 	return m.shards[xxh3.HashString(key)&m.mask]
 }
 
-func (m *memCache) Get(key string) ([]byte, bool) { return m.shard(key).Get(key) }
-func (m *memCache) Put(key string, data []byte)   { m.shard(key).Put(key, data) }
-func (m *memCache) Pin(key string)                { m.shard(key).Pin(key) }
-func (m *memCache) Unpin(key string)              { m.shard(key).Unpin(key) }
+func (m *memCache) Get(key string) ([]byte, bool)     { return m.shard(key).Get(key) }
+func (m *memCache) Put(key string, data []byte)       { m.shard(key).Put(key, data) }
+func (m *memCache) Pin(key string)                    { m.shard(key).Pin(key) }
+func (m *memCache) Unpin(key string)                  { m.shard(key).Unpin(key) }
+func (m *memCache) PutUnread(key string, data []byte) { m.shard(key).PutUnread(key, data) }
+func (m *memCache) MarkUnread(key string)             { m.shard(key).MarkUnread(key) }
+func (m *memCache) ClearUnread(key string)            { m.shard(key).ClearUnread(key) }
+
+// setOnEvictUnread installs the thrash callback on every shard.
+func (m *memCache) setOnEvictUnread(fn func(key string)) {
+	for _, s := range m.shards {
+		s.onEvictUnread = fn
+	}
+}

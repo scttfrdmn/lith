@@ -24,3 +24,29 @@ func computeInflightBytes(flag string) (int64, string) {
 	}
 	return defaultInflightFallback, fmt.Sprintf("%d bytes (fallback; NIC speed unknown)", int64(defaultInflightFallback))
 }
+
+// effectiveReadahead resolves the per-handle readahead window in blocks. A
+// positive user value wins; otherwise the default is the bandwidth-delay
+// product (inflightBytes / block) so a single reader can hold enough in flight
+// to fill a fat NIC on a cold read (#56), clamped to [8, 1024] blocks.
+func effectiveReadahead(userBlocks, inflightBytes, blockSize int64) int64 {
+	if userBlocks > 0 {
+		return userBlocks
+	}
+	if blockSize <= 0 {
+		blockSize = 8 << 20
+	}
+	// 1.5 × the BDP in blocks: the window must lead by more than inflight-bytes
+	// because completed chunks sit cached-unread ahead of the cursor, so the
+	// bytes actually in flight are less than the window. Measured knee on a
+	// 30 Gbps box: a raw BDP window (~89 blocks) reached only 88% of mount-s3,
+	// 1.5× (~134) reaches parity+ (#56).
+	n := inflightBytes * 3 / (2 * blockSize)
+	if n < 8 {
+		n = 8
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return n
+}

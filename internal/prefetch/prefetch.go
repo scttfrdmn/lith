@@ -96,6 +96,19 @@ func New(maxReadahead int64) *Prefetcher {
 // State returns the current detected pattern.
 func (p *Prefetcher) State() State { return p.state }
 
+// SetMax updates the readahead window cap (in blocks). The FUSE layer lowers it
+// when many handles are open so their windows share the prefetch budget (#55).
+// The current window is clamped down to the new cap; the floor is initialWindow.
+func (p *Prefetcher) SetMax(n int64) {
+	if n < initialWindow {
+		n = initialWindow
+	}
+	p.maxReadahead = n
+	if p.window > n {
+		p.window = n
+	}
+}
+
 // Open dispatches the initial readahead window (blocks [0, initialWindow)),
 // assuming reads begin near the start of the file. It must be called once,
 // before the first Observe, for files worth prefetching.

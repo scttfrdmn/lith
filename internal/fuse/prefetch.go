@@ -19,15 +19,17 @@ func newPFWrapper(maxReadahead int64) *pfWrapper {
 	return &pfWrapper{pf: prefetch.New(maxReadahead)}
 }
 
-func (w *pfWrapper) observe(block int64) []int64 {
+func (w *pfWrapper) observe(block, maxWindow int64) []int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.pf.SetMax(maxWindow)
 	return w.pf.Observe(block)
 }
 
-func (w *pfWrapper) open() []int64 {
+func (w *pfWrapper) open(maxWindow int64) []int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.pf.SetMax(maxWindow)
 	return w.pf.Open()
 }
 
