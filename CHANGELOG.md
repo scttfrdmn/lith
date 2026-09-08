@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-08
+
 ### Changed
 
 - The block cache is now **chunk-granular**: a fixed 1 MiB chunk is the cache
@@ -162,4 +164,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/commits/main
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/scttfrdmn/lith/releases/tag/v0.1.0
