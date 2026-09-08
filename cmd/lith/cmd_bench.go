@@ -26,24 +26,25 @@ import (
 )
 
 type benchFlags struct {
-	pattern       string
-	against       string
-	blockSize     string
-	memCache      string
-	diskCache     string
-	diskPath      string
-	cacheDir      string
-	ops           int
-	runs          int
-	readers       int
-	objects       string
-	s3Concurrency int
-	prefetchConc  int
-	maxRange      string
-	maxReadahead  int64
-	diskWriters   int
-	inflightBytes string
-	timelineCSV   string
+	pattern        string
+	against        string
+	blockSize      string
+	memCache       string
+	diskCache      string
+	diskPath       string
+	cacheDir       string
+	ops            int
+	runs           int
+	readers        int
+	objects        string
+	s3Concurrency  int
+	prefetchConc   int
+	prefetchBudget string
+	maxRange       string
+	maxReadahead   int64
+	diskWriters    int
+	inflightBytes  string
+	timelineCSV    string
 
 	noSignRequest bool
 	requesterPays bool
@@ -80,6 +81,7 @@ func newBenchCmd() *cobra.Command {
 	fl.StringVar(&f.objects, "objects", "", "comma-separated keys for --readers mode")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
+	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
@@ -100,6 +102,7 @@ type countingRecorder struct {
 	prefetchIssued int64
 	prefetchHit    int64
 	uncovered      int64
+	evictedUnread  int64
 
 	waitMu    sync.Mutex
 	waitNanos []int64 // prefetch-semaphore wait durations (ns)
@@ -114,10 +117,11 @@ func (c *countingRecorder) S3Get(n int64, _ bool) {
 	atomic.AddInt64(&c.reqs, 1)
 	atomic.AddInt64(&c.bytes, n)
 }
-func (c *countingRecorder) StaleKey(string) {}
-func (c *countingRecorder) PrefetchIssued() { atomic.AddInt64(&c.prefetchIssued, 1) }
-func (c *countingRecorder) PrefetchHit()    { atomic.AddInt64(&c.prefetchHit, 1) }
-func (c *countingRecorder) UncoveredMiss()  { atomic.AddInt64(&c.uncovered, 1) }
+func (c *countingRecorder) StaleKey(string)        {}
+func (c *countingRecorder) PrefetchIssued()        { atomic.AddInt64(&c.prefetchIssued, 1) }
+func (c *countingRecorder) PrefetchHit()           { atomic.AddInt64(&c.prefetchHit, 1) }
+func (c *countingRecorder) UncoveredMiss()         { atomic.AddInt64(&c.uncovered, 1) }
+func (c *countingRecorder) PrefetchEvictedUnread() { atomic.AddInt64(&c.evictedUnread, 1) }
 func (c *countingRecorder) PrefetchWait(d time.Duration) {
 	c.waitMu.Lock()
 	c.waitNanos = append(c.waitNanos, d.Nanoseconds())
@@ -159,6 +163,12 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	if err != nil {
 		return err
 	}
+	var prefetchBudget int64
+	if f.prefetchBudget != "" {
+		if prefetchBudget, err = parseSize(f.prefetchBudget); err != nil {
+			return err
+		}
+	}
 	windowBytes := f.maxReadahead * blockSize
 
 	// In --readers mode, count every HTTP attempt by status so the report can
@@ -191,7 +201,8 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
 			DiskCache: diskCache, DiskPath: cacheDir, MaxRange: maxRange,
 			S3Concurrency: f.s3Concurrency, PrefetchConcurrency: f.prefetchConc,
-			DiskWriters: f.diskWriters, InflightBytes: inflight, Recorder: rec,
+			PrefetchBudget: prefetchBudget,
+			DiskWriters:    f.diskWriters, InflightBytes: inflight, Recorder: rec,
 		})
 		return bs, rec, berr
 	}
@@ -380,6 +391,7 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	_, _ = fmt.Fprintf(tw, "prefetch sem wait p99\t%s\t-\n", rec.waitP99())
 	_, _ = fmt.Fprintf(tw, "prefetch issued / uncovered\t%d / %d\t-\n",
 		atomic.LoadInt64(&rec.prefetchIssued), atomic.LoadInt64(&rec.uncovered))
+	_, _ = fmt.Fprintf(tw, "prefetch evicted-unread (thrash)\t%d\t-\n", atomic.LoadInt64(&rec.evictedUnread))
 	halvings, resets, pw := pfStats.Snapshot()
 	sort.Slice(pw, func(i, j int) bool { return pw[i] < pw[j] })
 	_, _ = fmt.Fprintf(tw, "prefetch halved / reset-random\t%d / %d\t-\n", halvings, resets)

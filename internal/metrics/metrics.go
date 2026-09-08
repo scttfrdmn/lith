@@ -18,20 +18,21 @@ import (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	cacheHits    *prometheus.CounterVec // tier=mem|disk
-	cacheMiss    prometheus.Counter
-	s3Bytes      prometheus.Counter
-	s3Requests   *prometheus.CounterVec // op, status=ok|error
-	inflight     prometheus.Gauge
-	prefetchIss  prometheus.Counter
-	prefetchHit  prometheus.Counter
-	uncovered    prometheus.Counter
-	straddle     prometheus.Counter
-	staleTotal   prometheus.Counter
-	fuseLatency  *prometheus.HistogramVec // op
-	prefetchWait prometheus.Histogram
-	pfHalved     prometheus.Counter
-	pfResetRand  prometheus.Counter
+	cacheHits     *prometheus.CounterVec // tier=mem|disk
+	cacheMiss     prometheus.Counter
+	s3Bytes       prometheus.Counter
+	s3Requests    *prometheus.CounterVec // op, status=ok|error
+	inflight      prometheus.Gauge
+	prefetchIss   prometheus.Counter
+	prefetchHit   prometheus.Counter
+	uncovered     prometheus.Counter
+	straddle      prometheus.Counter
+	staleTotal    prometheus.Counter
+	fuseLatency   *prometheus.HistogramVec // op
+	prefetchWait  prometheus.Histogram
+	pfHalved      prometheus.Counter
+	pfResetRand   prometheus.Counter
+	pfEvictUnread prometheus.Counter
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -85,10 +86,13 @@ func New() *Metrics {
 		pfResetRand: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_reset_random_total", Help: "Prefetch detector collapses to random (two seeks, no progress between).",
 		}),
+		pfEvictUnread: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_evicted_unread_total", Help: "Prefetched chunks evicted before a demand read consumed them (thrash; #55).",
+		}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand)
+		m.pfHalved, m.pfResetRand, m.pfEvictUnread)
 	return m
 }
 
@@ -130,6 +134,14 @@ func (m *Metrics) PrefetchSeeks(halvings, resets int64) {
 	}
 	if resets > 0 {
 		m.pfResetRand.Add(float64(resets))
+	}
+}
+
+// PrefetchEvictedUnread records a prefetched chunk evicted before it was read
+// (optional blockstore.Recorder extension; the #55 thrash signal).
+func (m *Metrics) PrefetchEvictedUnread() {
+	if m != nil {
+		m.pfEvictUnread.Inc()
 	}
 }
 

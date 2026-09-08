@@ -79,7 +79,11 @@ type Config struct {
 	PrefetchConcurrency int
 	DiskWriters         int   // write-behind workers for the disk tier (default 4)
 	InflightBytes       int64 // bytes-in-flight budget (0 disables byte gating)
-	Recorder            Recorder
+	// PrefetchBudget caps the bytes held for prefetch not yet demanded (in-flight
+	// + fetched-unread), so aggregate readahead cannot thrash the memory tier
+	// (#55). <=0 defaults to 50% of MemCache.
+	PrefetchBudget int64
+	Recorder       Recorder
 }
 
 // chunkState is an in-flight (or just-completed) chunk fetch.
@@ -99,16 +103,20 @@ type BlockStore struct {
 	mem  *memCache
 	disk *diskTier
 
-	sem      chan struct{} // total S3 request-count hard cap
-	prefetch chan struct{} // cap on concurrent prefetch fills (<= sem)
-	budget   *bytesBudget  // bytes-in-flight budget (nil = disabled)
+	sem      chan struct{}   // total S3 request-count hard cap
+	prefetch chan struct{}   // cap on concurrent prefetch fills (<= sem)
+	budget   *bytesBudget    // bytes-in-flight budget (nil = disabled)
+	pfBudget *prefetchBudget // prefetched-not-yet-demanded byte budget (#55)
 
 	rec Recorder
 
-	mu         sync.Mutex
-	inflight   map[string]*chunkState
-	stale      map[string]struct{}
-	prefetched map[string]struct{}
+	mu       sync.Mutex
+	inflight map[string]*chunkState
+	stale    map[string]struct{}
+	// prefetched holds chunk keys fetched by prefetch and not yet demanded; a
+	// sync.Map so the mem-tier eviction callback can release the budget without
+	// taking bs.mu under the shard lock (avoids a lock-order inversion).
+	prefetched sync.Map
 
 	// Write-behind disk tier: prefetch fills apply backpressure on this queue
 	// (bounded), demand fills never block; shutdown drains via stop.
@@ -157,6 +165,10 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		}
 		disk = d
 	}
+	pfBudgetCap := cfg.PrefetchBudget
+	if pfBudgetCap <= 0 {
+		pfBudgetCap = cfg.MemCache / 2
+	}
 	bs := &BlockStore{
 		src:         src,
 		bucket:      cfg.Bucket,
@@ -167,11 +179,12 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		sem:         make(chan struct{}, conc),
 		prefetch:    make(chan struct{}, max(1, prefetchConc)),
 		budget:      newBytesBudget(cfg.InflightBytes),
+		pfBudget:    newPrefetchBudget(pfBudgetCap),
 		rec:         cfg.Recorder,
 		inflight:    make(map[string]*chunkState),
 		stale:       make(map[string]struct{}),
-		prefetched:  make(map[string]struct{}),
 	}
+	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
 		writers := cfg.DiskWriters
 		if writers <= 0 {
@@ -324,7 +337,20 @@ func (bs *BlockStore) claim(k Key, ci int64) (cs *chunkState, mine bool, cachedD
 func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err error, blocking bool) {
 	ck := bs.cacheKey(k, ci)
 	if err == nil {
-		bs.mem.Put(ck, data)
+		// blocking == prefetch fill: insert the chunk already flagged unread
+		// (evicted last, atomically) — it holds a budget reservation until a
+		// demand read consumes it or it is evicted (#55). Demand fills insert
+		// normally.
+		if blocking {
+			bs.mem.PutUnread(ck, data)
+		} else {
+			bs.mem.Put(ck, data)
+		}
+	} else if blocking {
+		// Prefetch fill failed: release its reservation so the budget doesn't leak.
+		if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
+			bs.pfBudget.release(ChunkSize)
+		}
 	}
 	cs.data, cs.err = data, err
 	close(cs.done)
@@ -502,6 +528,11 @@ func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]by
 	}
 	if !mine {
 		<-cs.done
+		// A demand read that joined an in-flight prefetch fill still consumes the
+		// chunk: credit the hit and release its budget reservation (#55).
+		if cs.err == nil {
+			bs.notePrefetchHit(bs.cacheKey(k, ci))
+		}
 		return cs.data, cs.err
 	}
 	bs.record(func(r Recorder) { r.UncoveredMiss() })
@@ -587,33 +618,57 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	if c1 > lastChunk {
 		c1 = lastChunk
 	}
-	// Mark not-yet-cached chunks as prefetched for accuracy accounting.
+	// Reserve each not-yet-cached chunk against the prefetch budget and mark it
+	// prefetched. When the budget is exhausted, stop fetching further ahead
+	// (#55): shrink the run to the last reserved chunk so we never dispatch more
+	// prefetch than the memory tier can hold unread.
+	hi := c0 - 1
 	for ci := c0; ci <= c1; ci++ {
-		if _, tier := bs.lookup(k, ci); tier == "" {
-			ck := bs.cacheKey(k, ci)
-			bs.mu.Lock()
-			if _, dup := bs.prefetched[ck]; !dup {
-				bs.prefetched[ck] = struct{}{}
-				bs.mu.Unlock()
-				bs.record(func(r Recorder) { r.PrefetchIssued() })
-			} else {
-				bs.mu.Unlock()
+		if _, tier := bs.lookup(k, ci); tier != "" {
+			if ci == hi+1 {
+				hi = ci // already cached and contiguous; keep the run going
 			}
+			continue
 		}
+		ck := bs.cacheKey(k, ci)
+		if _, dup := bs.prefetched.Load(ck); dup {
+			hi = ci
+			continue
+		}
+		if !bs.pfBudget.tryReserve(ChunkSize) {
+			break // budget full: do not prefetch further ahead
+		}
+		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); dup {
+			bs.pfBudget.release(ChunkSize) // lost a race; undo the reservation
+		} else {
+			bs.record(func(r Recorder) { r.PrefetchIssued() })
+		}
+		hi = ci
 	}
-	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
+	if hi < c0 {
+		return
+	}
+	_ = bs.ensureChunks(ctx, k, c0, hi, objSize, true, nil)
+}
+
+// onEvictUnread is invoked by the memory tier when a prefetched-but-unread chunk
+// is evicted — the thrash signal. It releases the chunk's prefetch reservation.
+// Called under a shard lock, so it must stay lock-free w.r.t. bs.mu (hence the
+// sync.Map).
+func (bs *BlockStore) onEvictUnread(ck string) {
+	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
+		bs.pfBudget.release(ChunkSize)
+		bs.recordPrefetchEvicted()
+	}
 }
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a
-// chunk that prefetch had fetched.
+// chunk that prefetch had fetched, clears its unread flag, and releases its
+// prefetch-budget reservation.
 func (bs *BlockStore) notePrefetchHit(ck string) {
-	bs.mu.Lock()
-	_, ok := bs.prefetched[ck]
-	if ok {
-		delete(bs.prefetched, ck)
-	}
-	bs.mu.Unlock()
-	if ok {
+	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
+		bs.pfBudget.release(ChunkSize)
+		bs.mem.ClearUnread(ck)
 		bs.record(func(r Recorder) { r.PrefetchHit() })
 	}
 }
@@ -653,5 +708,17 @@ type prefetchWaitRecorder interface {
 func (bs *BlockStore) recordPrefetchWait(d time.Duration) {
 	if r, ok := bs.rec.(prefetchWaitRecorder); ok {
 		r.PrefetchWait(d)
+	}
+}
+
+// prefetchEvictRecorder is an optional Recorder extension: implementers are
+// told when a prefetched-but-unread chunk was evicted (the #55 thrash signal).
+type prefetchEvictRecorder interface {
+	PrefetchEvictedUnread()
+}
+
+func (bs *BlockStore) recordPrefetchEvicted() {
+	if r, ok := bs.rec.(prefetchEvictRecorder); ok {
+		r.PrefetchEvictedUnread()
 	}
 }

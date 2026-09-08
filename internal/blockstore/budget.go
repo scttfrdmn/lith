@@ -2,7 +2,10 @@
 
 package blockstore
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // bytesBudget is a weighted semaphore bounding total bytes in flight, so
 // concurrency tracks the network bandwidth-delay product rather than a fixed
@@ -53,4 +56,45 @@ func (b *bytesBudget) release(n int64) {
 	b.avail += n
 	b.mu.Unlock()
 	b.cond.Broadcast()
+}
+
+// prefetchBudget bounds the bytes held for prefetch that a demand read has not
+// yet consumed (in-flight prefetch fills plus fetched-but-unread chunks), so
+// aggregate readahead cannot exceed a fraction of the memory tier and thrash it
+// (#55). Unlike bytesBudget it never blocks: a reservation that would exceed the
+// cap is refused, and the prefetcher simply does not fetch further ahead.
+type prefetchBudget struct {
+	cap  int64
+	used atomic.Int64
+}
+
+func newPrefetchBudget(capacity int64) *prefetchBudget {
+	if capacity <= 0 {
+		return nil
+	}
+	return &prefetchBudget{cap: capacity}
+}
+
+// tryReserve reserves n bytes if they fit under the cap, returning success.
+func (p *prefetchBudget) tryReserve(n int64) bool {
+	if p == nil {
+		return true // budget disabled: never gate
+	}
+	for {
+		u := p.used.Load()
+		if u+n > p.cap {
+			return false
+		}
+		if p.used.CompareAndSwap(u, u+n) {
+			return true
+		}
+	}
+}
+
+// release returns n bytes to the budget.
+func (p *prefetchBudget) release(n int64) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.used.Add(-n)
 }

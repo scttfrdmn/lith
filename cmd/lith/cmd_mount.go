@@ -33,6 +33,7 @@ type mountFlags struct {
 	smallFile      string
 	s3Concurrency  int
 	prefetchConc   int
+	prefetchBudget string
 	maxReadahead   int64
 	diskWriters    int
 	inflightBytes  string
@@ -76,6 +77,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
+	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
@@ -121,6 +123,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	maxRange, err := parseSize(f.maxRange)
 	if err != nil {
 		return err
+	}
+	var prefetchBudget int64
+	if f.prefetchBudget != "" {
+		if prefetchBudget, err = parseSize(f.prefetchBudget); err != nil {
+			return err
+		}
 	}
 	smallFile, err := parseSize(f.smallFile)
 	if err != nil {
@@ -172,6 +180,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		MaxRange:            maxRange,
 		S3Concurrency:       f.s3Concurrency,
 		PrefetchConcurrency: f.prefetchConc,
+		PrefetchBudget:      prefetchBudget,
 		DiskWriters:         f.diskWriters,
 		InflightBytes:       inflight,
 		Recorder:            met, // nil-safe
