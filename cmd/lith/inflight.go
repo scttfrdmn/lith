@@ -24,3 +24,24 @@ func computeInflightBytes(flag string) (int64, string) {
 	}
 	return defaultInflightFallback, fmt.Sprintf("%d bytes (fallback; NIC speed unknown)", int64(defaultInflightFallback))
 }
+
+// effectiveReadahead resolves the per-handle readahead window in blocks. A
+// positive user value wins; otherwise the default is the bandwidth-delay
+// product (inflightBytes / block) so a single reader can hold enough in flight
+// to fill a fat NIC on a cold read (#56), clamped to [8, 1024] blocks.
+func effectiveReadahead(userBlocks, inflightBytes, blockSize int64) int64 {
+	if userBlocks > 0 {
+		return userBlocks
+	}
+	if blockSize <= 0 {
+		blockSize = 8 << 20
+	}
+	n := inflightBytes / blockSize
+	if n < 8 {
+		n = 8
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return n
+}

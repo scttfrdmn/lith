@@ -83,7 +83,7 @@ func newBenchCmd() *cobra.Command {
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
-	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
+	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = derive from inflight-bytes/block)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.timelineCSV, "timeline-csv", "", "in --readers mode, write a per-second per-reader MB/s timeline to this CSV")
@@ -169,6 +169,10 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 			return err
 		}
 	}
+	// Default the single-handle readahead window to the bandwidth-delay product
+	// (inflight-bytes / block) so one reader can fill the NIC on a fat pipe (#56).
+	benchInflight, _ := computeInflightBytes(f.inflightBytes)
+	f.maxReadahead = effectiveReadahead(f.maxReadahead, benchInflight, blockSize)
 	windowBytes := f.maxReadahead * blockSize
 
 	// In --readers mode, count every HTTP attempt by status so the report can

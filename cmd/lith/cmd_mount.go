@@ -78,7 +78,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
-	fl.Int64Var(&f.maxReadahead, "max-readahead", 64, "max sequential readahead window in blocks")
+	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = derive from inflight-bytes/block)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
@@ -171,6 +171,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	}
 	inflight, inflightDesc := computeInflightBytes(f.inflightBytes)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
+	// Default the readahead window to the bandwidth-delay product so a single
+	// reader can fill the NIC on a cold read (#56).
+	f.maxReadahead = effectiveReadahead(f.maxReadahead, inflight, blockSize)
+	log.Info("readahead window", "blocks", f.maxReadahead)
 	bs, err := blockstore.New(client, blockstore.Config{
 		Bucket:              bucket,
 		BlockSize:           blockSize,
