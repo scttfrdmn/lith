@@ -31,6 +31,34 @@ type Config struct {
 	GID          uint32
 	SmallFile    int64 // whole-file prefetch threshold in bytes
 	MaxReadahead int64 // max sequential readahead window in blocks
+	// PrefetchStats, when non-nil, collects per-handle prefetcher diagnostics
+	// at Release (the #49 investigation). nil in production.
+	PrefetchStats *PrefetchStats
+}
+
+// PrefetchStats aggregates per-handle prefetcher behaviour across a run.
+type PrefetchStats struct {
+	mu          sync.Mutex
+	Resets      int64   // total window collapses across all handles
+	PeakWindows []int64 // each handle's largest readahead window
+}
+
+func (p *PrefetchStats) record(resets, peak int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.Resets += resets
+	p.PeakWindows = append(p.PeakWindows, peak)
+	p.mu.Unlock()
+}
+
+// Snapshot returns the total reset count and a copy of the per-handle peak
+// windows recorded so far.
+func (p *PrefetchStats) Snapshot() (int64, []int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Resets, append([]int64(nil), p.PeakWindows...)
 }
 
 // node is an entry in the NodeId table.
@@ -284,8 +312,12 @@ func (f *rawFS) maybeWholeFile(h *fileHandle) {
 // Release frees a file handle.
 func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	f.mu.Lock()
+	h := f.handles[input.Fh]
 	delete(f.handles, input.Fh)
 	f.mu.Unlock()
+	if h != nil && f.cfg.PrefetchStats != nil {
+		f.cfg.PrefetchStats.record(h.pf.resets(), h.pf.peakWindow())
+	}
 }
 
 // OpenDir accepts a directory open (state is carried via the read offset).

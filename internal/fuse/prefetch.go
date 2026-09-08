@@ -30,3 +30,15 @@ func (w *pfWrapper) open() []int64 {
 	defer w.mu.Unlock()
 	return w.pf.Open()
 }
+
+func (w *pfWrapper) resets() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.Resets()
+}
+
+func (w *pfWrapper) peakWindow() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.PeakWindow()
+}

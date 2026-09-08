@@ -33,6 +33,10 @@ type Config struct {
 	PathStyle bool
 	// Concurrency sizes the connection pool; defaults to 64.
 	Concurrency int
+	// TransportWrap, when non-nil, wraps the tuned RoundTripper before use.
+	// Used only by diagnostic tooling (e.g. lith-s3bench / bench instrumentation)
+	// to count HTTP attempts by status code; nil in production.
+	TransportWrap func(http.RoundTripper) http.RoundTripper
 }
 
 // Client is the aws-sdk-go-v2 implementation of API with a transport tuned
@@ -88,9 +92,18 @@ func buildTransport(concurrency int) *http.Transport {
 // is set, the region is resolved from the bucket. This performs network I/O;
 // unit tests use the fake instead.
 func New(ctx context.Context, cfg Config) (*Client, error) {
-	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+	var httpClient config.HTTPClient
+	if cfg.TransportWrap != nil {
+		// Diagnostic path: build the tuned transport, wrap its RoundTripper, and
+		// hand it over as a plain *http.Client so every HTTP attempt is observed.
+		t := &http.Transport{}
 		TuneTransport(t, cfg.Concurrency)
-	})
+		httpClient = &http.Client{Transport: cfg.TransportWrap(t)}
+	} else {
+		httpClient = awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+			TuneTransport(t, cfg.Concurrency)
+		})
+	}
 
 	loadOpts := []func(*config.LoadOptions) error{
 		config.WithHTTPClient(httpClient),

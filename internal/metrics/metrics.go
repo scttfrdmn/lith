@@ -7,6 +7,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -17,17 +18,18 @@ import (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	cacheHits   *prometheus.CounterVec // tier=mem|disk
-	cacheMiss   prometheus.Counter
-	s3Bytes     prometheus.Counter
-	s3Requests  *prometheus.CounterVec // op, status=ok|error
-	inflight    prometheus.Gauge
-	prefetchIss prometheus.Counter
-	prefetchHit prometheus.Counter
-	uncovered   prometheus.Counter
-	straddle    prometheus.Counter
-	staleTotal  prometheus.Counter
-	fuseLatency *prometheus.HistogramVec // op
+	cacheHits    *prometheus.CounterVec // tier=mem|disk
+	cacheMiss    prometheus.Counter
+	s3Bytes      prometheus.Counter
+	s3Requests   *prometheus.CounterVec // op, status=ok|error
+	inflight     prometheus.Gauge
+	prefetchIss  prometheus.Counter
+	prefetchHit  prometheus.Counter
+	uncovered    prometheus.Counter
+	straddle     prometheus.Counter
+	staleTotal   prometheus.Counter
+	fuseLatency  *prometheus.HistogramVec // op
+	prefetchWait prometheus.Histogram
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -70,9 +72,14 @@ func New() *Metrics {
 			Help:    "FUSE operation latency in seconds.",
 			Buckets: prometheus.ExponentialBuckets(1e-6, 4, 12), // ~1µs .. ~4s
 		}, []string{"op"}),
+		prefetchWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "lith_prefetch_sem_wait_seconds",
+			Help:    "Time a prefetch fill spent blocked acquiring the prefetch semaphore.",
+			Buckets: prometheus.ExponentialBuckets(1e-6, 4, 12), // ~1µs .. ~4s
+		}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
-		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency)
+		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait)
 	return m
 }
 
@@ -93,6 +100,14 @@ func (m *Metrics) Handler() http.Handler {
 		return http.NotFoundHandler()
 	}
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
+}
+
+// PrefetchWait records the time a prefetch fill blocked on the prefetch
+// semaphore (optional blockstore.Recorder extension).
+func (m *Metrics) PrefetchWait(d time.Duration) {
+	if m != nil {
+		m.prefetchWait.Observe(d.Seconds())
+	}
 }
 
 // --- blockstore.Recorder implementation (all nil-safe) ---
