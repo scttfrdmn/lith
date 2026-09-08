@@ -84,6 +84,27 @@ mount_nvme
 # until it exits — and if the box hits its TTL first the output is lost. Instead:
 #   spawn connect <box> --user ubuntu -- bgrun ./bench.sh      # returns at once
 #   spawn connect <box> --user ubuntu -- tail -n +1 /tmp/bgrun.out   # poll
+# Application-benchmark tools (session 13). Opt-in — set LITH_BENCH_APPS=1 — so
+# the base dev box stays lean. Pinned versions; arm64 wheels/apt.
+if [ "${LITH_BENCH_APPS:-0}" = "1" ]; then
+	log "app-bench tools: apt (samtools, tabix, fastp)"
+	sudo apt-get install -y -qq tabix fastp python3-venv python3-pip >/dev/null 2>&1 || true
+	samtools --version | head -1; tabix --version 2>&1 | head -1; fastp --version 2>&1 | head -1
+	log "app-bench tools: python venv /opt/lithapps (pinned)"
+	python3 -m venv /opt/lithapps
+	/opt/lithapps/bin/pip -q install --upgrade pip >/dev/null 2>&1
+	/opt/lithapps/bin/pip -q install \
+		numpy==1.26.4 \
+		'xarray==2024.6.0' \
+		'zarr==2.18.2' \
+		's3fs==2024.6.1' \
+		'h5py==3.11.0' \
+		'pyarrow==17.0.0' \
+		'webdataset==0.2.100' \
+		'torch==2.4.1' --extra-index-url https://download.pytorch.org/whl/cpu >/dev/null 2>&1 \
+		&& echo "lithapps venv ready" || echo "WARN: some app wheels failed; see box"
+fi
+
 log "install bgrun helper (detached-to-file runner for long benchmarks)"
 sudo tee /usr/local/bin/bgrun >/dev/null <<'BGRUN'
 #!/usr/bin/env bash
