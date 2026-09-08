@@ -380,9 +380,10 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	_, _ = fmt.Fprintf(tw, "prefetch sem wait p99\t%s\t-\n", rec.waitP99())
 	_, _ = fmt.Fprintf(tw, "prefetch issued / uncovered\t%d / %d\t-\n",
 		atomic.LoadInt64(&rec.prefetchIssued), atomic.LoadInt64(&rec.uncovered))
-	resets, pw := pfStats.Snapshot()
+	halvings, resets, pw := pfStats.Snapshot()
 	sort.Slice(pw, func(i, j int) bool { return pw[i] < pw[j] })
-	_, _ = fmt.Fprintf(tw, "prefetch window resets / peak windows\t%d / %v\t-\n", resets, pw)
+	_, _ = fmt.Fprintf(tw, "prefetch halved / reset-random\t%d / %d\t-\n", halvings, resets)
+	_, _ = fmt.Fprintf(tw, "prefetch peak windows\t%v\t-\n", pw)
 	_ = tw.Flush()
 	return nil
 }

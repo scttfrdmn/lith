@@ -39,26 +39,28 @@ type Config struct {
 // PrefetchStats aggregates per-handle prefetcher behaviour across a run.
 type PrefetchStats struct {
 	mu          sync.Mutex
-	Resets      int64   // total window collapses across all handles
+	Halvings    int64   // total window halvings (seeks) across all handles
+	Resets      int64   // total collapses to Random across all handles
 	PeakWindows []int64 // each handle's largest readahead window
 }
 
-func (p *PrefetchStats) record(resets, peak int64) {
+func (p *PrefetchStats) record(halvings, resets, peak int64) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
+	p.Halvings += halvings
 	p.Resets += resets
 	p.PeakWindows = append(p.PeakWindows, peak)
 	p.mu.Unlock()
 }
 
-// Snapshot returns the total reset count and a copy of the per-handle peak
-// windows recorded so far.
-func (p *PrefetchStats) Snapshot() (int64, []int64) {
+// Snapshot returns the total halving and reset counts and a copy of the
+// per-handle peak windows recorded so far.
+func (p *PrefetchStats) Snapshot() (halvings, resets int64, peaks []int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.Resets, append([]int64(nil), p.PeakWindows...)
+	return p.Halvings, p.Resets, append([]int64(nil), p.PeakWindows...)
 }
 
 // node is an entry in the NodeId table.
@@ -315,8 +317,10 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	h := f.handles[input.Fh]
 	delete(f.handles, input.Fh)
 	f.mu.Unlock()
-	if h != nil && f.cfg.PrefetchStats != nil {
-		f.cfg.PrefetchStats.record(h.pf.resets(), h.pf.peakWindow())
+	if h != nil {
+		halvings, resets := h.pf.halvings(), h.pf.resets()
+		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
+		f.cfg.Metrics.PrefetchSeeks(halvings, resets)
 	}
 }
 

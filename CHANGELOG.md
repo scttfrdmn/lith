@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The per-handle prefetcher is now **tolerant of out-of-order reads**. The kernel
+  issues a single file handle's readahead concurrently, so reads can reach the
+  FUSE layer out of order even for a strictly sequential file; the old detector
+  treated any non-unit delta as a pattern break and collapsed the readahead
+  window to zero, then re-ramped from 2. Under 8 concurrent readers this left the
+  last, largest, slowest-draining file with an oscillating shallow window — the
+  bimodal ~180 MB/s cold tail (#49). The detector now treats a read within the
+  reorder band `[cursor-window, frontier+window]` as sequential progress; a
+  genuine out-of-band seek **halves** the window (floor 2) and re-anchors rather
+  than resetting to zero, and only two seeks with no progress between them fall
+  to random. New metrics `lith_prefetch_window_halved_total` and
+  `lith_prefetch_reset_random_total`. See #49, #40.
 - Prefetch now dispatches the readahead window **ahead of the demand cursor** —
   on `open` (initial 2-block window) and on every window advance — instead of
   reactively on the read that reveals a gap. A demand read that finds its chunk
