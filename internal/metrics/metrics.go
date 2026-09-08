@@ -30,6 +30,8 @@ type Metrics struct {
 	staleTotal   prometheus.Counter
 	fuseLatency  *prometheus.HistogramVec // op
 	prefetchWait prometheus.Histogram
+	pfHalved     prometheus.Counter
+	pfResetRand  prometheus.Counter
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -77,9 +79,16 @@ func New() *Metrics {
 			Help:    "Time a prefetch fill spent blocked acquiring the prefetch semaphore.",
 			Buckets: prometheus.ExponentialBuckets(1e-6, 4, 12), // ~1µs .. ~4s
 		}),
+		pfHalved: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_window_halved_total", Help: "Readahead-window halvings from an out-of-band seek.",
+		}),
+		pfResetRand: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_reset_random_total", Help: "Prefetch detector collapses to random (two seeks, no progress between).",
+		}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
-		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait)
+		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
+		m.pfHalved, m.pfResetRand)
 	return m
 }
 
@@ -107,6 +116,20 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) PrefetchWait(d time.Duration) {
 	if m != nil {
 		m.prefetchWait.Observe(d.Seconds())
+	}
+}
+
+// PrefetchSeeks adds a handle's window-halving and random-reset counts (called
+// once per handle at Release). Nil-safe.
+func (m *Metrics) PrefetchSeeks(halvings, resets int64) {
+	if m == nil {
+		return
+	}
+	if halvings > 0 {
+		m.pfHalved.Add(float64(halvings))
+	}
+	if resets > 0 {
+		m.pfResetRand.Add(float64(resets))
 	}
 }
 
