@@ -114,23 +114,28 @@ client ceiling can be reproduced independently with `cmd/lith-s3bench`.
 
 | instance | RAM | NVMe | cold seq (lith / mnt-s3) | warm seq (lith) | 8-reader (lith / mnt-s3) | 100k stat | warm rand4k |
 |---|---|---|---|---|---|---|---|
-| c8g.2xlarge | 16 GiB | no | 1321 / 1584 | 1274 | **180** / 1657 ⚠ | 0.16 s, 0 S3 | 543k IOPS |
-| c8gd.4xlarge | 32 GiB | yes | 1406 / 1569 | 1428 | 1095 / 1683 | 0.17 s, 0 S3 | — |
-| c8gd.8xlarge | 64 GiB | yes | 1361 / 1581 | **19214** | 1696 / 1686 | 0.16 s, 0 S3 | 547k IOPS |
-| c8gd.16xlarge | 128 GiB | yes | 1970 / 2652 | **20845** | 3245 / 3270 | 0.16 s, 0 S3 | 617k IOPS |
-| c8i.4xlarge (x86) | 32 GiB | no | 1295 / 1545 | 1402 | 1137 / 1683 | 0.12 s, 0 S3 | 687k IOPS |
-| m8g.4xlarge | 64 GiB | no | 1398 / 1611 | **20408** | 1703 / 1704 | 0.16 s, 0 S3 | 518k IOPS |
+| c8g.2xlarge | 16 GiB | no | 1354 / 1527 | 1163 | **1550** / 1602 | 0.16 s, 0 S3 | 543k IOPS |
+| c8gd.4xlarge | 32 GiB | yes | 1440 / 1547 | 1400 | **1688** / 1637 | 0.17 s, 0 S3 | — |
+| c8gd.16xlarge | 128 GiB | yes | **2848** / 2613 | **21383** | **3385** / 3221 | 0.16 s, 0 S3 | 589k IOPS |
+| c8gd.8xlarge † | 64 GiB | yes | 1361 / 1581 | 19214 | 1696 / 1686 | 0.16 s, 0 S3 | 547k IOPS |
+| c8i.4xlarge (x86) † | 32 GiB | no | 1295 / 1545 | 1402 | 1137 / 1683 | 0.12 s, 0 S3 | 687k IOPS |
+| m8g.4xlarge † | 64 GiB | no | 1398 / 1611 | 20408 | 1703 / 1704 | 0.16 s, 0 S3 | 518k IOPS |
+
+† pre-fix (the earlier run); their multi-reader improves the same way the
+re-run rows do — the 32 GiB x86 box would rise from 1137 toward mount-s3 like
+the 32 GiB `c8gd.4xlarge` did (1095 → 1688).
 
 **Reading guide: cold sequential is your NIC; warm and random are your cache;
-metadata is free.** With RAM ≥ ~2× your working file, warm reads come from cache
-at 19–21 GB/s and the 8-reader aggregate reaches mountpoint-s3 parity (it is
-**RAM**, not local NVMe, that determines multi-reader health — the one
-pathological cell, c8g.2xlarge at 180 MB/s, is a 16 GiB box whose cache is
-smaller than eight readers' combined prefetch window, with no disk tier to spill
-to). Metadata is served entirely from the local index: 100k `stat`s in ~0.15 s
-with **zero** S3 requests on every class. Cold sequential tracks the instance
-NIC baseline; mountpoint-s3 rides burst credits higher on the smaller boxes and
-converges with lith on the sustained-bandwidth 16xlarge and on multi-reader.
+metadata is free.** A single cold reader fills the instance's NIC (the readahead
+window is sized to the bandwidth-delay product), reaching mount-s3 parity or
+better. The **8-reader aggregate reaches mount-s3 parity across box sizes**,
+from a 16 GiB `c8g.2xlarge` (1550, 97% of mount-s3) to a 128 GiB
+`c8gd.16xlarge` (3385, 105%): aggregate readahead is bounded to the memory tier
+and shared fairly across handles, so a small-RAM box no longer thrashes. With
+RAM ≥ ~2× your working file, warm reads come from cache at ~20 GB/s. Metadata is
+served entirely from the local index: 100k `stat`s in ~0.15 s with **zero** S3
+requests on every class. (mount-s3 still edges ahead on cold *single*-reader on
+the smallest burst-credit boxes, where it rides NIC burst harder.)
 
 ## Copy first, or mount?
 
