@@ -1,0 +1,5 @@
+# lith v0.1.0 per-instance-class matrix. us-east-1, s3://1000genomes, fair #43 config.
+# lith: --mem-cache (default 25% RAM or 32GiB where noted) --disk-cache 0 (NVMe boxes: --disk-cache on /mnt/nvme) --s3-concurrency 128; mount-s3: --read-part-size 8388608, NIC-aware default throughput, no --cache.
+# single = 14GiB CRAM seq; readers8 = 8 heterogeneous phase3 CRAMs (3.8-14GiB) cold; rand4k warm; metadata from prebuilt local index.
+# NIC_Gbps = advertised ("up to" for <16xlarge; 16xlarge sustained). On-demand $/hr via AWS Price List API.
+instance,vCPU,RAM_GiB,NIC_Gbps,local_nvme,usd_per_hr,lith_seq_cold_min,lith_seq_cold_med,lith_seq_cold_max,lith_seq_warm,ms3_seq_cold_med,lith_r8_min,lith_r8_med,lith_r8_max,ms3_r8_med,lith_cpu_pct_r8,lith_rand4k_warm,lith_ls_sec,lith_stat_n,lith_stat_sec,lith_stat_s3reqs,notes

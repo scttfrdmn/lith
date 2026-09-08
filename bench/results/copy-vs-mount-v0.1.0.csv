@@ -1,0 +1,5 @@
+# lith v0.1.0 copy-vs-mount cost-to-result. c8gd.4xlarge, us-east-1, s3://1000genomes.
+# Rates (AWS Price List API): c8gd.4xlarge=$0.78384/hr; gp3=$0.08/GiB-month (200GiB prorated by hours alive); S3 GET=$0.0000004/request ($0.0004/1000). Cross-region/egress=$0 (in-region).
+# W1=samtools view -c chr20:30M-31M on 14GiB CRAM (~1%); W2=flagstat 3.8GiB CRAM (100%); W3=flagstat 8 heterogeneous CRAMs x8 parallel.
+# P1=aws s3 cp -> gp3 EBS then compute; P2=aws s3 cp -> local NVMe then compute; P3=lith mount, compute on mount.
+workload,path,run,wall_s,copy_s,compute_s,bytes_from_s3,s3_get_reqs,usd_instance,usd_gp3,usd_s3get,usd_total,notes
