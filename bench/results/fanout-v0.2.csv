@@ -1,0 +1,14 @@
+# lith v0.2 fan-out (session 17): samtools flagstat on 64 phase3 CRAMs (534.8 GB), c8g.2xlarge (8 vCPU) spot, us-east-1.
+# lith=mount (post-#79 NIC baseline sizing), reads shard by key; copy=stage shard to root gp3 (125 MB/s) then flagstat.
+# wall_s = submit -> last result object (spot fulfillment + boot + setup + work). cost_usd = billed node-seconds x $0.31904/hr.
+# cost: EC2 billed where a clean cohort was captured (lith-1/8/64, copy-8); copy-64 from per-node timing + 130 s/node boot+setup.
+# copy-1 DID NOT COMPLETE in the 2.5 h budget: staged 392 GB in 56.5 min (~124 MB/s, gp3-write-bound) then killed before compute
+#   -> its full stage alone (~72 min projected) already exceeds lith N=1's entire 22 min run; wall/cost below are projected lower bounds.
+# N=64 spot topped out at 62/64 nodes both runs (spot capacity ~512 vCPU near the 640 quota); those cells are 62-complete.
+path,n,wall_s,nodes_done,cost_usd,sum_copy_s,sum_compute_s,complete_files,complete
+lith,1,1320,1,0.123,0,1253,64,1
+lith,8,445,8,0.225,0,1635,64,1
+lith,64,408,64,1.179,0,6758,64,1
+copy,1,8580,1,0.760,4320,4260,0,0
+copy,8,1307,8,0.811,4027,4324,64,1
+copy,64,450,62,1.506,3117,5798,62,1
