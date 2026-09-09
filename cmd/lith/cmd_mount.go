@@ -37,6 +37,7 @@ type mountFlags struct {
 	prefetchConc   int
 	prefetchBudget string
 	maxReadahead   int64
+	nicGbps        float64
 	siblingWindow  int
 	siblingRead    int
 	diskWriters    int
@@ -84,6 +85,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
+	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
@@ -180,7 +182,20 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if f.metrics != "" {
 		met = metrics.New()
 	}
-	inflight, inflightDesc := computeInflightBytes(f.inflightBytes)
+	// Resolve NIC bandwidth (baseline drives the in-flight budget; #79). Cache
+	// nic.json next to the index so repeat mounts and boxes without
+	// ec2:DescribeInstanceTypes still get a real answer.
+	nicDir := os.TempDir()
+	if f.indexFile != "" {
+		nicDir = filepath.Dir(f.indexFile)
+	}
+	nic := resolveNIC(ctx, nicDir, f.nicGbps)
+	if nic.Source != "" {
+		log.Info("nic bandwidth", "baseline_gbps", nic.BaselineGbps, "peak_gbps", nic.PeakGbps, "source", nic.Source)
+	} else {
+		log.Info("nic bandwidth", "source", "unknown (using fixed in-flight fallback)")
+	}
+	inflight, inflightDesc := computeInflightBytes(f.inflightBytes, nic.BaselineGbps)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
 	// Default the readahead window to the bandwidth-delay product so a single
 	// reader can fill the NIC on a cold read (#56).

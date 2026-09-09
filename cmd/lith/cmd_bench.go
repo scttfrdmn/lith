@@ -170,8 +170,10 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 		}
 	}
 	// Default the single-handle readahead window to the bandwidth-delay product
-	// (inflight-bytes / block) so one reader can fill the NIC on a fat pipe (#56).
-	benchInflight, _ := computeInflightBytes(f.inflightBytes)
+	// (inflight-bytes / block) so one reader can fill the NIC on a fat pipe (#56),
+	// sized from the NIC baseline (#79).
+	nicBaseline := resolveNIC(ctx, os.TempDir(), 0).BaselineGbps
+	benchInflight, _ := computeInflightBytes(f.inflightBytes, nicBaseline)
 	f.maxReadahead = effectiveReadahead(f.maxReadahead, benchInflight, blockSize)
 	windowBytes := f.maxReadahead * blockSize
 
@@ -200,7 +202,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 
 	mkStore := func(cacheDir string) (*blockstore.BlockStore, *countingRecorder, error) {
 		rec := &countingRecorder{}
-		inflight, _ := computeInflightBytes(f.inflightBytes)
+		inflight, _ := computeInflightBytes(f.inflightBytes, nicBaseline)
 		bs, berr := blockstore.New(client, blockstore.Config{
 			Bucket: bucket, BlockSize: blockSize, MemCache: memCache,
 			DiskCache: diskCache, DiskPath: cacheDir, MaxRange: maxRange,

@@ -7,20 +7,23 @@ import "fmt"
 // defaultInflightFallback is used when the NIC bandwidth cannot be determined.
 const defaultInflightFallback = 512 << 20
 
-// computeInflightBytes resolves the bytes-in-flight budget. An explicit flag
-// wins; otherwise it is 2 × (NIC bandwidth × 100 ms), or a 512 MiB fallback
-// when the NIC speed is unknown. Returns the budget and a human description.
-func computeInflightBytes(flag string) (int64, string) {
+// computeInflightBytes resolves the bytes-in-flight budget. An explicit
+// --inflight-bytes flag wins; otherwise it is 2 × (baselineGbps × 100 ms) — the
+// bandwidth-delay product sized from the sustained **baseline** so a long read
+// does not over-commit once burst credits deplete (#79) — or a 512 MiB fallback
+// when the NIC speed is unknown (baselineGbps <= 0). Returns the budget and a
+// human description.
+func computeInflightBytes(flag string, baselineGbps float64) (int64, string) {
 	if flag != "" {
 		n, err := parseSize(flag)
 		if err == nil && n > 0 {
 			return n, fmt.Sprintf("%d bytes (from --inflight-bytes)", n)
 		}
 	}
-	if gbps := nicGbps(); gbps > 0 {
-		// 2 × bandwidth-delay product at 100 ms.
-		n := int64(2 * gbps * 1e9 / 8 * 0.1)
-		return n, fmt.Sprintf("%d bytes (2 × %.0f Gbps × 100 ms)", n, gbps)
+	if baselineGbps > 0 {
+		// 2 × bandwidth-delay product at 100 ms, from the baseline.
+		n := int64(2 * baselineGbps * 1e9 / 8 * 0.1)
+		return n, fmt.Sprintf("%d bytes (2 × %.1f Gbps baseline × 100 ms)", n, baselineGbps)
 	}
 	return defaultInflightFallback, fmt.Sprintf("%d bytes (fallback; NIC speed unknown)", int64(defaultInflightFallback))
 }
