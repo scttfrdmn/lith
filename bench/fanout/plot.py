@@ -23,6 +23,7 @@ def load():
         data[row["path"]][int(row["n"])] = {
             "cost": float(row["cost_usd"]),
             "wall": float(row["wall_s"]),
+            "complete": row.get("complete", "1") == "1",
         }
     return data
 
@@ -37,10 +38,15 @@ def main():
     for path in ("lith", "copy"):
         if not d[path]:
             continue
-        ns, cost = series(d[path], "cost")
-        ax1.plot(ns, cost, "o-", color=C[path], label=path, linewidth=2, markersize=6)
-        ns, wall = series(d[path], "wall")
-        ax2.plot(ns, [w / 60 for w in wall], "o-", color=C[path], label=path, linewidth=2, markersize=6)
+        comp = sorted(n for n in d[path] if d[path][n]["complete"])
+        inc = sorted(n for n in d[path] if not d[path][n]["complete"])
+        ax1.plot(comp, [d[path][n]["cost"] for n in comp], "o-", color=C[path], label=path, linewidth=2, markersize=6)
+        ax2.plot(comp, [d[path][n]["wall"]/60 for n in comp], "o-", color=C[path], label=path, linewidth=2, markersize=6)
+        for n in inc:
+            ax1.plot([n], [d[path][n]["cost"]], "x", color=C[path], markersize=9, markeredgewidth=2)
+            ax2.plot([n], [d[path][n]["wall"]/60], "x", color=C[path], markersize=9, markeredgewidth=2)
+            ax2.annotate("N=1 did not\nfinish (>2.5 h)", (n, d[path][n]["wall"]/60), textcoords="offset points",
+                         xytext=(12, -6), fontsize=8, color=C[path])
     for ax in (ax1, ax2):
         ax.set_xscale("log", base=2)
         ax.set_xlabel("nodes (N)")
