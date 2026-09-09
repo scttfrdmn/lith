@@ -19,6 +19,7 @@ import (
 	fusefs "github.com/scttfrdmn/lith/internal/fuse"
 	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/metrics"
+	"github.com/scttfrdmn/lith/internal/prefetch"
 	"github.com/scttfrdmn/lith/internal/s3client"
 	"github.com/spf13/cobra"
 )
@@ -195,6 +196,26 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	defer bs.Close()
 	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 
+	// The single prefetch policy object (#64): per-handle readahead, sibling
+	// readahead (#63), and small-file parts (#69) all draw on the one budget and
+	// query the Index for neighborhoods through it.
+	limits := prefetch.NewPolicy(
+		bs.PrefetchBudgetBytes(),
+		prefetch.DeviceLimits{
+			NICBDPBytes:   inflight,
+			MemCacheBytes: memCache,
+			DiskWriteBPS:  0, // populated once the disk tier reports a sustained rate
+		},
+		func(key string, n int) []prefetch.Sibling {
+			sibs := ix.Neighborhood(key, n)
+			out := make([]prefetch.Sibling, len(sibs))
+			for i, s := range sibs {
+				out[i] = prefetch.Sibling{Key: s.Key, Size: s.Size, ETagHash: s.ETagHash}
+			}
+			return out
+		},
+	)
+
 	fcfg := fusefs.Config{
 		Index:        ix,
 		Store:        bs,
@@ -203,6 +224,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		GID:          uint32(f.gid),
 		SmallFile:    smallFile,
 		MaxReadahead: f.maxReadahead,
+		Limits:       limits,
 	}
 
 	srv, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{

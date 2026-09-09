@@ -16,6 +16,7 @@ import (
 	"github.com/scttfrdmn/lith/internal/blockstore"
 	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/metrics"
+	"github.com/scttfrdmn/lith/internal/prefetch"
 )
 
 // oneYear is used for attribute and entry cache timeouts: the index is
@@ -31,6 +32,12 @@ type Config struct {
 	GID          uint32
 	SmallFile    int64 // whole-file prefetch threshold in bytes
 	MaxReadahead int64 // max sequential readahead window in blocks
+	// Limits is the single prefetch policy object (#64): the per-handle
+	// readahead window, sibling readahead (#63), and small-file parts (#69) all
+	// query it for budget and neighborhood. When nil, the FUSE layer falls back
+	// to the store's budget directly (behavior-preserving for callers that do
+	// not build a policy, e.g. older tests).
+	Limits prefetch.Limits
 	// PrefetchStats, when non-nil, collects per-handle prefetcher diagnostics
 	// at Release (the #49 investigation). nil in production.
 	PrefetchStats *PrefetchStats
@@ -458,7 +465,7 @@ func (f *rawFS) maxReadahead() int64 {
 // readahead within the memory tier (#55).
 func (f *rawFS) perHandleWindow() int64 {
 	maxW := f.maxReadahead()
-	budgetBlocks := f.store.PrefetchBudgetBlocks()
+	budgetBlocks := f.budgetBlocks()
 	if budgetBlocks <= 0 {
 		return maxW
 	}
@@ -476,4 +483,23 @@ func (f *rawFS) perHandleWindow() int64 {
 		share = maxW
 	}
 	return share
+}
+
+// budgetBlocks is the mount-wide prefetch budget expressed in readahead blocks.
+// The value comes from the Limits policy (#64) when one is configured — the
+// single source for "how much un-demanded prefetch may be outstanding" — and
+// falls back to the store's budget otherwise. Both yield the same number; the
+// policy is the seam through which sibling readahead and parts share the budget.
+func (f *rawFS) budgetBlocks() int64 {
+	if f.cfg.Limits != nil {
+		total, _ := f.cfg.Limits.Budget()
+		if bs := f.store.BlockSize(); bs > 0 && total > 0 {
+			if n := total / bs; n >= 1 {
+				return n
+			}
+			return 1
+		}
+		return 0
+	}
+	return f.store.PrefetchBudgetBlocks()
 }

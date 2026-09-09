@@ -316,6 +316,60 @@ func (ix *Index) Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, e
 	return out, uint64(i + 1), nil
 }
 
+// Sibling is one neighbor returned by Neighborhood: the Index-relative key, its
+// size, and its recorded ETag hash — enough to fetch it without a second lookup.
+type Sibling struct {
+	Key      string
+	Size     int64
+	ETagHash uint64
+}
+
+// Neighborhood returns up to n stored keys that follow path in Index order
+// under the same directory (direct file children only — keys within a
+// subdirectory are skipped), each with its size and ETag hash. path is
+// slash-rooted relative to the mount (e.g. "/d/chunk.0"); the returned keys are
+// Index-relative (the mount prefix stripped), matching what Prefix() prepends
+// to form the object key. It is O(log N + n) against the sorted arena and
+// feeds sibling readahead (#63): a directory walked in key order reads ahead
+// across its siblings.
+func (ix *Index) Neighborhood(path string, n int) []Sibling {
+	if n <= 0 {
+		return nil
+	}
+	rel := toRel(path)
+	// Directory prefix: everything up to and including the last '/'.
+	dir := ""
+	if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+		dir = rel[:slash+1]
+	}
+	i := ix.lowerBound(rel)
+	// Skip the key itself if it is present, so we return only what follows it.
+	if i < ix.Len() && ix.key(i) == rel {
+		i++
+	}
+	out := make([]Sibling, 0, n)
+	for i < ix.Len() && len(out) < n {
+		k := ix.key(i)
+		if !strings.HasPrefix(k, dir) {
+			break // left the directory's key range
+		}
+		rem := k[len(dir):]
+		if rem == "" {
+			i++ // the directory's own folder-marker key
+			continue
+		}
+		if slash := strings.IndexByte(rem, '/'); slash >= 0 {
+			// A key inside a subdirectory: siblings are direct children only, so
+			// jump past the whole subdirectory rather than descend into it.
+			i = ix.skipDir(dir, rem[:slash])
+			continue
+		}
+		out = append(out, Sibling{Key: k, Size: int64(ix.sizes[i]), ETagHash: ix.etags[i]})
+		i++
+	}
+	return out
+}
+
 // toRel converts a slash-rooted mount path to a relative key: it trims a
 // single leading slash. "" and "/" both map to "" (the root).
 func toRel(path string) string {

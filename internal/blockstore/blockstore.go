@@ -635,6 +635,11 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
 }
 
+// PrefetchBudgetBytes is the mount-wide byte budget for prefetch not yet
+// demanded. It is the total the prefetch Limits policy is built with (#64); the
+// per-handle window and the sibling/parts reservations all draw on it.
+func (bs *BlockStore) PrefetchBudgetBytes() int64 { return bs.pfBudgetBytes }
+
 // PrefetchBudgetBlocks is the number of readahead blocks the prefetch budget
 // allows to be outstanding across all handles; the FUSE layer divides it by the
 // live handle count to size each handle's window (#55).
