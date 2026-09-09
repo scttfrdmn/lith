@@ -9,6 +9,7 @@ package fuse
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ type Config struct {
 	UID          uint32
 	GID          uint32
 	SmallFile    int64 // whole-file prefetch threshold in bytes
+	PartsMax     int64 // largest file fetched whole as parallel parts on first read (#69); 0 falls back to SmallFile
 	MaxReadahead int64 // max sequential readahead window in blocks
 	// Limits is the single prefetch policy object (#64): the per-handle
 	// readahead window, sibling readahead (#63), and small-file parts (#69) all
@@ -84,6 +86,11 @@ type fileHandle struct {
 	pf        *pfWrapper
 	smallDone bool
 	smallMu   sync.Mutex
+	// partsDispatched is set once a whole-file parts fetch (#69) has been
+	// dispatched for this handle. While set, Read skips its per-handle readahead:
+	// the parts fetch already covers every block, so readahead would only
+	// contend with it for the same chunks (see Open).
+	partsDispatched atomic.Bool
 }
 
 type rawFS struct {
@@ -233,9 +240,21 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	f.handles[fh] = h
 	f.mu.Unlock()
 
-	// Dispatch the initial readahead window at open (before the first read)
-	// for files worth prefetching, so the frontier leads from the start (#38).
-	if fi.Size > f.cfg.SmallFile {
+	// Dispatch the initial readahead window at open so the frontier leads from
+	// the start (#38) — but only for files larger than the parts threshold. A
+	// file at or below it is fetched whole as parallel parts on first read (#69),
+	// which already covers every block, so per-handle readahead is both redundant
+	// and a source of contention: the window and the parts fetch would each issue
+	// a Prefetch for the same low blocks. That contention is *correct* — the chunk
+	// singleflight (session 3) makes concurrent claims for one chunk join a single
+	// fetch and never double-read it — but an unlucky interleave can split a
+	// would-be single coalesced range GET into two (one goroutine ends up owning
+	// the head chunks, the other the tail), costing an extra GET, not wrong data.
+	// Skipping the window here, and the read-driven readahead in Read for the same
+	// handle (via partsDispatched), removes the contention for parts-covered files
+	// outright; a budget-exhausted parts fetch leaves partsDispatched false, so
+	// readahead still serves those files.
+	if fi.Size > f.partsThreshold() {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -258,7 +277,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fu
 		return nil, fuse.EBADF
 	}
 
-	f.maybeWholeFile(h)
+	f.maybePartsFetch(h)
 
 	off := int64(input.Offset)
 	length := int64(len(buf))
@@ -292,29 +311,86 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fu
 		res = fuse.ReadResultData(data)
 	}
 
-	// Drive the prefetcher off the block this read falls in.
-	blk := off / f.blockSize
-	for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
-		pb := pb
-		go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+	// Drive the prefetcher off the block this read falls in — unless a whole-file
+	// parts fetch is in flight for this handle, which already covers every block
+	// (see Open: readahead would only contend with the parts fetch).
+	if !h.partsDispatched.Load() {
+		blk := off / f.blockSize
+		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
+			pb := pb
+			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+		}
 	}
 	return res, fuse.OK
 }
 
-// maybeWholeFile fetches an entire small file on first read.
-func (f *rawFS) maybeWholeFile(h *fileHandle) {
-	if f.cfg.SmallFile <= 0 || h.size > f.cfg.SmallFile {
+// maybePartsFetch, on the first read of a file small enough to fetch whole
+// (<= the parts threshold), fetches every block concurrently as parallel range
+// parts through the normal fill path rather than letting the app pull the file
+// one chunk at a time. This is the #69 fix: a mid-size object (the 31 MB HDF5
+// granule) that a copy tool parallelizes into range parts and reads faster than
+// lith's serial per-chunk demand fetches; a file spanning N blocks becomes N
+// concurrent block-sized (part-sized) range GETs, a single GET when it fits in
+// one part. The eager fetch is budget-bounded via Limits (#64): many handles
+// opening mid-size files at once cannot exceed the mount-wide prefetch budget,
+// and when it is full the eager fetch is skipped so per-read readahead still
+// serves the file.
+func (f *rawFS) maybePartsFetch(h *fileHandle) {
+	threshold := f.partsThreshold()
+	if threshold <= 0 || h.size > threshold {
 		return
 	}
 	h.smallMu.Lock()
-	defer h.smallMu.Unlock()
 	if h.smallDone {
+		h.smallMu.Unlock()
 		return
 	}
 	h.smallDone = true
+	h.smallMu.Unlock()
+
+	// Reserve the whole object against the prefetch budget; if it does not fit,
+	// skip the eager fetch and let per-read readahead serve the file.
+	if !f.reserve(h.size) {
+		return
+	}
+	h.partsDispatched.Store(true)
 	nb := (h.size + f.blockSize - 1) / f.blockSize
-	for b := int64(0); b < nb; b++ {
-		go f.store.Prefetch(f.ctx, h.key, b, h.size)
+	go func() {
+		defer f.release(h.size)
+		var wg sync.WaitGroup
+		for b := int64(0); b < nb; b++ {
+			wg.Add(1)
+			go func(b int64) {
+				defer wg.Done()
+				f.store.Prefetch(f.ctx, h.key, b, h.size)
+			}(b)
+		}
+		wg.Wait()
+	}()
+}
+
+// partsThreshold is the largest file eagerly fetched whole on first read: the
+// #69 parts threshold when set, else the legacy small-file threshold.
+func (f *rawFS) partsThreshold() int64 {
+	if f.cfg.PartsMax > 0 {
+		return f.cfg.PartsMax
+	}
+	return f.cfg.SmallFile
+}
+
+// reserve reserves n bytes of prefetch budget through the Limits policy (#64);
+// with no policy configured it always succeeds and reserves nothing.
+func (f *rawFS) reserve(n int64) bool {
+	if f.cfg.Limits == nil {
+		return true
+	}
+	return f.cfg.Limits.Reserve(n)
+}
+
+// release returns n bytes of prefetch budget (no-op with no policy).
+func (f *rawFS) release(n int64) {
+	if f.cfg.Limits != nil {
+		f.cfg.Limits.Release(n)
 	}
 }
 
