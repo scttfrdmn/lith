@@ -37,6 +37,8 @@ type mountFlags struct {
 	prefetchConc   int
 	prefetchBudget string
 	maxReadahead   int64
+	siblingWindow  int
+	siblingRead    int
 	diskWriters    int
 	inflightBytes  string
 	metrics        string
@@ -82,6 +84,8 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
+	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
+	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
@@ -223,15 +227,17 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	)
 
 	fcfg := fusefs.Config{
-		Index:        ix,
-		Store:        bs,
-		Metrics:      met,
-		UID:          uint32(f.uid),
-		GID:          uint32(f.gid),
-		SmallFile:    smallFile,
-		PartsMax:     partsMax,
-		MaxReadahead: f.maxReadahead,
-		Limits:       limits,
+		Index:            ix,
+		Store:            bs,
+		Metrics:          met,
+		UID:              uint32(f.uid),
+		GID:              uint32(f.gid),
+		SmallFile:        smallFile,
+		PartsMax:         partsMax,
+		MaxReadahead:     f.maxReadahead,
+		SiblingWindow:    f.siblingWindow,
+		SiblingReadahead: f.siblingRead,
+		Limits:           limits,
 	}
 
 	srv, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{
