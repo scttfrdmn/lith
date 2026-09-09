@@ -25,4 +25,4 @@ default EBI ref registry via `REF_CACHE`/`REF_PATH`.
 
 Path pattern: `phase3/data/<sample>/alignment/<sample>.mapped.ILLUMINA.bwa.GBR.low_coverage.<date>.bam.cram`.
 
-Region files (deterministic, seed 13): `r1-regions-chr20-10kb.txt`, `r2-regions-1Mb.txt`.
+Region files (deterministic, seed 13): `r1-regions-chr20-10kb.txt` (1000×10kb on chr20), `r2-regions-1Mb.txt` (1000×1Mb concentrated on chr20 — heavy overlap so lith's chunk cache dedups re-fetches to a ~0.8 GB working set, matching session-13's selective R2; scattered genome-wide 1Mb windows would defeat the cache and read >2× the file).
