@@ -20,6 +20,14 @@ file count matches the cores, so every vCPU is busy — lith is **2.9× faster a
 lith never does — serial in front of compute, then read back from a 125 MB/s
 volume — so it loses on both axes, everywhere.
 
+Given the copy path its **best** tool and tier — `s5cmd` staging to a 1000 MB/s
+gp3 (the `copy-best` line) — the N=8 gap narrows a lot: ~8.3 min / ~$0.26,
+roughly 2.6× faster and 3× cheaper than the naive copy. lith still edges it
+(7.4 min / $0.23), because even at ~1 GB/s a node must finish staging its shard
+before it computes, while the mount overlaps the two. The fast-copier result is
+the honest one to plan against: the mount's fan-out advantage is real but
+modest once the copier is well-chosen.
+
 Two honest caveats the chart shows. **Cost is not flat across width:** it rises
 with N for *both* paths, because a fixed per-node boot-and-setup cost is paid N
 times and, past the sweet spot, each node underuses its cores (at N=64 each node

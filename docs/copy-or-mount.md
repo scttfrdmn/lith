@@ -54,27 +54,42 @@ cold, an async in-place reader is currently faster. <!-- number: session 17 -->
 
 ## The crossover, measured
 
-Cost to result, **copy → gp3 EBS then compute** vs **mount with lith**, across
-the EBS-only Graviton4 ladder (no local NVMe — the case that most favors
-copying). Each cell is **copy $ / lith $** (wall copy / wall lith); lower is
-better. Full data: [`bench/results/crossover-v0.2.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/crossover-v0.2.csv),
+Cost to result, **copy → compute** vs **mount with lith**, across the EBS-only
+Graviton4 ladder (no local NVMe — the case that most favors copying). The copy
+path is given its **best tool and tier**: **`s5cmd` tuned** (~1 GB/s, 3× faster
+than `aws s3 cp`) staging to a **gp3 volume provisioned to 1000 MB/s**, which
+un-caps both staging and the read-back the compute does ([#84](https://github.com/scttfrdmn/lith/issues/84)).
+Each cell is **copy $ / lith $** (wall copy / wall lith); lower is better. Full
+data: [`bench/results/crossover-v0.2.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/crossover-v0.2.csv),
 method in [#77](https://github.com/scttfrdmn/lith/issues/77).
 
 | access shape | c8g.large (2 vCPU) | c8g.xlarge (4) | c8g.2xlarge (8) | c8gd.4xlarge (16) | lith margin |
 |---|---|---|---|---|---|
-| **selective** (14 GB CRAM, region set, ~0.8 GB touched) | $0.0035 / **$0.0013** | $0.0066 / **$0.0022** | $0.0123 / **$0.0043** | $0.033 / **$0.011** | 2.7–3.1× cheaper |
-| **stream** (3.8 GB CRAM, `flagstat`) | $0.0020 / **$0.0015** | $0.0032 / **$0.0022** | $0.0054 / **$0.0042** | $0.0165 / **$0.0105** | 1.3–1.4× cheaper |
-| **batch** (8 CRAMs, 60 GB, parallel = vCPU) | —¹ | $0.046 / **$0.011** | $0.080 / **$0.013** | $0.21 / **$0.046** | 3.9–5.6× cheaper |
+| **selective** (14 GB CRAM, region set, ~0.8 GB touched) | $0.0064 / **$0.0012** | $0.0054 / **$0.0021** | $0.0065 / **$0.0042** | $0.0146 / **$0.0109** | 1.3–5× cheaper |
+| **stream** (3.8 GB CRAM, `flagstat`) | $0.0036 / **$0.0014** | $0.0042 / **$0.0022** | $0.0069 / **$0.0043** | $0.0155 / **$0.0103** | 1.4–2.6× cheaper |
+| **batch** (8 CRAMs, 60 GB, parallel = vCPU) | $0.044 / —² | $0.023 / **$0.0105** | $0.023 / **$0.0134** | $0.052 / **$0.040** | 1.2–2.2× cheaper |
 
-**lith is cheaper on every box measured. The crossover is at or below the
-smallest box (`c8g.large`) for all three shapes** — there is no instance in the
-ladder where copying wins, because the copy path pays full-object staging that
-lith never does.
+**lith is still cheaper on every box — the crossover is at or below `c8g.large`
+for all three shapes; nothing flips.** But given its best tool and tier the copy
+path is far more competitive than the naive `aws s3 cp` → baseline-gp3 it
+replaces: on the high-NIC boxes (2xlarge, 4xl) the margin **collapses to
+~1.2–1.5×** (it was up to 5.6×). What remains of lith's edge is the staging it
+never does — now only 5–60 s on a fast box — plus selectivity (a region query
+still moves 0.8 GB, not 14). On the **smaller** boxes staging is NIC-bound, so
+the best copier is no faster there and lith wins by more (2xlarge/4xl measured;
+large/xlarge estimated).
 
-¹ Batch was measured from `c8g.xlarge` up: 60 GB across two paths overran the
-2-vCPU box's one-hour test budget. The crossover is ≤ large by extrapolation —
-the copy path's cost is dominated by reading the staged files back from a
-125 MB/s gp3 volume, which only worsens on a smaller box.
+Against **mountpoint-s3** (the other in-place reader), lith wins the selective
+and small-object shapes and ties the CPU-bound stream, but **trails on
+large-file batch** (W3: 143 s vs lith's 184 s on a 4xl) — mountpoint's CRT
+client fans more concurrent range GETs per object, tracked in
+[#85](https://github.com/scttfrdmn/lith/issues/85).
+
+² lith's batch cell on the 2-vCPU `c8g.large` wasn't run (60 GB × 8-way on 2
+cores overran the test budget); the copy-best cost there (~$0.044) is shown for
+scale. The crossover stays ≤ large — copy-best on a 2-vCPU box is dominated by
+staging 60 GB over its small NIC and then `flagstat`-ing on 2 cores, both of
+which favor the mount.
 
 !!! note "Why warm reuse doesn't change this for CPU-bound jobs"
     On the 8-vCPU box, re-running the selective and stream jobs against a warm
