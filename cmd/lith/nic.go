@@ -87,7 +87,9 @@ func selectBandwidth(ni *ec2types.NetworkInfo) (baseline, peak float64) {
 func describeInstanceBandwidth(ctx context.Context, itype string) (baseline, peak float64, ok bool) {
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(cctx)
+	// Resolve the region from IMDS: on a bare EC2 box there is no AWS_REGION env
+	// or config file, and without it the EC2 endpoint can't be built.
+	cfg, err := config.LoadDefaultConfig(cctx, config.WithEC2IMDSRegion())
 	if err != nil {
 		return 0, 0, false
 	}
