@@ -9,6 +9,7 @@ package fuse
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -85,6 +86,11 @@ type fileHandle struct {
 	pf        *pfWrapper
 	smallDone bool
 	smallMu   sync.Mutex
+	// partsDispatched is set once a whole-file parts fetch (#69) has been
+	// dispatched for this handle. While set, Read skips its per-handle readahead:
+	// the parts fetch already covers every block, so readahead would only
+	// contend with it for the same chunks (see Open).
+	partsDispatched atomic.Bool
 }
 
 type rawFS struct {
@@ -234,12 +240,20 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	f.handles[fh] = h
 	f.mu.Unlock()
 
-	// Dispatch the initial readahead window at open (before the first read) so
-	// the frontier leads from the start (#38) — but only for files larger than
-	// the parts threshold. A file at or below it is fetched whole as parallel
-	// parts on first read (#69); dispatching a readahead window too would race
-	// the parts fetch for the same low blocks and split a block-sized GET at
-	// chunk granularity.
+	// Dispatch the initial readahead window at open so the frontier leads from
+	// the start (#38) — but only for files larger than the parts threshold. A
+	// file at or below it is fetched whole as parallel parts on first read (#69),
+	// which already covers every block, so per-handle readahead is both redundant
+	// and a source of contention: the window and the parts fetch would each issue
+	// a Prefetch for the same low blocks. That contention is *correct* — the chunk
+	// singleflight (session 3) makes concurrent claims for one chunk join a single
+	// fetch and never double-read it — but an unlucky interleave can split a
+	// would-be single coalesced range GET into two (one goroutine ends up owning
+	// the head chunks, the other the tail), costing an extra GET, not wrong data.
+	// Skipping the window here, and the read-driven readahead in Read for the same
+	// handle (via partsDispatched), removes the contention for parts-covered files
+	// outright; a budget-exhausted parts fetch leaves partsDispatched false, so
+	// readahead still serves those files.
 	if fi.Size > f.partsThreshold() {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
@@ -297,11 +311,15 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fu
 		res = fuse.ReadResultData(data)
 	}
 
-	// Drive the prefetcher off the block this read falls in.
-	blk := off / f.blockSize
-	for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
-		pb := pb
-		go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+	// Drive the prefetcher off the block this read falls in — unless a whole-file
+	// parts fetch is in flight for this handle, which already covers every block
+	// (see Open: readahead would only contend with the parts fetch).
+	if !h.partsDispatched.Load() {
+		blk := off / f.blockSize
+		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
+			pb := pb
+			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+		}
 	}
 	return res, fuse.OK
 }
@@ -335,6 +353,7 @@ func (f *rawFS) maybePartsFetch(h *fileHandle) {
 	if !f.reserve(h.size) {
 		return
 	}
+	h.partsDispatched.Store(true)
 	nb := (h.size + f.blockSize - 1) / f.blockSize
 	go func() {
 		defer f.release(h.size)
