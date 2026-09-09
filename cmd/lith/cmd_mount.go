@@ -32,6 +32,7 @@ type mountFlags struct {
 	blockSize      string
 	maxRange       string
 	smallFile      string
+	partsMax       string
 	s3Concurrency  int
 	prefetchConc   int
 	prefetchBudget string
@@ -76,6 +77,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size (1MiB-64MiB)")
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
+	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
@@ -132,6 +134,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		}
 	}
 	smallFile, err := parseSize(f.smallFile)
+	if err != nil {
+		return err
+	}
+	partsMax, err := parseSize(f.partsMax)
 	if err != nil {
 		return err
 	}
@@ -223,6 +229,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		UID:          uint32(f.uid),
 		GID:          uint32(f.gid),
 		SmallFile:    smallFile,
+		PartsMax:     partsMax,
 		MaxReadahead: f.maxReadahead,
 		Limits:       limits,
 	}
