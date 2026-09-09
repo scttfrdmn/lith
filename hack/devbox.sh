@@ -88,8 +88,22 @@ mount_nvme
 # the base dev box stays lean. Pinned versions; arm64 wheels/apt.
 if [ "${LITH_BENCH_APPS:-0}" = "1" ]; then
 	log "app-bench tools: apt (samtools, tabix, fastp)"
-	sudo apt-get install -y -qq tabix fastp python3-venv python3-pip >/dev/null 2>&1 || true
+	sudo apt-get install -y -qq tabix fastp python3-venv python3-pip unzip >/dev/null 2>&1 || true
 	samtools --version | head -1; tabix --version 2>&1 | head -1; fastp --version 2>&1 | head -1
+
+	# Copier tools for the best-competitor stage-rate matrix (session 18). arm64,
+	# pinned. s5cmd and rclone are the fast S3 copiers compared against `aws s3 cp`.
+	S5CMD_VER="${S5CMD_VER:-2.2.2}"
+	RCLONE_VER="${RCLONE_VER:-1.68.2}"
+	if ! command -v s5cmd >/dev/null 2>&1; then
+		curl -fsSL -o /tmp/s5cmd.tgz "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VER}/s5cmd_${S5CMD_VER}_Linux-arm64.tar.gz" &&
+			sudo tar -C /usr/local/bin -xzf /tmp/s5cmd.tgz s5cmd || echo "WARN: s5cmd install failed"
+	fi
+	if ! command -v rclone >/dev/null 2>&1; then
+		curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/v${RCLONE_VER}/rclone-v${RCLONE_VER}-linux-arm64.zip" &&
+			(cd /tmp && unzip -q -o rclone.zip && sudo cp "rclone-v${RCLONE_VER}-linux-arm64/rclone" /usr/local/bin/) || echo "WARN: rclone install failed"
+	fi
+	s5cmd version 2>&1 | head -1; rclone version 2>&1 | head -1
 	# venv under $HOME (devbox runs as the login user; /opt is root-owned, which
 	# silently aborted the block in session 13). Wheels-only (--only-binary): the
 	# strict pins had no arm64/py3.12 wheels and fell back to failing source
