@@ -18,7 +18,7 @@ def load():
                 continue
             rows.append(line)
     r = csv.DictReader(rows)
-    data = {"lith": {}, "copy": {}}
+    data = {"lith": {}, "copy": {}, "copy-best": {}}
     for row in r:
         data[row["path"]][int(row["n"])] = {
             "cost": float(row["cost_usd"]),
@@ -34,8 +34,8 @@ def series(d, key):
 def main():
     d = load()
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.2))
-    C = {"lith": "#2a7ae2", "copy": "#d1495b"}
-    for path in ("lith", "copy"):
+    C = {"lith": "#2a7ae2", "copy": "#d1495b", "copy-best": "#e08e0b"}
+    for path in ("lith", "copy", "copy-best"):
         if not d[path]:
             continue
         comp = sorted(n for n in d[path] if d[path][n]["complete"])
