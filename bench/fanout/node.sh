@@ -40,7 +40,7 @@ def imds(p):
 N=int(sys.argv[1]); iid=imds("instance-id")
 ec2=boto3.client("ec2",region_name=imds("placement/region"))
 tags={t["Key"]:t["Value"] for t in ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0].get("Tags",[])}
-tok=tags.get("Name","").rsplit("-",1)[-1]; idx=int(tok) if tok.isdigit() else 0
+tok=tags.get("Name","").rsplit("-",1)[-1]; idx=0 if N==1 else (int(tok) if tok.isdigit() else 0)
 keys=[l.split("\t")[0] for l in open("/tmp/fanout-64.txt") if l.strip() and not l.startswith("#")]
 per=math.ceil(len(keys)/N)
 print(idx, ",".join(keys[idx*per:(idx+1)*per]))
