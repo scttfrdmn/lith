@@ -1,0 +1,13 @@
+# lith v0.2 prefetch benchmarks (session 15) — sibling readahead (#63), small-file parts (#69), limits interface (#64)
+# c8gd.4xlarge, us-east-1, --disk-cache 0. before = main; after = all three PRs stacked (feat/sibling-readahead).
+# Rate: c8gd.4xlarge = $0.78384/hr (AWS Price List API).
+metric,before_main,after,commit_after,note
+zarr_cold_s,38.7,23.8,63ffdff,"S3 NWM chrtout.zarr yearly-mean; sibling readahead cut cold 39%. Target (xarray+s3fs 9.9s) not met: 114 uncovered misses remain at 2D chunk-grid boundaries -> #70 chunk-grid-aware plan"
+zarr_warm_s,5.5,5.5,63ffdff,"unchanged (cache-served)"
+zarr_uncovered_misses,551,114,63ffdff,"sibling prefetch covered 437 of the former misses"
+zarr_sibling_prefetch,0,560,63ffdff,"91% used (48 unread)"
+zarr_cold_s_deep,38.7,21.7,63ffdff,"--sibling-window 16 --sibling-readahead 64: marginal further gain over defaults (16)"
+r3_cold_s,1.20,0.54,63ffdff,"goes16 57MB C01 .nc, h5py 500 hyperslabs; parts path. aws s3 cp+read baseline=0.97s -> after BEATS it (#69 target met)"
+r3_warm_s,0.27,0.27,63ffdff,"unchanged"
+seq_cold_mbps,1312,1303,e777c5b,"NA12878 15.8GB CRAM, lith bench seq --runs 3 median; #64 behavior-preservation gate: 0.7% = within run-to-run noise"
+seq_warm_mbps,19086,19525,e777c5b,"cache-served; both ~19GB/s"
