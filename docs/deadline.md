@@ -2,25 +2,34 @@
 
 You have more work than one node can finish in time. Go wider.
 
-## Why wider is also cheaper with a mount
+## Mount beats copy at every width
 
-With a **copy-based** data plane, going wider costs more: each of your N nodes
-either stages its own copy (N × the staging bill and wall-clock) or you stand up
-a shared filesystem sized and paid for per job. Width multiplies the data-plane
-cost.
+The claim to test: mounting lets you go wider without the data-plane cost that
+copying pays per node. Measured — `flagstat` over 64 CRAMs (535 GB) across 1, 8,
+and 64 `c8g.2xlarge` spot nodes, lith-mount vs stage-to-gp3
+([#83](https://github.com/scttfrdmn/lith/issues/83)):
 
-With a **mount**, the arithmetic changes. The compute is the same total
-node-hours at any width — ten nodes for one hour is the same as one node for ten
-hours — and the data cost is **bytes touched**, which is fixed by the work, not
-by how many nodes touch them. So there is no width penalty on data, and
-finishing **sooner** and finishing **cheaper** stop being a trade-off: they are
-the same choice.
+![Fan-out: cost and wall-clock vs node count, lith vs copy](assets/fanout.svg)
 
-<!-- number: session 17 — fan-out chart: total $ flat across N (mount) vs rising (copy); wall-clock falling as 1/N -->
+**lith is both cheaper and faster than copying at every width.** At **N=1**, one
+node finishes the whole job through lith in **22 min for $0.12**, while the copy
+path **can't even finish staging** the 535 GB in the 2.5-hour budget (its stage
+alone, ~72 min, exceeds lith's entire run). At the **sweet spot N=8** — where the
+file count matches the cores, so every vCPU is busy — lith is **2.9× faster and
+3.6× cheaper** (7.4 min / $0.23 vs 21.8 min / $0.81). Copying pays for staging
+lith never does — serial in front of compute, then read back from a 125 MB/s
+volume — so it loses on both axes, everywhere.
 
-*(A measured fan-out chart — cost flat across node count for the mount, cost
-rising for the copy path, wall-clock falling as 1/N — lands here after the
-session-17 run.)*
+Two honest caveats the chart shows. **Cost is not flat across width:** it rises
+with N for *both* paths, because a fixed per-node boot-and-setup cost is paid N
+times and, past the sweet spot, each node underuses its cores (at N=64 each node
+runs one `flagstat` on 8 vCPUs). And **wall-clock floors** once you pass
+N ≈ files ÷ vCPUs: from 8 to 64 nodes the wall barely moved while cost grew ~5×.
+
+So the rule for going wide: **fan out to about `files ÷ vCPUs-per-node`, not
+further.** There you get full CPU utilization, the shortest wall-clock, cost near
+its floor — and lith's staging-free advantage over copying at its largest. Wider
+than that spends more for no speed-up; copying loses at any width.
 
 ## How to do it
 
