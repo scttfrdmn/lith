@@ -316,6 +316,17 @@ func (ix *Index) Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, e
 	return out, uint64(i + 1), nil
 }
 
+// Position returns the arena index of the exact stored key for path and whether
+// it exists. It lets the FUSE layer detect a directory being walked in key
+// order (successive opens whose positions advance by a small delta; #63).
+func (ix *Index) Position(path string) (int, bool) {
+	rel := toRel(path)
+	if rel == "" || strings.HasSuffix(rel, "/") {
+		return 0, false
+	}
+	return ix.findExact(rel)
+}
+
 // Sibling is one neighbor returned by Neighborhood: the Index-relative key, its
 // size, and its recorded ETag hash — enough to fetch it without a second lookup.
 type Sibling struct {

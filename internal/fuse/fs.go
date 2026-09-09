@@ -8,6 +8,7 @@ package fuse
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,9 +41,26 @@ type Config struct {
 	// to the store's budget directly (behavior-preserving for callers that do
 	// not build a policy, e.g. older tests).
 	Limits prefetch.Limits
+	// SiblingWindow is the maximum index-position gap between successive opens in
+	// one directory that still counts as walking it in key order (#63); <=0 uses
+	// the default of 4.
+	SiblingWindow int
+	// SiblingReadahead is how many following siblings a detected directory walk
+	// prefetches whole (#63); 0 disables sibling readahead.
+	SiblingReadahead int
 	// PrefetchStats, when non-nil, collects per-handle prefetcher diagnostics
 	// at Release (the #49 investigation). nil in production.
 	PrefetchStats *PrefetchStats
+	// SiblingStats, when non-nil, collects sibling-readahead accuracy counters
+	// (the #63 guardrail). nil is fine (metrics still record when configured).
+	SiblingStats *SiblingStats
+}
+
+// SiblingStats aggregates sibling-readahead accuracy across a run (#63).
+type SiblingStats struct {
+	Prefetched atomic.Int64 // sibling objects dispatched
+	Used       atomic.Int64 // sibling-prefetched objects later opened
+	Unread     atomic.Int64 // sibling-prefetched objects that fell out of the pending window unopened
 }
 
 // PrefetchStats aggregates per-handle prefetcher behaviour across a run.
@@ -62,6 +80,24 @@ func (p *PrefetchStats) record(halvings, resets, peak int64) {
 	p.Resets += resets
 	p.PeakWindows = append(p.PeakWindows, peak)
 	p.mu.Unlock()
+}
+
+func (s *SiblingStats) recordPrefetched() {
+	if s != nil {
+		s.Prefetched.Add(1)
+	}
+}
+
+func (s *SiblingStats) recordUsed() {
+	if s != nil {
+		s.Used.Add(1)
+	}
+}
+
+func (s *SiblingStats) recordUnread() {
+	if s != nil {
+		s.Unread.Add(1)
+	}
 }
 
 // Snapshot returns the total halving and reset counts and a copy of the
@@ -107,6 +143,13 @@ type rawFS struct {
 	nodes   map[uint64]*node
 	handles map[uint64]*fileHandle
 	nextFh  uint64
+
+	// Sibling-readahead state (#63), guarded by sibMu.
+	sibMu         sync.Mutex
+	sibLastPos    map[string]int      // directory -> index position of its last open
+	sibPendingSet map[string]struct{} // sibling-prefetched keys not yet opened
+	sibPendingQ   []string            // FIFO of the same keys, bounded by sibPendingCap
+	sibPendingCap int
 }
 
 // NewRawFileSystem builds the read-only RawFileSystem.
@@ -122,6 +165,14 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		nodes:         map[uint64]*node{fuse.FUSE_ROOT_ID: {path: "", parent: fuse.FUSE_ROOT_ID, isDir: true}},
 		handles:       map[uint64]*fileHandle{},
 		nextFh:        1,
+		sibLastPos:    map[string]int{},
+		sibPendingSet: map[string]struct{}{},
+	}
+	// Bound the pending-sibling tracker to a few readahead batches: a key that
+	// falls out of it without being opened is counted as an unread sibling.
+	f.sibPendingCap = cfg.SiblingReadahead * 4
+	if f.sibPendingCap < 64 {
+		f.sibPendingCap = 64
 	}
 	return f
 }
@@ -261,6 +312,10 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 		}
 	}
 
+	// If this directory is being walked in key order, read ahead across the
+	// following siblings (#63).
+	f.maybeSiblingReadahead(n.path)
+
 	out.Fh = fh
 	out.OpenFlags = fuse.FOPEN_KEEP_CACHE // content is immutable
 	return fuse.OK
@@ -348,25 +403,131 @@ func (f *rawFS) maybePartsFetch(h *fileHandle) {
 	h.smallDone = true
 	h.smallMu.Unlock()
 
-	// Reserve the whole object against the prefetch budget; if it does not fit,
-	// skip the eager fetch and let per-read readahead serve the file.
-	if !f.reserve(h.size) {
-		return
+	// Fetch the whole file as parallel parts, budget-permitting; on a full
+	// budget per-read readahead still serves the file. When it is dispatched,
+	// mark the handle so Read skips its redundant per-handle readahead (which
+	// would only contend with the parts fetch for the same chunks; see Open).
+	if f.prefetchWhole(h.key, h.size) {
+		h.partsDispatched.Store(true)
 	}
-	h.partsDispatched.Store(true)
-	nb := (h.size + f.blockSize - 1) / f.blockSize
+}
+
+// prefetchWhole reserves the object's size against the prefetch budget (#64)
+// and, if it fits, fetches every block concurrently as parallel range parts
+// (#69), releasing the reservation when they complete. It returns false when
+// the budget is full so a caller issuing several prefetches (sibling readahead)
+// stops before starving demand.
+func (f *rawFS) prefetchWhole(key blockstore.Key, size int64) bool {
+	if size <= 0 {
+		return true
+	}
+	if !f.reserve(size) {
+		return false
+	}
+	nb := (size + f.blockSize - 1) / f.blockSize
 	go func() {
-		defer f.release(h.size)
+		defer f.release(size)
 		var wg sync.WaitGroup
 		for b := int64(0); b < nb; b++ {
 			wg.Add(1)
 			go func(b int64) {
 				defer wg.Done()
-				f.store.Prefetch(f.ctx, h.key, b, h.size)
+				f.store.Prefetch(f.ctx, key, b, size)
 			}(b)
 		}
 		wg.Wait()
 	}()
+	return true
+}
+
+// maybeSiblingReadahead, on the open of a file whose index position is within
+// --sibling-window of the previous open in the same directory, treats the
+// directory as being walked in key order and prefetches the next
+// --sibling-readahead siblings whole (each if it is at or below --small-file),
+// via the parts path (#69), bounded by the prefetch budget (#64). Chunked
+// stores (Zarr, sharded datasets) are read as many small sibling objects in key
+// order, and the per-file prefetcher never sees the next object; this closes
+// that gap (#63). Budget exhaustion stops the loop so handle readahead is not
+// starved. A first open outside the window resets the walk.
+func (f *rawFS) maybeSiblingReadahead(relPath string) {
+	if f.cfg.SiblingReadahead <= 0 || f.cfg.Limits == nil {
+		return
+	}
+	pos, ok := f.ix.Position("/" + relPath)
+	if !ok {
+		return
+	}
+	dir := dirOf(relPath)
+
+	f.sibMu.Lock()
+	prev, seen := f.sibLastPos[dir]
+	f.sibLastPos[dir] = pos
+	f.markSiblingUsedLocked(relPath) // this file paid off an earlier sibling prefetch
+	f.sibMu.Unlock()
+
+	window := f.cfg.SiblingWindow
+	if window <= 0 {
+		window = 4
+	}
+	// A forward step within the window is a walk; anything else (a backward
+	// step, a jump beyond the window, or the first open) is not.
+	if !seen || pos <= prev || pos-prev > window {
+		return
+	}
+
+	sibs := f.cfg.Limits.Neighborhood("/"+relPath, f.cfg.SiblingReadahead)
+	for _, s := range sibs {
+		if s.Size <= 0 || s.Size > f.cfg.SmallFile {
+			continue // only whole-fetch genuinely small siblings
+		}
+		key := blockstore.Key{Key: f.ix.Prefix() + s.Key, ETagHash: s.ETagHash}
+		if !f.prefetchWhole(key, s.Size) {
+			break // budget exhausted: stop before starving handle readahead
+		}
+		f.noteSiblingIssued(s.Key)
+	}
+}
+
+// noteSiblingIssued records that key was sibling-prefetched, counting it, and
+// evicts the oldest pending sibling if the bounded tracker overflows — a key
+// that falls out without being opened is an unread sibling (the #63 guardrail).
+func (f *rawFS) noteSiblingIssued(key string) {
+	f.sibMu.Lock()
+	defer f.sibMu.Unlock()
+	if _, dup := f.sibPendingSet[key]; dup {
+		return
+	}
+	f.sibPendingSet[key] = struct{}{}
+	f.sibPendingQ = append(f.sibPendingQ, key)
+	f.cfg.SiblingStats.recordPrefetched()
+	f.met.SiblingPrefetch(1)
+	for len(f.sibPendingQ) > f.sibPendingCap {
+		old := f.sibPendingQ[0]
+		f.sibPendingQ = f.sibPendingQ[1:]
+		if _, still := f.sibPendingSet[old]; still {
+			delete(f.sibPendingSet, old)
+			f.cfg.SiblingStats.recordUnread()
+			f.met.SiblingPrefetchUnread(1)
+		}
+	}
+}
+
+// markSiblingUsedLocked clears key from the pending tracker (it was opened, so
+// the sibling prefetch paid off). Caller holds sibMu.
+func (f *rawFS) markSiblingUsedLocked(key string) {
+	if _, ok := f.sibPendingSet[key]; ok {
+		delete(f.sibPendingSet, key)
+		f.cfg.SiblingStats.recordUsed()
+	}
+}
+
+// dirOf returns the directory portion of a relative key ("" for a root-level
+// file).
+func dirOf(rel string) string {
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	return ""
 }
 
 // partsThreshold is the largest file eagerly fetched whole on first read: the
