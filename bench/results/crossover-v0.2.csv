@@ -1,0 +1,27 @@
+# lith v0.2 crossover ladder (session 16). c8g EBS-only classes, us-east-1, s3://1000genomes phase3 low_coverage CRAMs.
+# Rates $/hr (Price List API): c8g.large=0.07976 xlarge=0.15952 2xlarge=0.31904 c8gd.4xlarge=0.78384. gp3=$0.08/GiB-mo prorated by minutes alive; S3 GET=$0.0000004.
+# lith=defaults (mem tier only, --disk-cache 0); copy=aws s3 cp to root gp3 (125MB/s baseline) then compute, cp concurrency=4xvCPU. 4xl column from session 11/13 (same objects: HG00096/HG00100/8-set).
+# R2=samtools view -c 1000x1Mb chr20 (14GB CRAM, selective); S1=flagstat 3.8GB CRAM (stream); W3=flagstat 8 CRAMs 60GB (parallel=vCPU). All cold unless noted.
+workload,instance,path,wall_s,gb_pulled,lith_cpu_s,cpu_s_per_gb,usd_instance,usd_gp3,usd_get,usd_total
+R2,large,lith,54.7,0.86,1.3,1.51,0.00121,0.000000,0.000060,0.00127
+R2,large,copy,152.8,14.09,,,0.00339,0.000094,0.000032,0.00351
+R2,xlarge,lith,48.0,1.11,1.6,1.44,0.00213,0.000000,0.000036,0.00216
+R2,xlarge,copy,146.8,14.09,,,0.00650,0.000091,0.000032,0.00663
+R2,2xlarge,lith,47.8,1.11,1.8,1.62,0.00424,0.000000,0.000029,0.00427
+R2,2xlarge,copy,137.0,14.09,,,0.01214,0.000085,0.000032,0.01226
+R2,4xl,lith,50.0,0.81,0,,0.01089,0.000000,0.000068,0.01095
+R2,4xl,copy,152.0,14.09,,,0.03310,0.000094,0.000032,0.03322
+S1,large,lith,62.0,4.12,5.5,1.33,0.00137,0.000000,0.000120,0.00149
+S1,large,copy,86.8,3.82,,,0.00192,0.000054,0.000024,0.00200
+S1,xlarge,lith,48.8,3.82,5.7,1.49,0.00216,0.000000,0.000000,0.00216
+S1,xlarge,copy,69.7,3.82,,,0.00309,0.000043,0.000024,0.00316
+S1,2xlarge,lith,47.9,3.82,5.3,1.39,0.00425,0.000000,0.000000,0.00425
+S1,2xlarge,copy,60.3,3.82,,,0.00534,0.000037,0.000024,0.00541
+S1,4xl,lith,47.5,3.82,0,,0.01034,0.000000,0.000182,0.01052
+S1,4xl,copy,75.6,3.82,,,0.01646,0.000047,0.000024,0.01653
+W3,xlarge,lith,236.2,60.04,76.4,1.27,0.01047,0.000000,0.000000,0.01047
+W3,xlarge,copy,923.4,60.03,,,0.04092,0.002280,0.002863,0.04606
+W3,2xlarge,lith,151.1,60.03,72.3,1.20,0.01339,0.000000,0.000000,0.01339
+W3,2xlarge,copy,843.0,60.03,,,0.07471,0.002081,0.002863,0.07965
+W3,4xl,lith,183.6,67.70,0,,0.03998,0.000000,0.006055,0.04603
+W3,4xl,copy,928.6,60.03,,,0.20219,0.002293,0.002863,0.20734
