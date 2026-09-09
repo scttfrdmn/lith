@@ -33,6 +33,8 @@ type Metrics struct {
 	pfHalved      prometheus.Counter
 	pfResetRand   prometheus.Counter
 	pfEvictUnread prometheus.Counter
+	sibPrefetch   prometheus.Counter
+	sibUnread     prometheus.Counter
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -89,11 +91,34 @@ func New() *Metrics {
 		pfEvictUnread: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_evicted_unread_total", Help: "Prefetched chunks evicted before a demand read consumed them (thrash; #55).",
 		}),
+		sibPrefetch: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_sibling_prefetch_total", Help: "Sibling objects prefetched by directory-walk readahead (#63).",
+		}),
+		sibUnread: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_sibling_prefetch_unread_total", Help: "Sibling-prefetched objects that fell out of the pending window without being opened (#63 accuracy guardrail).",
+		}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvictUnread)
+		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread)
 	return m
+}
+
+// SiblingPrefetch records n sibling objects dispatched by directory-walk
+// readahead (#63). Nil-safe.
+func (m *Metrics) SiblingPrefetch(n int64) {
+	if m != nil && n > 0 {
+		m.sibPrefetch.Add(float64(n))
+	}
+}
+
+// SiblingPrefetchUnread records n sibling-prefetched objects that fell out of
+// the pending window without being opened (the #63 accuracy guardrail).
+// Nil-safe.
+func (m *Metrics) SiblingPrefetchUnread(n int64) {
+	if m != nil && n > 0 {
+		m.sibUnread.Add(float64(n))
+	}
 }
 
 // RegisterQueueDepth registers a gauge that samples f on each scrape (used for
