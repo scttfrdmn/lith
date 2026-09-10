@@ -150,6 +150,13 @@ func (f *rawFS) maybeZarrReadahead(relPath string) bool {
 	f.markSiblingUsedLocked(relPath)
 	f.sibMu.Unlock()
 
+	// When the walked axis is ambiguous (first open, backward, or >1 axis moved),
+	// fall back to key-order sibling readahead (#63) rather than prefetching
+	// nothing — for a Zarr chunk grid, key order walks the last axis, which is
+	// still useful and never worse than idle.
+	if walkedAxis(coords, last) == -1 {
+		return false
+	}
 	// Prefetch the next N chunks along the walked axis, in grid order.
 	for _, rel := range planZarrChunks(dir, coords, last, grid, f.cfg.SiblingReadahead) {
 		fi, err := f.ix.Stat("/" + rel)
