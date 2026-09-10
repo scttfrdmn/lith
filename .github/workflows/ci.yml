@@ -33,6 +33,11 @@ jobs:
           govulncheck ./...
       - name: fuzz the index parser (60s; committed corpus also runs above)
         run: go test -run '^$' -fuzz 'FuzzParseIndex$' -fuzztime 60s ./internal/index/
+      - name: fuzz the bgzf index parsers (60s; committed corpora also run above)
+        run: |
+          go test -run '^$' -fuzz 'FuzzParseTBI$' -fuzztime 20s ./internal/format/bgzf/
+          go test -run '^$' -fuzz 'FuzzParseCRAI$' -fuzztime 20s ./internal/format/bgzf/
+          go test -run '^$' -fuzz 'FuzzParseBAI$' -fuzztime 20s ./internal/format/bgzf/
 
   build:
     name: build ${{ matrix.goarch }}

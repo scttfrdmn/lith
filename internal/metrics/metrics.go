@@ -38,6 +38,8 @@ type Metrics struct {
 	formatDetect  *prometheus.CounterVec
 	formatPlane   prometheus.Counter
 	formatReplan  prometheus.Counter
+	formatIdxPfB  prometheus.Counter
+	formatRanges  *prometheus.CounterVec // format
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -109,12 +111,34 @@ func New() *Metrics {
 		formatReplan: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_format_replan_total", Help: "Times an out-of-plane open triggered a new grid-plane selection (#70 tier 2).",
 		}),
+		formatIdxPfB: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_format_index_prefetch_bytes_total", Help: "Bytes of external index prefetched whole on index-file open (#107 tier 1).",
+		}),
+		formatRanges: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_format_plan_ranges_total", Help: "Data byte ranges prefetched by an index-resolved plan, by format (#107 tier 2).",
+		}, []string{"format"}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
-		m.formatPlane, m.formatReplan)
+		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges)
 	return m
+}
+
+// FormatIndexPrefetchBytes records bytes of external index prefetched whole on
+// index-file open (#107 tier 1). Nil-safe.
+func (m *Metrics) FormatIndexPrefetchBytes(n int64) {
+	if m != nil && n > 0 {
+		m.formatIdxPfB.Add(float64(n))
+	}
+}
+
+// FormatPlanRanges records one data byte range prefetched by an index-resolved
+// plan (#107 tier 2). Nil-safe.
+func (m *Metrics) FormatPlanRanges(format string) {
+	if m != nil {
+		m.formatRanges.WithLabelValues(format).Inc()
+	}
 }
 
 // FormatPlaneChunks records n chunks dispatched by the grid-plane plan (#70

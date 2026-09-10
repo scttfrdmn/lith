@@ -18,6 +18,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/scttfrdmn/lith/internal/blockstore"
+	"github.com/scttfrdmn/lith/internal/format/bgzf"
 	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/prefetch"
@@ -129,6 +130,12 @@ type fileHandle struct {
 	// the parts fetch already covers every block, so readahead would only
 	// contend with it for the same chunks (see Open).
 	partsDispatched atomic.Bool
+	// randomProtect suppresses per-handle sequential readahead for a bgzf data
+	// file with an index (#107): access is seek-driven, so a scan-shaped window
+	// would only over-fetch. bgzfRanges (if set) carries the index's compressed
+	// byte ranges for tier-2 seek extension.
+	randomProtect bool
+	bgzfRanges    []bgzf.Range
 }
 
 type rawFS struct {
@@ -155,6 +162,9 @@ type rawFS struct {
 
 	// Zarr grid-aware readahead state (#70 tier 1).
 	zarr *zarrState
+
+	// bgzf-family readahead state (#107).
+	bgzf *bgzfState
 }
 
 // NewRawFileSystem builds the read-only RawFileSystem.
@@ -173,6 +183,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		sibLastPos:    map[string]int{},
 		sibPendingSet: map[string]struct{}{},
 		zarr:          newZarrState(),
+		bgzf:          newBgzfState(),
 	}
 	// Bound the pending-sibling tracker to a few readahead batches: a key that
 	// falls out of it without being opened is counted as an unread sibling.
@@ -325,7 +336,12 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// handle (via partsDispatched), removes the contention for parts-covered files
 	// outright; a budget-exhausted parts fetch leaves partsDispatched false, so
 	// readahead still serves those files.
-	if fi.Size > f.partsThreshold() {
+	// bgzf-family tier 1 (#107): an index-driven data file gets header prefetch +
+	// random protection (no scan window); an index file gets a whole-index +
+	// data-header prefetch. Detected from the Index (sibling presence), no S3 call.
+	bgzfHandled := f.maybeBgzfReadahead(n.path, h, fi.Size)
+
+	if fi.Size > f.partsThreshold() && !h.randomProtect {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -333,8 +349,8 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	}
 
 	// If this directory is being walked in key order, read ahead across the
-	// following siblings (#63).
-	if !f.maybeZarrReadahead(n.path) {
+	// following siblings (#63). Skipped for bgzf (seek-driven) and Zarr (grid).
+	if !bgzfHandled && !f.maybeZarrReadahead(n.path) {
 		f.maybeSiblingReadahead(n.path)
 	}
 
@@ -362,6 +378,12 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	end := off + length
 	if end > h.size {
 		end = h.size
+	}
+
+	// bgzf tier 2 (#107): extend a seek to the enclosing index range so the
+	// tool's follow-on reads in that container/chunk are cache hits.
+	if len(h.bgzfRanges) > 0 {
+		f.bgzfSeekExtend(h, off)
 	}
 
 	var res fuse.ReadResult
@@ -392,7 +414,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// Drive the prefetcher off the block this read falls in — unless a whole-file
 	// parts fetch is in flight for this handle, which already covers every block
 	// (see Open: readahead would only contend with the parts fetch).
-	if !h.partsDispatched.Load() {
+	if !h.partsDispatched.Load() && !h.randomProtect {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			pb := pb
