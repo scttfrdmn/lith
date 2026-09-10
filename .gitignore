@@ -11,6 +11,9 @@ coverage.*
 *.lithidx
 /cache/
 
+# Host-specific NIC baseline cache (code writes nic-<uid>.json)
+nic*.json
+
 # Editor / OS
 .DS_Store
 *.swp

@@ -81,6 +81,46 @@ func TestNewRejectsNonHTTPSSignedEndpoint(t *testing.T) {
 	}
 }
 
+// TestNewRejectsNonHTTPSSignedEnvEndpoint covers M3 via the SDK endpoint
+// sources (AWS_ENDPOINT_URL / shared-config endpoint_url): the guard must
+// validate the effective endpoint the SDK resolves into awsCfg.BaseEndpoint,
+// not only the --endpoint flag. Region is set so no network resolution occurs.
+func TestNewRejectsNonHTTPSSignedEnvEndpoint(t *testing.T) {
+	cases := []struct {
+		name          string
+		envEndpoint   string
+		noSign        bool
+		wantSchemeErr bool
+	}{
+		{"env http signed", "http://attacker.host", false, true},
+		{"env https signed", "https://s3.example.com", false, false},
+		{"env http anonymous", "http://public.example.com", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AWS_ENDPOINT_URL", tc.envEndpoint)
+			_, err := New(context.Background(), Config{
+				Bucket:        "b",
+				Region:        "us-east-1", // avoid network region resolution
+				Endpoint:      "",          // no flag: exercise the env/shared-config path
+				NoSignRequest: tc.noSign,
+			})
+			if tc.wantSchemeErr {
+				if err == nil {
+					t.Fatalf("New(env=%q, noSign=%v): want scheme error, got nil", tc.envEndpoint, tc.noSign)
+				}
+				if !strings.Contains(err.Error(), "non-HTTPS scheme") {
+					t.Fatalf("New(env=%q): error %q does not name the non-HTTPS cause", tc.envEndpoint, err)
+				}
+				return
+			}
+			if err != nil && strings.Contains(err.Error(), "non-HTTPS scheme") {
+				t.Fatalf("New(env=%q, noSign=%v): unexpected scheme rejection: %v", tc.envEndpoint, tc.noSign, err)
+			}
+		})
+	}
+}
+
 // TestValidateContentRange covers L2: a ranged GET must return partial content
 // starting at the requested offset. This validates the SDK Content-Range at
 // the response layer; the fake bypasses the SDK and cannot exercise it.

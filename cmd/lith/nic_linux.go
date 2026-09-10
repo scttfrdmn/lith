@@ -22,7 +22,14 @@ func ethtoolGbps() float64 {
 	if iface == "" {
 		return 0
 	}
-	out, err := exec.Command("ethtool", iface).CombinedOutput()
+	// Resolve ethtool against a fixed trusted dir list (not $PATH): under `sudo`
+	// without secure_path a poisoned PATH would otherwise run an attacker binary
+	// as root (finding F5). Not found → behave as the existing failure path.
+	bin, err := trustedExecPath("ethtool")
+	if err != nil {
+		return 0
+	}
+	out, err := exec.Command(bin, iface).CombinedOutput()
 	if err != nil {
 		return 0
 	}

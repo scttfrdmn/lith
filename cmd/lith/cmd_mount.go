@@ -44,6 +44,7 @@ type mountFlags struct {
 	diskWriters    int
 	inflightBytes  string
 	metrics        string
+	pprof          string
 	timelineCSV    string
 	allowOther     bool
 	uid            int
@@ -92,7 +93,8 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
-	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
+	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101); serves only /metrics (no pprof)")
+	fl.StringVar(&f.pprof, "pprof", "", "serve net/http/pprof debug handlers on this address (e.g. 127.0.0.1:6060); off by default. SECURITY: exposes argv and an on-demand CPU/goroutine profiling DoS — bind to localhost and never expose to untrusted networks")
 	fl.StringVar(&f.timelineCSV, "timeline-csv", "", "diagnostic (#70): record a per-chunk demand-read timeline (join-wait, in-flight depth, prefetch-dispatch→open lag) and write it here on unmount")
 	fl.BoolVar(&f.allowOther, "allow-other", false, "allow other users to access the mount")
 	fl.IntVar(&f.uid, "uid", os.Getuid(), "owner uid for all files")
@@ -299,25 +301,36 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		_ = p
 	}
 
-	// Serve metrics (and pprof) if requested.
+	// Serve Prometheus metrics if requested. This endpoint serves ONLY /metrics;
+	// pprof lives behind the separate opt-in --pprof flag below so scrape targets
+	// (often reachable network-wide) never expose the pprof surface.
 	var metricsSrv *http.Server
 	if met != nil {
-		runtime.SetMutexProfileFraction(1)
-		runtime.SetBlockProfileRate(1)
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", met.Handler())
-		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		metricsSrv = &http.Server{Addr: f.metrics, Handler: mux}
+		metricsSrv = &http.Server{Addr: f.metrics, Handler: newMetricsMux(met)}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Warn("metrics server stopped", "err", err)
 			}
 		}()
 		log.Info("metrics endpoint", "addr", f.metrics)
+	}
+
+	// Serve net/http/pprof only when explicitly opted in via --pprof. The mutex
+	// and block profilers (which tax the hot path) are enabled only here, so a
+	// plain --metrics mount pays none of that cost. SECURITY: this surface leaks
+	// argv (/cmdline) and allows an on-demand CPU/goroutine DoS (/profile, /trace)
+	// — the flag help recommends binding to localhost.
+	var pprofSrv *http.Server
+	if f.pprof != "" {
+		runtime.SetMutexProfileFraction(1)
+		runtime.SetBlockProfileRate(1)
+		pprofSrv = &http.Server{Addr: f.pprof, Handler: newPprofMux()}
+		go func() {
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Warn("pprof server stopped", "err", err)
+			}
+		}()
+		log.Info("pprof endpoint", "addr", f.pprof)
 	}
 
 	// If we were forked as a daemon child, tell the parent the mount is ready.
@@ -331,6 +344,9 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		log.Info("unmounting")
 		if metricsSrv != nil {
 			_ = metricsSrv.Close()
+		}
+		if pprofSrv != nil {
+			_ = pprofSrv.Close()
 		}
 		if err := srv.Unmount(); err != nil {
 			log.Warn("unmount failed; retrying via lazy unmount", "err", err)
@@ -350,6 +366,27 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		}
 	}
 	return nil
+}
+
+// newMetricsMux builds the --metrics mux. It serves ONLY /metrics; the pprof
+// handlers are deliberately not registered here (see F1) so a network-reachable
+// scrape target does not expose the pprof surface.
+func newMetricsMux(met *metrics.Metrics) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", met.Handler())
+	return mux
+}
+
+// newPprofMux builds the --pprof mux with the net/http/pprof handlers. It is
+// wired only when --pprof is set; the addr should be a localhost address.
+func newPprofMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return mux
 }
 
 // loadOrBuildIndex loads the index from --index-file, or builds it from the

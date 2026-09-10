@@ -34,6 +34,22 @@ Remediation of an internal security audit (defensive hardening; no format change
 - **Keys containing C0 control bytes are rejected** at index build.
 - **The index is memory-mapped `MAP_PRIVATE`**, immune to post-validation mutation
   of the backing file.
+- **The HTTPS-endpoint guard now covers the environment**, not just `--endpoint`:
+  a non-`https` endpoint resolved from `AWS_ENDPOINT_URL`/`AWS_ENDPOINT_URL_S3`/
+  shared-config `endpoint_url` is also rejected when signing, so credentials can't
+  reach a cleartext endpoint via the standard SDK config path.
+- **`--metrics` no longer serves pprof.** `net/http/pprof` (which exposes the process
+  argv and an on-demand CPU/goroutine profiling DoS) moved to a separate opt-in
+  `--pprof <addr>` flag (off by default; bind to localhost). `--metrics` serves only
+  `/metrics`, and block/mutex profiling is enabled only when `--pprof` is set.
+- **The NIC-bandwidth cache (`nic.json`) is written safely.** It is now a per-uid
+  file created with `O_EXCL|O_NOFOLLOW` (`0600`) and read only when it is a regular
+  file owned by the current user — closing a symlink/pre-created-file overwrite in
+  the predictable `$TMPDIR` path and a cross-user sizing-poisoning read.
+- **`ethtool` and the bench `ss` helper are resolved from the fixed trusted path**
+  (as `fusermount3`/`fuser` already were).
+- **Supply chain:** CI now runs `govulncheck`; all GitHub Actions are pinned to
+  commit SHAs and `goreleaser-action` to a fixed version; `nic*.json` is gitignored.
 
 ### Fixed
 
@@ -49,6 +65,14 @@ Remediation of an internal security audit (defensive hardening; no format change
   entry count are capped, so a hostile or malformed inventory (gzip bomb, giant
   manifest) errors instead of exhausting memory. Inventory keys are unescaped with
   `PathUnescape` (a literal `+` is preserved) and a negative object size is rejected.
+- **`--timeline-csv` output is injection-safe.** The diagnostic CSV is now written with
+  `encoding/csv` and cells beginning with `= + - @` (or tab/CR) are prefixed with `'`,
+  so an S3 key name cannot corrupt the CSV structure or become a live spreadsheet formula.
+- **`parseSize` rejects `Inf`/`NaN`/negative/overflowing values** instead of silently
+  yielding a garbage size.
+- **The daemon log is only appended to a file the current user owns** (an attacker
+  pre-creating a regular file at the predictable path is now refused), and the mount-record
+  write closes a `/tmp`-fallback symlink race (`Mkdir`+re-check, `O_NOFOLLOW`).
 
 ## [0.2.1] - 2026-09-10
 
