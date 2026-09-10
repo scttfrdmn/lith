@@ -43,6 +43,10 @@ type Config struct {
 	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
 	// 0 uses the default of 512 MiB.
 	BgzfWholeFileMax int64
+	// DisableFooterTier2 turns off the footer family's tier-2 projection/entry
+	// prefetch (#108), leaving only the generic tier-1 footer+head prefetch. Zero
+	// value keeps tier 2 on; used to isolate the tiers when measuring.
+	DisableFooterTier2 bool
 	// Limits is the single prefetch policy object (#64): the per-handle
 	// readahead window, sibling readahead (#63), and small-file parts (#69) all
 	// query it for budget and neighborhood. When nil, the FUSE layer falls back
@@ -415,7 +419,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	}
 	// footer tier 2 (#108): prefetch this row group's projection columns
 	// (Parquet) or this/next zip entries so follow-on reads are cache hits.
-	if h.footerKind != footer.FormatNone {
+	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 {
 		f.footerReadExtend(h, off)
 	}
 

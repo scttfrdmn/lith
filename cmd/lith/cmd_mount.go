@@ -35,6 +35,7 @@ type mountFlags struct {
 	smallFile        string
 	partsMax         string
 	bgzfWholeFileMax string
+	footerTier2      bool
 	s3Concurrency    int
 	prefetchConc     int
 	prefetchBudget   string
@@ -86,6 +87,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
 	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
+	fl.BoolVar(&f.footerTier2, "footer-tier2", true, "prefetch the index-resolved projection (Parquet column chunks) / entries (zip) for footer-family files (#108); false leaves only the generic tier-1 footer+head prefetch")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
@@ -272,18 +274,19 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	)
 
 	fcfg := fusefs.Config{
-		Index:            root,
-		Store:            bs,
-		Metrics:          met,
-		UID:              uint32(f.uid),
-		GID:              uint32(f.gid),
-		SmallFile:        smallFile,
-		PartsMax:         partsMax,
-		BgzfWholeFileMax: bgzfWholeFileMax,
-		MaxReadahead:     f.maxReadahead,
-		SiblingWindow:    f.siblingWindow,
-		SiblingReadahead: f.siblingRead,
-		Limits:           limits,
+		Index:              root,
+		Store:              bs,
+		Metrics:            met,
+		UID:                uint32(f.uid),
+		GID:                uint32(f.gid),
+		SmallFile:          smallFile,
+		PartsMax:           partsMax,
+		BgzfWholeFileMax:   bgzfWholeFileMax,
+		DisableFooterTier2: !f.footerTier2,
+		MaxReadahead:       f.maxReadahead,
+		SiblingWindow:      f.siblingWindow,
+		SiblingReadahead:   f.siblingRead,
+		Limits:             limits,
 	}
 
 	srv, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{
