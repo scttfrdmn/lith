@@ -8,6 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -92,6 +95,16 @@ func buildTransport(concurrency int) *http.Transport {
 // is set, the region is resolved from the bucket. This performs network I/O;
 // unit tests use the fake instead.
 func New(ctx context.Context, cfg Config) (*Client, error) {
+	// M3: when signing is enabled, refuse to send SigV4-signed requests (which
+	// carry credentials, including any X-Amz-Security-Token) to a non-HTTPS
+	// endpoint, where they could be observed or misdirected in cleartext. This
+	// must run before any signed request is made (region resolution below).
+	if cfg.Endpoint != "" && !cfg.NoSignRequest {
+		if u, err := url.Parse(cfg.Endpoint); err != nil || u.Scheme != "https" {
+			return nil, fmt.Errorf("s3client: --endpoint %q uses a non-HTTPS scheme; signed requests may not be sent in cleartext — use https, or pass --no-sign-request for anonymous access", cfg.Endpoint)
+		}
+	}
+
 	var httpClient config.HTTPClient
 	if cfg.TransportWrap != nil {
 		// Diagnostic path: build the tuned transport, wrap its RoundTripper, and
@@ -245,6 +258,11 @@ func (c *Client) GetRange(ctx context.Context, key string, off, length int64) ([
 		return nil, "", err
 	}
 	defer func() { _ = out.Body.Close() }()
+	if rng != nil {
+		if err := validateContentRange(aws.ToString(out.ContentRange), off); err != nil {
+			return nil, "", err
+		}
+	}
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
 		return nil, "", err
@@ -270,7 +288,40 @@ func (c *Client) GetRangeReader(ctx context.Context, key string, off, length int
 	if err != nil {
 		return nil, "", err
 	}
+	if rng != nil {
+		if err := validateContentRange(aws.ToString(out.ContentRange), off); err != nil {
+			_ = out.Body.Close()
+			return nil, "", err
+		}
+	}
 	return out.Body, aws.ToString(out.ETag), nil
+}
+
+// validateContentRange verifies that a ranged GetObject response actually
+// returned partial content beginning at the requested offset. cr is the raw
+// Content-Range header ("bytes <start>-<end>/<total>", per RFC 7233). A
+// non-conforming or hostile endpoint that answers a ranged request with the
+// whole object (HTTP 200, no/!matching Content-Range) would otherwise let the
+// first length bytes be served as bytes [off, off+length); reject that. An
+// empty, malformed, or mismatched-start value is an error.
+func validateContentRange(cr string, off int64) error {
+	rangeErr := func() error {
+		return fmt.Errorf("s3client: endpoint did not honor the requested byte range (got %q, want start %d)", cr, off)
+	}
+	const prefix = "bytes "
+	if !strings.HasPrefix(cr, prefix) {
+		return rangeErr()
+	}
+	spec := cr[len(prefix):]
+	dash := strings.IndexByte(spec, '-')
+	if dash <= 0 {
+		return rangeErr()
+	}
+	start, err := strconv.ParseInt(spec[:dash], 10, 64)
+	if err != nil || start != off {
+		return rangeErr()
+	}
+	return nil
 }
 
 func ptrOrNil(s string) *string {

@@ -2,7 +2,11 @@
 
 package s3client
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+)
 
 func TestBuildTransportTuning(t *testing.T) {
 	tr := buildTransport(128)
@@ -33,6 +37,77 @@ func TestPayerHeader(t *testing.T) {
 	}
 	if got := (&Client{requesterPays: true}).payer(); got == "" {
 		t.Error("requester-pays client should set a request payer")
+	}
+}
+
+// TestNewRejectsNonHTTPSSignedEndpoint covers M3: signed requests must not be
+// sent to a non-HTTPS endpoint (SSRF + cleartext credential exposure), while
+// anonymous mode may still use http.
+func TestNewRejectsNonHTTPSSignedEndpoint(t *testing.T) {
+	cases := []struct {
+		name          string
+		endpoint      string
+		noSign        bool
+		wantSchemeErr bool
+	}{
+		{"http signed", "http://attacker.host", false, true},
+		{"no scheme signed", "attacker.host", false, true},
+		{"https signed", "https://s3.example.com", false, false},
+		{"http anonymous", "http://public.example.com", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(context.Background(), Config{
+				Bucket:        "b",
+				Region:        "us-east-1", // avoid network region resolution
+				Endpoint:      tc.endpoint,
+				NoSignRequest: tc.noSign,
+			})
+			if tc.wantSchemeErr {
+				if err == nil {
+					t.Fatalf("New(%q, noSign=%v): want scheme error, got nil", tc.endpoint, tc.noSign)
+				}
+				if !strings.Contains(err.Error(), "non-HTTPS scheme") {
+					t.Fatalf("New(%q): error %q does not name the non-HTTPS cause", tc.endpoint, err)
+				}
+				return
+			}
+			// The scheme guard must not fire; New itself may still succeed since
+			// an endpoint override skips network region resolution.
+			if err != nil && strings.Contains(err.Error(), "non-HTTPS scheme") {
+				t.Fatalf("New(%q, noSign=%v): unexpected scheme rejection: %v", tc.endpoint, tc.noSign, err)
+			}
+		})
+	}
+}
+
+// TestValidateContentRange covers L2: a ranged GET must return partial content
+// starting at the requested offset. This validates the SDK Content-Range at
+// the response layer; the fake bypasses the SDK and cannot exercise it.
+func TestValidateContentRange(t *testing.T) {
+	cases := []struct {
+		name    string
+		cr      string
+		off     int64
+		wantErr bool
+	}{
+		{"exact start zero", "bytes 0-99/1000", 0, false},
+		{"exact start offset", "bytes 500-599/1000", 500, false},
+		{"unknown total", "bytes 500-599/*", 500, false},
+		{"empty (whole object, 200)", "", 500, true},
+		{"wrong start", "bytes 0-99/1000", 500, true},
+		{"missing bytes prefix", "500-599/1000", 500, true},
+		{"garbage", "not-a-range", 500, true},
+		{"non-numeric start", "bytes x-99/1000", 500, true},
+		{"no dash", "bytes 500", 500, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateContentRange(tc.cr, tc.off)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("validateContentRange(%q, %d) err = %v, wantErr = %v", tc.cr, tc.off, err, tc.wantErr)
+			}
+		})
 	}
 }
 
