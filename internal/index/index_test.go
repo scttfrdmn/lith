@@ -179,7 +179,12 @@ func TestReaddirMissingDir(t *testing.T) {
 
 func TestSanitize(t *testing.T) {
 	valid := []string{"a", "a/b", "a/b/c", "folder/", "a.b/c-d", "x/"}
-	invalid := []string{"", "/", "a//b", "a/./b", "a/../b", ".", "..", "a//", "with\x00nul"}
+	invalid := []string{
+		"", "/", "a//b", "a/./b", "a/../b", ".", "..", "a//", "with\x00nul",
+		// C0 control characters anywhere in the key (H-b): newline, CR, ESC,
+		// backspace, tab. These block terminal-escape / argument-injection names.
+		"a\nb", "a\rb", "\x1b[31mred", "a\bb", "a\tb", "\x01lead", "trail\x1f",
+	}
 	for _, k := range valid {
 		if !sanitize(k) {
 			t.Errorf("sanitize(%q) = false, want true", k)
@@ -189,6 +194,44 @@ func TestSanitize(t *testing.T) {
 		if sanitize(k) {
 			t.Errorf("sanitize(%q) = true, want false", k)
 		}
+	}
+}
+
+// TestReaddirUntrustedCursor exercises Readdir with cursor values a local
+// process can force via lseek on the mount. A huge or out-of-range cursor must
+// not panic (index-out-of-range from a negative start) — it returns an empty
+// page (end of directory). cursor 0 lists normally (M1).
+func TestReaddirUntrustedCursor(t *testing.T) {
+	ix := build("", "a", "b", "c", "d/e", "d/f")
+	n := uint64(ix.Len())
+	cases := []struct {
+		cursor    uint64
+		wantEmpty bool
+	}{
+		{0, false},         // normal first page
+		{1, false},         // start at position 0
+		{^uint64(0), true}, // max uint64: must clamp, not go negative
+		{n + 5, true},      // past the end
+		{n + 1, true},      // one past Len(): cursor-1 == Len(), empty
+	}
+	for _, c := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Readdir(cursor=%d) panicked: %v", c.cursor, r)
+				}
+			}()
+			ents, _, err := ix.Readdir("/", c.cursor, 10)
+			if err != nil {
+				t.Fatalf("Readdir(cursor=%d): %v", c.cursor, err)
+			}
+			if c.wantEmpty && len(ents) != 0 {
+				t.Errorf("Readdir(cursor=%d): got %d entries, want empty page", c.cursor, len(ents))
+			}
+			if !c.wantEmpty && len(ents) == 0 {
+				t.Errorf("Readdir(cursor=%d): got empty page, want entries", c.cursor)
+			}
+		}()
 	}
 }
 

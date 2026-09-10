@@ -281,6 +281,13 @@ func (ix *Index) Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, e
 	if cursor == 0 {
 		start = ix.lowerBound(prefix)
 	} else {
+		// cursor is UNTRUSTED: a local process can lseek the mount's directory
+		// to any offset, so cursor-1 may be huge. Compare in uint64 space before
+		// converting to int, so start can never go negative or past Len() (which
+		// would make key(i) slice the arena out of range and panic the mount).
+		if cursor-1 > uint64(ix.Len()) {
+			return nil, cursor, nil // past the end of the directory: empty page
+		}
 		start = int(cursor - 1)
 	}
 

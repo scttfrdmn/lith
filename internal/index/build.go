@@ -45,13 +45,17 @@ func HashETag(etag string) uint64 { return xxh3.HashString(etag) }
 
 // sanitize reports whether a relative key is a valid POSIX path. A single
 // trailing "/" (a folder marker) is allowed; embedded "//", "." or ".."
-// components, a NUL byte, or an empty key are rejected.
+// components, an empty key, or any C0 control byte (< 0x20, including NUL,
+// newline, CR, ESC, backspace) anywhere in the key are rejected — the latter so
+// terminal-escape / argument-injection names never enter the namespace.
 func sanitize(rel string) bool {
 	if rel == "" {
 		return false
 	}
-	if strings.IndexByte(rel, 0) >= 0 {
-		return false
+	for i := 0; i < len(rel); i++ {
+		if rel[i] < 0x20 {
+			return false
+		}
 	}
 	s := strings.TrimSuffix(rel, "/")
 	if s == "" {
