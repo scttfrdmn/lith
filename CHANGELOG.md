@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Mount root at a prefix** (#90): `lith mount s3://bucket/some/prefix /mnt`
+  roots the filesystem at `some/prefix/`, showing only what lives under it with
+  the prefix stripped from every path. An index built at that prefix — or any
+  parent of it, including a whole-bucket index — serves the mount with no
+  rebuild, so **one index can back many prefix mounts concurrently**. A prefix
+  the index cannot cover, or one with no keys under it, is rejected rather than
+  mounted empty. `lith index inspect` now prints the index `root:`.
+- **`lith umount` and `lith mounts`** (#91): `lith umount <mountpoint>` signals
+  the mount process and waits for it to leave the mount table, falling back to
+  `fusermount3 -u` (and `-uz` lazy only with `--force`); a busy mount is
+  reported with the holding pids and refused without `--force`. `--all`
+  unmounts every lith mount for the user. `lith mounts` lists live mounts
+  (cross-checked against `/proc/mounts`) and stale records, with `--prune`.
+
 ## [0.1.0] - 2026-09-08
 
 ### Changed

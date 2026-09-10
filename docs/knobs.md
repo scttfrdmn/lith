@@ -48,9 +48,17 @@ drain a burst-credit box's credits faster than it helps.
 
 The namespace snapshot that makes metadata free.
 
+The `s3://bucket/prefix` you pass to `mount` is the **root** of the filesystem:
+the mount shows only what lives under that prefix, with the prefix stripped from
+every path. An index whose own build root is that prefix — **or any parent of
+it** — can serve the mount, so one wide index backs many prefix mounts
+concurrently, with no rebuild. A prefix the index cannot cover (narrower than,
+or disjoint from, its root), or one with no keys under it, is rejected rather
+than mounted empty. `lith index inspect` prints the index's `root:`.
+
 | flag | default | why |
 |---|---|---|
-| `--index-file` | (auto-build) | Load a prebuilt index. Without it, `lith mount` auto-builds from the bucket, bounded by `--auto-index-limit`. Prebuild for large buckets and reuse across nodes. |
+| `--index-file` | (auto-build) | Load a prebuilt index. Without it, `lith mount` auto-builds from the bucket, bounded by `--auto-index-limit`. Prebuild for large buckets and reuse across nodes — one whole-bucket or parent-prefix index can back many prefix mounts at once. |
 | `--auto-index-limit` | `5000000` | Max keys `lith mount` will auto-index; above this, build explicitly with `lith index build` first. |
 | `lith index build --inventory` | — | Build from an S3 Inventory manifest instead of a `ListObjectsV2` pass — far cheaper for very large buckets. |
 | `lith index build --shard` | — | List sub-prefixes concurrently (repeatable) to speed a build over a wide namespace. |

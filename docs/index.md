@@ -75,7 +75,26 @@ lith bench s3://1000genomes/phase3/data/HG00100/alignment/HG00100.mapped.ILLUMIN
 ## 6. Unmount
 
 ```bash
-fusermount3 -u /mnt/hg00100
+lith umount /mnt/hg00100
+```
+
+`lith umount` signals the mount process and waits for it to leave the mount
+table (falling back to `fusermount3 -u` if needed); `lith mounts` lists every
+live lith mount. You can still `fusermount3 -u` by hand.
+
+## Mount at any prefix
+
+The `s3://bucket/prefix` you pass to `mount` becomes the **root** of the
+filesystem — above, `/mnt/hg00100` is rooted at `phase3/data/HG00100/alignment/`,
+so its top-level entries are that folder's contents, not the whole bucket. One
+prebuilt index can back many prefix mounts at once: build a wide index once and
+mount any prefix at or below its root, concurrently, with no rebuild —
+
+```bash
+lith index build s3://1000genomes/phase3/data --no-sign-request --index-file /tmp/phase3.lithidx
+lith mount s3://1000genomes/phase3/data/HG00096 /mnt/hg00096 --index-file /tmp/phase3.lithidx --no-sign-request --daemon
+lith mount s3://1000genomes/phase3/data/HG00100 /mnt/hg00100b --index-file /tmp/phase3.lithidx --no-sign-request --daemon
+lith umount --all
 ```
 
 ## What just happened
