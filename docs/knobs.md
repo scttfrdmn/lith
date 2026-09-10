@@ -16,6 +16,7 @@ bandwidth on bytes you won't use.
 | `--max-range` | `64MiB` | Caps how many contiguous blocks coalesce into a single GET, so one fill can't monopolize a connection. |
 | `--small-file` | `4MiB` | Files at or below this are fetched whole on first read — one GET beats seeking within a tiny object. |
 | `--parts-max` | `64MiB` | Files up to this are fetched whole as **concurrent block-sized range parts** on first read (v0.2, [#69](https://github.com/scttfrdmn/lith/issues/69)); below one block it's a single GET. This is what lets a 31 MB granule beat `aws s3 cp`. `0` disables. |
+| `--bgzf-whole-file-max` | `512MiB` | For a bgzf-family data file (BAM/CRAM/VCF.gz/BCF) that has a coordinate-index sibling (`.bai`/`.tbi`/`.csi`/`.crai`), files at or below this are fetched whole through the parts path when the index opens — a region-indexed scan (e.g. `tabix` over many regions) touches nearly every block, so the whole-file working set makes cold ≈ warm (v0.3, [#107](https://github.com/scttfrdmn/lith/issues/107)). Above it, tier-2 prefetches only the index-resolved slices/chunks. `0` disables whole-file prefetch. The handle keeps its adaptive readahead window either way — the plan only *adds* ranges. |
 
 ## RAM vs re-fetch
 
