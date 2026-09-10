@@ -1,0 +1,13 @@
+/* Minimal overrides. Self-hosting Atkinson Hyperlegible (optional):
+   1. Add docs/stylesheets/AtkinsonHyperlegible-Regular.woff2 (and -Bold).
+   2. Uncomment the @font-face + body rule below.
+   No CDN is used; mkdocs.yml sets theme.font: false. */
+
+/* @font-face {
+  font-family: "Atkinson Hyperlegible";
+  src: url("AtkinsonHyperlegible-Regular.woff2") format("woff2");
+  font-weight: 400; font-display: swap;
+}
+body, input { font-family: "Atkinson Hyperlegible", system-ui, sans-serif; } */
+
+.md-typeset table:not([class]) { font-size: 0.72rem; }

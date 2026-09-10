@@ -1,0 +1,48 @@
+site_name: lith
+site_description: Read-only POSIX filesystem over an S3 bucket in its native key layout.
+site_url: https://scttfrdmn.github.io/lith/
+repo_url: https://github.com/scttfrdmn/lith
+repo_name: scttfrdmn/lith
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  # No CDN dependency: use the system font stack. To self-host Atkinson
+  # Hyperlegible later, drop its .woff2 into docs/stylesheets/ and add an
+  # @font-face rule to extra.css (see the note there); leave font: false so
+  # Material never fetches Google Fonts.
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/weather-night, name: Switch to dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/weather-sunny, name: Switch to light mode }
+  features:
+    - navigation.instant
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details        # collapsible <details> blocks for evidence
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - tables
+  - toc: { permalink: true }
+
+plugins:
+  - search
+
+nav:
+  - Start here: index.md
+  - Copy or mount?: copy-or-mount.md
+  - Sizing the node: sizing.md
+  - Meet a deadline: deadline.md
+  - Knobs: knobs.md
+  - What lith is not: not.md

@@ -16,3 +16,4 @@ coverage.*
 *.swp
 .idea/
 .vscode/
+site/
