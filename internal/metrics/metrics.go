@@ -36,6 +36,8 @@ type Metrics struct {
 	sibPrefetch   prometheus.Counter
 	sibUnread     prometheus.Counter
 	formatDetect  *prometheus.CounterVec
+	formatPlane   prometheus.Counter
+	formatReplan  prometheus.Counter
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -101,11 +103,34 @@ func New() *Metrics {
 		formatDetect: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_format_detect_total", Help: "Format-aware access plans detected, by format (#70).",
 		}, []string{"format"}),
+		formatPlane: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_format_plane_chunks_total", Help: "Chunks prefetched by the Zarr grid-plane selection plan (#70 tier 2).",
+		}),
+		formatReplan: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_format_replan_total", Help: "Times an out-of-plane open triggered a new grid-plane selection (#70 tier 2).",
+		}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect)
+		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.formatPlane, m.formatReplan)
 	return m
+}
+
+// FormatPlaneChunks records n chunks dispatched by the grid-plane plan (#70
+// tier 2). Nil-safe.
+func (m *Metrics) FormatPlaneChunks(n int64) {
+	if m != nil && n > 0 {
+		m.formatPlane.Add(float64(n))
+	}
+}
+
+// FormatReplan records that an out-of-plane open triggered a new plane (#70
+// tier 2). Nil-safe.
+func (m *Metrics) FormatReplan() {
+	if m != nil {
+		m.formatReplan.Inc()
+	}
 }
 
 // FormatDetect records that a format-aware plan was detected for an object
