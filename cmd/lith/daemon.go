@@ -23,6 +23,37 @@ const (
 
 func isDaemonChild() bool { return os.Getenv(daemonChildEnv) == "1" }
 
+// openOwnedLog opens the per-uid daemon log 0600 with O_NOFOLLOW (no symlink),
+// then fstats the opened descriptor and refuses it unless it is a regular file
+// owned by our euid. This defeats an attacker who pre-plants a regular file at
+// the predictable /tmp path so a root daemon would append diagnostics to a file
+// it does not own (info disclosure).
+func openOwnedLog(logPath string) (*os.File, error) {
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("daemon log %s is not a regular file", logPath)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		_ = f.Close()
+		return nil, fmt.Errorf("daemon log %s: cannot verify ownership", logPath)
+	}
+	if st.Uid != uint32(os.Geteuid()) {
+		_ = f.Close()
+		return nil, fmt.Errorf("daemon log %s is not owned by uid %d", logPath, os.Geteuid())
+	}
+	return f, nil
+}
+
 // daemonize re-execs this process detached and returns once the child signals
 // readiness (or fails).
 func daemonize() error {
@@ -36,9 +67,13 @@ func daemonize() error {
 	}
 	// Per-uid log opened 0600 with O_NOFOLLOW: a world-writable predictable log
 	// in a shared /tmp would let another user pre-plant a symlink so a root
-	// daemon appends to an arbitrary file (finding M2).
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("lith-%d-mount.log", os.Getuid()))
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	// daemon appends to an arbitrary file (finding M2). O_NOFOLLOW blocks a
+	// symlink but NOT a regular file an attacker pre-created at the predictable
+	// path, so after opening we fstat and refuse to append unless the file is a
+	// regular file owned by our euid. The path uses Geteuid for consistency with
+	// the ownership checks used for mount records.
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("lith-%d-mount.log", os.Geteuid()))
+	logFile, err := openOwnedLog(logPath)
 	if err != nil {
 		return err
 	}
