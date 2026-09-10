@@ -516,8 +516,14 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 			want = 0
 		}
 		buf := make([]byte, want)
-		if _, rerr := io.ReadFull(body, buf); rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
-			// Fail this and every remaining chunk in the run.
+		// want is the exact byte count for this chunk, so a correct body fills
+		// buf and io.ReadFull returns nil. Any error — including a short read
+		// (io.ErrUnexpectedEOF) or zero bytes (io.EOF) — means the transfer was
+		// truncated (dropped/partial/hostile). A short read is a truncation, not
+		// success: never cache a zero-padded buffer as authoritative. Fail this
+		// and every remaining chunk in the run. (For a trailing want == 0 chunk,
+		// io.ReadFull on an empty buffer returns nil, so this stays correct.)
+		if _, rerr := io.ReadFull(body, buf); rerr != nil {
 			for r := idx; r < len(owned); r++ {
 				bs.complete(k, first+int64(r), owned[r], nil, rerr, isPrefetch)
 			}
