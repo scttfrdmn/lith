@@ -38,7 +38,8 @@ drain a burst-credit box's credits faster than it helps.
 | flag | default | why |
 |---|---|---|
 | `--max-readahead` | 1.5 × the bandwidth-delay product | Sequential readahead window in blocks. The 1.5× is **empirical**, measured on a `c8gd.16xlarge` ([#56](https://github.com/scttfrdmn/lith/issues/56)); a raw-BDP window left the NIC underfed. |
-| `--inflight-bytes` | 2 × NIC bandwidth × 100 ms (via `ethtool`) | Total bytes in flight to S3. Falls back to a fixed budget when the NIC speed can't be read — set it explicitly on `c8g` and other undetected classes ([#79](https://github.com/scttfrdmn/lith/issues/79)). |
+| `--inflight-bytes` | 2 × NIC baseline × 100 ms | Total bytes in flight to S3. NIC bandwidth is detected `ethtool` → EC2 `DescribeInstanceTypes` baseline → a fixed fallback, so burst-credit classes like `c8g` are now sized from their baseline automatically ([#79](https://github.com/scttfrdmn/lith/issues/79)); the result is cached in `nic.json` next to the index. |
+| `--nic-gbps` | detect | Override the detected NIC bandwidth (Gbps) — it sizes `--inflight-bytes` and the readahead window. Use on boxes without `ec2:DescribeInstanceTypes` or a readable `ethtool` speed ([#79](https://github.com/scttfrdmn/lith/issues/79)). |
 | `--s3-concurrency` | `128` | Hard cap on concurrent S3 requests. 128 won on both cold sequential and stride in the tuning grid ([#40](https://github.com/scttfrdmn/lith/issues/40)). |
 | `--prefetch-concurrency` | `--s3-concurrency` | Sub-cap on concurrent prefetch fills; lower it to reserve request slots for demand reads under heavy prefetch. |
 | `--sibling-readahead` | `16` | On a directory walked in key order, prefetch this many following small siblings whole (v0.2, [#63](https://github.com/scttfrdmn/lith/issues/63)) — the chunked-store path. `0` disables. |
@@ -85,3 +86,4 @@ Authentication, endpoint, and how files present to the OS.
 | flag | default | why |
 |---|---|---|
 | `--metrics` | off | Serve Prometheus metrics **and** Go `pprof` on an address (e.g. `:9101`): cache hits by tier, S3 bytes/requests, prefetch accuracy, uncovered misses, FUSE op latency. Point Prometheus at it; hit `/debug/pprof/` for profiles. |
+| `--timeline-csv` | off | Diagnostic ([#70](https://github.com/scttfrdmn/lith/issues/70)/[#95](https://github.com/scttfrdmn/lith/issues/95)): write a per-chunk demand-read timeline — join-wait, in-flight fill depth, and prefetch-dispatch→open lag — to this CSV on unmount. Opt-in; no effect on the read path when unset. |

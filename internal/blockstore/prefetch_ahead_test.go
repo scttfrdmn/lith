@@ -4,6 +4,7 @@ package blockstore
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +45,41 @@ func TestPrefetchAheadCoversDemand(t *testing.T) {
 	// 1 MiB block so block index == chunk index (clean 1:1 for the assertion).
 	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, Recorder: rec})
 
+	// Synchronize on GETs actually starting instead of sleeping: by the time
+	// GetRangeReader is called, ensureChunks has already claimed the run's
+	// chunks in-flight, so waiting for the frontier's GETs to start guarantees
+	// the frontier leads the cursor — with no dependence on goroutine-scheduling
+	// timing (deterministic under -race -count=N).
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	started := map[int64]bool{}
+	srv.OnGetStart = func(_ string, off, _ int64) {
+		mu.Lock()
+		started[off/mib] = true
+		cond.Broadcast()
+		mu.Unlock()
+	}
+	waitStarted := func(blocks []int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		for {
+			all := true
+			for _, b := range blocks {
+				if b*mib >= size {
+					continue // no GET is issued for a block past EOF
+				}
+				if !started[b] {
+					all = false
+					break
+				}
+			}
+			if all {
+				return
+			}
+			cond.Wait()
+		}
+	}
+
 	ctx := context.Background()
 	pf := prefetch.New(32)
 	dispatch := func(blocks []int64) {
@@ -53,15 +89,19 @@ func TestPrefetchAheadCoversDemand(t *testing.T) {
 		}
 	}
 
-	// Open dispatches the initial window (blocks 0,1) before any read.
-	dispatch(pf.Open())
-	time.Sleep(15 * time.Millisecond) // let the open-time GETs start
+	// Open dispatches the initial window before any read; wait until those GETs
+	// are in flight.
+	ob := pf.Open()
+	dispatch(ob)
+	waitStarted(ob)
 	if srv.GetCallCount() < 1 {
-		t.Fatalf("expected GET(s) for blocks 0-1 issued at open; GetCalls=%d", srv.GetCallCount())
+		t.Fatalf("expected GET(s) for the open window issued at open; GetCalls=%d", srv.GetCallCount())
 	}
 
 	for d := int64(0); d <= 20; d++ {
-		dispatch(pf.Observe(d))
+		nb := pf.Observe(d)
+		dispatch(nb)
+		waitStarted(nb) // frontier GETs are in flight before we read behind them
 		before := rec.uncov()
 		if _, err := bs.GetRange(ctx, k, d*mib, 4096, size); err != nil {
 			t.Fatalf("read block %d: %v", d, err)

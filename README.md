@@ -9,11 +9,22 @@ namespace directly. It writes nothing to the bucket, needs no sidecar objects,
 and serves all metadata (`readdir`, `lookup`, `getattr`, `open`) locally from an
 index after a one-time build.
 
+**Why "lith"?** As in *lithic* / *lithology* — rock strata. lith serves a
+bucket's objects as read-only strata, exactly as they were laid down: the
+bucket's native key layout is the stratum, and lith never rewrites it.
+
 ## What it is
 
 - **Read-only.** There is no write path. Every mutating operation returns `EROFS`.
 - **Native layout.** The bucket's keys *are* the filesystem. Any bucket, any producer.
 - **Local metadata.** After an index build, listing and stat make zero S3 calls.
+- **Mount any prefix.** Root the filesystem at any prefix below the bucket; one
+  prebuilt index backs many prefix mounts at once (`lith umount`/`lith mounts`
+  manage them).
+- **Prefetch that knows its limits.** A single memory-tier-bounded budget feeds
+  per-handle readahead, sibling readahead for chunked stores, a format-aware
+  plan (Zarr chunk grid), and parallel parts for mid-size files; the in-flight
+  window is sized from the NIC's baseline bandwidth.
 - **Fast.** Sequential throughput near NIC line rate; random reads bounded by
   cache hit rate, not S3 request latency.
 - A single static Go binary.
@@ -26,16 +37,26 @@ index after a one-time build.
 
 ## Install
 
+Download the static binary for your architecture (a stable name that always
+points at the latest release):
+
 ```
-go install github.com/scttfrdmn/lith/cmd/lith@latest
+# arm64 (Graviton, Apple-on-Linux VMs, …)
+curl -L https://github.com/scttfrdmn/lith/releases/latest/download/lith_linux_arm64 -o lith && chmod +x lith
+# or x86-64
+curl -L https://github.com/scttfrdmn/lith/releases/latest/download/lith_linux_amd64 -o lith && chmod +x lith
+sudo mv lith /usr/local/bin/
 ```
 
-Or download a static binary from the [releases](https://github.com/scttfrdmn/lith/releases) page.
+Versioned `.tar.gz` archives are on the [releases](https://github.com/scttfrdmn/lith/releases)
+page. Or, with Go: `go install github.com/scttfrdmn/lith/cmd/lith@latest`.
 
 ## Commands
 
 ```
 lith mount   s3://bucket[/prefix] /mnt/point [flags]   # mount as a read-only filesystem
+lith umount  /mnt/point [--all] [--force]              # unmount (SIGTERM, then fusermount fallback)
+lith mounts                                            # list live lith mounts (and stale records)
 lith index   build|refresh|inspect s3://bucket[/prefix] --index-file F
 lith bench   s3://bucket/key --pattern seq|rand4k|stride [--against PATH]
 lith version                                            # version, commit, build date
@@ -49,9 +70,11 @@ credentials:
 ```
 lith index build s3://1000genomes/changelog_details --index-file /tmp/1kg.lithidx --no-sign-request
 lith index inspect /tmp/1kg.lithidx
+sudo mkdir -p /mnt/1kg && sudo chown "$USER" /mnt/1kg   # you must own the mountpoint
 lith mount  s3://1000genomes/changelog_details /mnt/1kg --index-file /tmp/1kg.lithidx --no-sign-request
 ls -l /mnt/1kg
 cat /mnt/1kg/changelog_details_20081219
+lith umount /mnt/1kg
 ```
 
 ## Documentation

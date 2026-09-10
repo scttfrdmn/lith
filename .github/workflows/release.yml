@@ -10,7 +10,32 @@ permissions:
   contents: write
 
 jobs:
+  # Re-run the full CI gate for the tagged commit. A tag pushed to a commit that
+  # does not pass vet + lint + `go test -race` must produce no release assets, so
+  # goreleaser depends on this job (a tag push does not itself trigger ci.yml,
+  # which runs on branch pushes and PRs).
+  gate:
+    name: gate (vet, lint, test -race)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+      - name: go test -race
+        run: go test -race ./...
+
   goreleaser:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -27,6 +27,8 @@ jobs:
           version: v2.13.2
       - name: go test -race
         run: go test -race ./...
+      - name: fuzz the index parser (60s; committed corpus also runs above)
+        run: go test -run '^$' -fuzz 'FuzzParseIndex$' -fuzztime 60s ./internal/index/
 
   build:
     name: build ${{ matrix.goarch }}

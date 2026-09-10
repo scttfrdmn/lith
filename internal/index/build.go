@@ -129,7 +129,7 @@ func Build(entries []Entry, opts Options) *Index {
 	// 4. Pack the file arena and metadata; assign file inodes.
 	used := map[uint64]struct{}{0: {}, rootIno: {}}
 	n := len(final)
-	ix.offs = make([]uint32, n+1)
+	ix.offs = make([]uint64, n+1)
 	ix.sizes = make([]uint64, n)
 	ix.mtimes = make([]int64, n)
 	ix.etags = make([]uint64, n)
@@ -140,7 +140,7 @@ func Build(entries []Entry, opts Options) *Index {
 
 	var arena []byte
 	for i, e := range final {
-		ix.offs[i] = uint32(len(arena))
+		ix.offs[i] = uint64(len(arena))
 		arena = append(arena, e.Key...)
 		ix.sizes[i] = uint64(e.Size)
 		ix.mtimes[i] = e.MTime
@@ -148,7 +148,7 @@ func Build(entries []Entry, opts Options) *Index {
 		ix.inos[i] = ix.assignIno(hashKey(ix.prefix+e.Key), used)
 		accumulateDirs(dirMax, e.Key, e.MTime)
 	}
-	ix.offs[n] = uint32(len(arena))
+	ix.offs[n] = uint64(len(arena))
 	ix.arena = arena
 
 	// 5. Build the directory table: sorted paths, shared-namespace inodes, and
@@ -201,12 +201,12 @@ func (ix *Index) packDirs(dirMax map[string]int64, used map[uint64]struct{}) {
 	sort.Strings(dirs)
 
 	m := len(dirs)
-	ix.dirOffs = make([]uint32, m+1)
+	ix.dirOffs = make([]uint64, m+1)
 	ix.dirMtimes = make([]int64, m)
 	ix.dirInos = make([]uint64, m)
 	var arena []byte
 	for i, d := range dirs {
-		ix.dirOffs[i] = uint32(len(arena))
+		ix.dirOffs[i] = uint64(len(arena))
 		arena = append(arena, d...)
 		mt := dirMax[d]
 		if mt == 0 {
@@ -219,7 +219,7 @@ func (ix *Index) packDirs(dirMax map[string]int64, used map[uint64]struct{}) {
 		}
 		ix.dirInos[i] = ix.assignIno(hashKey(ix.prefix+d+"/"), used)
 	}
-	ix.dirOffs[m] = uint32(len(arena))
+	ix.dirOffs[m] = uint64(len(arena))
 	ix.dirArena = arena
 }
 

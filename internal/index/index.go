@@ -48,7 +48,7 @@ type Index struct {
 	// arena holds all sorted, relative keys concatenated. offs has len n+1;
 	// key i is arena[offs[i]:offs[i+1]].
 	arena []byte
-	offs  []uint32
+	offs  []uint64
 
 	// Parallel per-key metadata (SoA), each of length n.
 	sizes  []uint64
@@ -61,7 +61,7 @@ type Index struct {
 	// namespace as file inodes; mtimes are the max LastModified over each
 	// directory's descendants (falling back to buildTime).
 	dirArena  []byte
-	dirOffs   []uint32
+	dirOffs   []uint64
 	dirMtimes []int64  // Unix nanoseconds
 	dirInos   []uint64 // parallel to the dir table
 	buildTime int64    // Unix nanoseconds; mtime fallback for empty directories

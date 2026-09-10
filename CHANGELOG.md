@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-10
+
+Hardening and docs currency from an external review of v0.2.0. No new mechanisms.
+
+### Fixed
+
+- **The release workflow no longer publishes on a red commit** (#98): the tag
+  build now depends on a `gate` job that reruns the full CI suite (vet, lint,
+  `go test -race`) for the tagged SHA; goreleaser runs only if it passes. A tag
+  push does not itself trigger CI, so the gate lives in the release workflow.
+- **Flaky prefetch test** (#98): `TestPrefetchAheadCoversDemand` and
+  `TestMidFillUnblock` synchronized on the fake S3 signalling a GET in flight
+  (new `OnGetStart` hook) instead of sleeping; `-race -count=20` clean.
+- **`View.TotalSize` data race** (#102): the per-mount-root size is summed once
+  at `Root()` and read as an immutable field, so concurrent `StatFs` on a
+  prefix view is race-free (was a lazily-set field with no lock).
+- **The index deserializer now validates every length and arena offset against
+  the image before slicing** (#101): a malformed image returns `ErrCorruptIndex`
+  naming the byte offset instead of panicking. A fuzz test over the parser
+  (truncated + bit-flipped corpus) runs as a regression corpus in CI.
+- **Install one-liner** (#99): releases now also publish stable-name raw
+  binaries (`lith_linux_amd64`, `lith_linux_arm64`) alongside the versioned
+  `.tar.gz` archives, so `curl -L …/releases/latest/download/lith_linux_amd64`
+  works across releases.
+
+### Changed
+
+- **Index format → v3** (#101): the arena offset arrays (`offs`/`dirOffs`) widen
+  from `uint32` to `uint64`, lifting the ~4 GiB pathname-arena cap (measured
+  cost: +4.0 bytes/key, ~4.6%; the zero-copy mmap path is unchanged). v2 index
+  files are rejected on load with the rebuild message, as v1 → v2.
+- **Docs currency** (#100): Zarr numbers reconciled to the shipped tier-1
+  figures (~35 s cold vs ~25 s in-place s3fs, same box; grid-aware prefetch is
+  shipped, not future work), README command table and feature list updated to
+  v0.2, a "Why 'lith'" note added to the README and docs, and every page walked
+  against `--help` and the CHANGELOG (`mkdocs build --strict`).
+
+### Security
+
+- **SECURITY.md** (#100): dropped the `security@example.com` placeholder;
+  vulnerability reports go through GitHub private vulnerability reporting.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
@@ -221,6 +263,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/scttfrdmn/lith/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scttfrdmn/lith/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/lith/releases/tag/v0.1.0

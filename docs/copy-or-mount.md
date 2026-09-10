@@ -44,13 +44,20 @@ throughput-capped volume.
 
 **Many-small-object stores** — Zarr, sharded datasets read in key order. **The
 one shape where the answer is nuanced.** Reading these cold pays a serial S3
-round-trip per object. As of v0.2, sibling readahead ([#63](https://github.com/scttfrdmn/lith/issues/63))
-cut the Zarr yearly-mean cold read from **~40 s to ~24 s**, still above the
-**~10 s** an in-place `xarray`+`s3fs` reader manages by fetching all chunks
-concurrently; [#70](https://github.com/scttfrdmn/lith/issues/70) (chunk-grid–aware
-prefetch) targets parity. If you read one chunked store repeatedly and can
-afford the RAM, mount and let the warm cache serve reruns; if you read it once,
-cold, an async in-place reader is currently faster. <!-- number: session 17 -->
+round-trip per object. v0.2 shipped sibling readahead
+([#63](https://github.com/scttfrdmn/lith/issues/63)) and the first format-aware
+plan — chunk-grid–aware Zarr prefetch ([#70](https://github.com/scttfrdmn/lith/issues/70)
+tier 1, [#87](https://github.com/scttfrdmn/lith/issues/87)) that walks the grid
+in access order instead of flat key order. On the 1.4 TB `chrtout.zarr`
+yearly-mean the cold read is **~35 s**, versus **~25 s** for an in-place
+`xarray`+`s3fs` reader on the same box, same day (c8gd.4xlarge, us-east-1;
+`bench/results/apps.csv` @ `748b33d`). lith's prefetch runs deep and leads, but
+the uncovered chunks at 2-D grid boundaries each still pay a full cold GET on
+the app's bounded compute pool while s3fs fires the whole selection at once;
+closing that gap is #70 tier 2 (whole-selection / grid-plane prefetch). If you
+read one chunked store repeatedly and can afford the RAM, mount and let the warm
+cache serve reruns (**~22 s** warm); if you read it once, cold, an async
+in-place reader is currently a touch faster. <!-- number: apps.csv @748b33d (v0.2.0), sessions 19/21 -->
 
 ## The crossover, measured
 
