@@ -150,6 +150,9 @@ type rawFS struct {
 	sibPendingSet map[string]struct{} // sibling-prefetched keys not yet opened
 	sibPendingQ   []string            // FIFO of the same keys, bounded by sibPendingCap
 	sibPendingCap int
+
+	// Zarr grid-aware readahead state (#70 tier 1).
+	zarr *zarrState
 }
 
 // NewRawFileSystem builds the read-only RawFileSystem.
@@ -167,6 +170,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		nextFh:        1,
 		sibLastPos:    map[string]int{},
 		sibPendingSet: map[string]struct{}{},
+		zarr:          newZarrState(),
 	}
 	// Bound the pending-sibling tracker to a few readahead batches: a key that
 	// falls out of it without being opened is counted as an unread sibling.
@@ -314,7 +318,9 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 
 	// If this directory is being walked in key order, read ahead across the
 	// following siblings (#63).
-	f.maybeSiblingReadahead(n.path)
+	if !f.maybeZarrReadahead(n.path) {
+		f.maybeSiblingReadahead(n.path)
+	}
 
 	out.Fh = fh
 	out.OpenFlags = fuse.FOPEN_KEEP_CACHE // content is immutable

@@ -35,6 +35,7 @@ type Metrics struct {
 	pfEvictUnread prometheus.Counter
 	sibPrefetch   prometheus.Counter
 	sibUnread     prometheus.Counter
+	formatDetect  *prometheus.CounterVec
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -97,11 +98,22 @@ func New() *Metrics {
 		sibUnread: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_sibling_prefetch_unread_total", Help: "Sibling-prefetched objects that fell out of the pending window without being opened (#63 accuracy guardrail).",
 		}),
+		formatDetect: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_format_detect_total", Help: "Format-aware access plans detected, by format (#70).",
+		}, []string{"format"}),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread)
+		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect)
 	return m
+}
+
+// FormatDetect records that a format-aware plan was detected for an object
+// (#70). Nil-safe.
+func (m *Metrics) FormatDetect(format string) {
+	if m != nil {
+		m.formatDetect.WithLabelValues(format).Inc()
+	}
 }
 
 // SiblingPrefetch records n sibling objects dispatched by directory-walk
