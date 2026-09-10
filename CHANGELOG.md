@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+Remediation of an internal security audit (defensive hardening; no format change).
+
+- **`lith umount` no longer signals an unverified PID.** A mount record's PID is
+  signalled only if it is genuinely among the processes holding the mount open
+  (`fuser -m`), and mount records are read only from a runtime dir the current
+  user owns; otherwise umount falls through to `fusermount3 -u`. This closes a
+  local-multi-user vector where a planted record in a world-writable fallback dir
+  could induce `lith umount` (esp. as root) to SIGTERM an arbitrary PID.
+- **Runtime records and the disk cache are created private and ownership-checked.**
+  The per-user runtime dir and the disk-cache dir are created `0700` and refused
+  if they are a symlink or not owned by the current user; mount records are
+  written `0600`; the daemon log is per-uid, `0600`, and opened `O_NOFOLLOW`.
+- **`--endpoint` may not receive signed requests over plaintext.** A non-`https`
+  endpoint is rejected unless `--no-sign-request` is set, so SigV4-signed requests
+  (and the STS session token) are never sent in cleartext to an arbitrary host.
+- **Ranged GETs are validated.** A response that ignores the requested byte range
+  (returns the whole object) is rejected via its `Content-Range`, so offset-shifted
+  data can never be served as the requested range.
+- **`lith mounts`/`umount --all` match the exact `fuse.lith` fstype**, no longer a
+  substring, so unrelated FUSE mounts (`fuse.monolith`, …) are never touched.
+- **System helpers are resolved from a fixed trusted path** (`/usr/bin`, `/bin`,
+  `/usr/sbin`, `/sbin`) rather than `$PATH`.
+- **Keys containing C0 control bytes are rejected** at index build.
+- **The index is memory-mapped `MAP_PRIVATE`**, immune to post-validation mutation
+  of the backing file.
+
+### Fixed
+
+- **Truncated S3 responses are no longer cached or served as valid zeros.** A short
+  chunk read (dropped/partial transfer) now fails the fill instead of completing a
+  zero-padded buffer that was persisted to the memory and disk tiers and served as
+  authoritative on every later read.
+- **A crafted directory offset can no longer crash the mount.** `Readdir` clamps an
+  out-of-range cursor and the FUSE readdirplus path no longer underflows, closing a
+  local denial-of-service (out-of-bounds panic). FUSE query handlers also recover a
+  panic into `EIO` rather than tearing down the mount for all users.
+- **The S3 Inventory parser is bounded.** Manifest, per-file decompression, and total
+  entry count are capped, so a hostile or malformed inventory (gzip bomb, giant
+  manifest) errors instead of exhausting memory. Inventory keys are unescaped with
+  `PathUnescape` (a literal `+` is preserved) and a negative object size is rejected.
+
 ## [0.2.1] - 2026-09-10
 
 Hardening and docs currency from an external review of v0.2.0. No new mechanisms.

@@ -22,3 +22,17 @@ lith is read-only and writes nothing to the bucket. It does read S3 credentials
 from the standard AWS credential chain (unless `--no-sign-request` is used) and
 writes a local index and block cache to disk; the cache is not encrypted at rest
 (out of scope for v0.x).
+
+Operator responsibilities and trust boundaries:
+
+- **`--index-file` must be trusted and immutable for the mount's lifetime.** lith
+  memory-maps the index and serves the filesystem from it; a mutable or malicious
+  index is a data-integrity boundary. A malformed image is rejected
+  (`ErrCorruptIndex`) rather than trusted, but a semantically-crafted index is only
+  as trustworthy as its source.
+- **`--endpoint` must be `https` when requests are signed.** lith refuses a
+  non-HTTPS endpoint unless `--no-sign-request` is set, so credentials are never
+  sent in cleartext to an arbitrary host.
+- **`--allow-other` exposes the whole mounted subtree to every local user** (files
+  are world-readable `0444`/`0555` with no per-object access control), independent
+  of the underlying S3 ACLs. Use it only on hosts where that is acceptable.

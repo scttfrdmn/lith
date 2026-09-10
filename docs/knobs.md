@@ -77,7 +77,7 @@ Authentication, endpoint, and how files present to the OS.
 | `--endpoint` | (AWS) | Point at an S3-compatible store. |
 | `--path-style` | off | Path-style addressing for stores that need it. |
 | `--region` | (resolved) | Resolved from the bucket if empty. |
-| `--allow-other` | off | Let other users access the mount (needs `user_allow_other` in `/etc/fuse.conf`). |
+| `--allow-other` | off | Let other users access the mount (needs `user_allow_other` in `/etc/fuse.conf`). **Security:** files are world-readable (`0444`/`0555`) with no per-object access control, so this exposes the entire mounted subtree to every local user regardless of the bucket's S3 ACLs — enable it only where that is acceptable. |
 | `--uid` / `--gid` | your uid/gid | Owner reported for every file. |
 | `--exec` | off | Report files as mode `0555` instead of `0444` (executables on the mount). |
 
