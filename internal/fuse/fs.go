@@ -19,6 +19,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/scttfrdmn/lith/internal/blockstore"
 	"github.com/scttfrdmn/lith/internal/format/bgzf"
+	"github.com/scttfrdmn/lith/internal/format/footer"
 	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/prefetch"
@@ -139,6 +140,16 @@ type fileHandle struct {
 	// readahead window regardless — the Format layer only adds ranges, it never
 	// changes the detector (ruling 1); any overlap joins via the singleflight.
 	bgzfRanges []bgzf.Range
+	// footer-family tier-2 state (#108). footerKind is set at open when the key
+	// names a footer-family container; the parse (footerMeta/footerZip) is lazy
+	// on first read and shared across handles via footerState. footerParsed marks
+	// that a parse was attempted (nil result = tier 1 only).
+	footerKind    footer.Format
+	footerParsed  bool
+	footerMeta    *footer.ParquetMeta
+	footerProj    *footerProjection
+	footerZip     []footer.ZipEntry
+	footerLastZip int
 }
 
 type rawFS struct {
@@ -168,6 +179,9 @@ type rawFS struct {
 
 	// bgzf-family readahead state (#107).
 	bgzf *bgzfState
+
+	// footer-family readahead state (#108).
+	footer *footerState
 }
 
 // NewRawFileSystem builds the read-only RawFileSystem.
@@ -187,6 +201,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		sibPendingSet: map[string]struct{}{},
 		zarr:          newZarrState(),
 		bgzf:          newBgzfState(),
+		footer:        newFooterState(),
 	}
 	// Bound the pending-sibling tracker to a few readahead batches: a key that
 	// falls out of it without being opened is counted as an unread sibling.
@@ -343,6 +358,13 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// random protection (no scan window); an index file gets a whole-index +
 	// data-header prefetch. Detected from the Index (sibling presence), no S3 call.
 	bgzfHandled := f.maybeBgzfReadahead(n.path, h, fi.Size)
+	// footer-family tier 1 (#108): a columnar/archive container gets its footer
+	// (tail) + head prefetched at open; tier-2 projection/entry prefetch is
+	// driven from Read. Detected from the key extension, no S3 call.
+	footerHandled := false
+	if !bgzfHandled {
+		footerHandled = f.maybeFooterReadahead(n.path, h, fi.Size)
+	}
 
 	if fi.Size > f.partsThreshold() {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
@@ -353,7 +375,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 
 	// If this directory is being walked in key order, read ahead across the
 	// following siblings (#63). Skipped for bgzf (seek-driven) and Zarr (grid).
-	if !bgzfHandled && !f.maybeZarrReadahead(n.path) {
+	if !bgzfHandled && !footerHandled && !f.maybeZarrReadahead(n.path) {
 		f.maybeSiblingReadahead(n.path)
 	}
 
@@ -390,6 +412,11 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// tool's follow-on reads in that container/chunk are cache hits.
 	if len(h.bgzfRanges) > 0 {
 		f.bgzfSeekExtend(h, off)
+	}
+	// footer tier 2 (#108): prefetch this row group's projection columns
+	// (Parquet) or this/next zip entries so follow-on reads are cache hits.
+	if h.footerKind != footer.FormatNone {
+		f.footerReadExtend(h, off)
 	}
 
 	var res fuse.ReadResult
