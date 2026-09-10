@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-10
+
+Security release: two internal audit passes, fully remediated. Defensive hardening
+only — no on-disk format change, no new mechanisms.
+
 ### Security
 
 Remediation of an internal security audit (defensive hardening; no format change).
@@ -330,7 +335,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/scttfrdmn/lith/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scttfrdmn/lith/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scttfrdmn/lith/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/lith/releases/tag/v0.1.0
