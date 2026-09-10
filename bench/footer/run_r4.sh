@@ -22,6 +22,8 @@ MP=/mnt/nvme/mp; mkdir -p "$MP"; IDX=$W/r4.idx
 scrape(){ curl -s "http://127.0.0.1:$1/metrics" 2>/dev/null; }
 mval(){ awk -v k="$2" '$1==k{print $2}' <<<"$1"|tail -1; }
 mgets(){ awk '/^lith_s3_requests_total\{op="get"/{s+=$2} END{print s+0}' <<<"$1"; }
+IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -oP "dev \K\S+" | head -1)
+rx(){ cat /sys/class/net/$IFACE/statistics/rx_bytes; }
 now(){ date +%s.%N; }; el(){ awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f",b-a}'; }
 umount_mp(){ fusermount3 -u "$MP" 2>/dev/null; pkill -x lith 2>/dev/null; sleep 1; }
 mount_fresh(){ # bin extra port
@@ -66,20 +68,20 @@ conc_lith(){ # label bin extra port
 conc_pyarrow(){
   for rep in 1 2; do
     sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-    local t0; t0=$(now); pids=()
+    local r0; r0=$(rx); local t0; t0=$(now); pids=()
     for i in 0 1 2 3 4 5 6 7; do "$PY" "$Q" s3 "$BKT/$REL/${FILES[$i]}" >/dev/null 2>&1 & pids+=($!); done
     for p in "${pids[@]}"; do wait "$p"; done
-    local t1; t1=$(now)
-    echo "R4CONC|pyarrow-native|rep$rep|wall=$(el "$t0" "$t1")|s3_MB=NA|gets=NA"
+    local t1; t1=$(now); local r1; r1=$(rx)
+    echo "R4CONC|pyarrow-native|rep$rep|wall=$(el "$t0" "$t1")|s3_MB=$(awk -v a="$r0" -v b="$r1" 'BEGIN{printf "%.1f",(b-a)/1048576}')(rx)|gets=NA"
   done
 }
 single_pyarrow(){
   local colds=()
   for rep in 1 2 3; do
     sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-    local t0; t0=$(now); "$PY" "$Q" s3 "$BKT/$REL/${FILES[0]}" >/dev/null 2>&1; local t1; t1=$(now); colds+=("$(el "$t0" "$t1")")
+    local r0; r0=$(rx); local t0; t0=$(now); "$PY" "$Q" s3 "$BKT/$REL/${FILES[0]}" >/dev/null 2>&1; local t1; t1=$(now); local r1; r1=$(rx); colds+=("$(el "$t0" "$t1")"); rxmb=$(awk -v a="$r0" -v b="$r1" 'BEGIN{printf "%.1f",(b-a)/1048576}')
   done
-  echo "R4SINGLE|pyarrow-native|cold=${colds[0]},${colds[1]},${colds[2]}|warm=NA|s3_MB=NA|gets=NA|distinct_MB=NA|plan_ranges=NA"
+  echo "R4SINGLE|pyarrow-native|cold=${colds[0]},${colds[1]},${colds[2]}|warm=NA|s3_MB=$rxmb(rx)|gets=NA|distinct_MB=NA|plan_ranges=NA"
 }
 
 BM=/mnt/nvme/lith/bin/lith-main
