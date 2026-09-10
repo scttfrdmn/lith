@@ -4,11 +4,28 @@ package index
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"unsafe"
 )
+
+// ErrCorruptIndex is returned when an index image is malformed — a length or
+// offset in the header points outside the image, or an arena offset is out of
+// range. Parsing a corrupt image returns this error (wrapped, naming the byte
+// offset at fault); it never panics.
+var ErrCorruptIndex = errors.New("index: corrupt image")
+
+func corruptf(off int, format string, a ...any) error {
+	return fmt.Errorf("%w: offset %d: %s", ErrCorruptIndex, off, fmt.Sprintf(format, a...))
+}
+
+// inBounds reports whether [at, at+size) lies within a slice of length blen.
+// Overflow-safe for any int at, size (size <= blen-at avoids at+size wrap).
+func inBounds(blen, at, size int) bool {
+	return at >= 0 && size >= 0 && at <= blen && size <= blen-at
+}
 
 // The on-disk index format is lith-private and versioned. It carries no
 // compatibility promise before v1 (see the pinned Design issue, §10). Numeric
@@ -16,10 +33,12 @@ import (
 // and queried without copying; a mismatched byte order is rejected on load.
 //
 // v2 adds the directory table (sorted dir paths, per-directory inodes and
-// mtimes). v1 files are rejected with a message to rebuild.
+// mtimes). v3 widens the arena offset arrays (offs/dirOffs) from uint32 to
+// uint64 so the pathname arena is not capped at ~4 GiB. Older files are
+// rejected with a message to rebuild.
 
 // FormatVersion is the current on-disk index format version.
-const FormatVersion = 2
+const FormatVersion = 3
 
 const (
 	magic       = "LITHIDX1"
@@ -60,7 +79,7 @@ func (ix *Index) Marshal() []byte {
 	arenaAt := off + 8 // arenaLen(8) precedes the bytes
 	off = align8(arenaAt + len(ix.arena))
 	offsAt := off
-	off = align8(offsAt + (n+1)*4)
+	off = align8(offsAt + (n+1)*8)
 	sizesAt := off
 	off += n * 8
 	mtimesAt := off
@@ -72,7 +91,7 @@ func (ix *Index) Marshal() []byte {
 	dirArenaAt := off + 8 // dirArenaLen(8) precedes the bytes
 	off = align8(dirArenaAt + len(ix.dirArena))
 	dirOffsAt := off
-	off = align8(dirOffsAt + (m+1)*4)
+	off = align8(dirOffsAt + (m+1)*8)
 	dirMtimesAt := off
 	off += m * 8
 	dirInosAt := off
@@ -99,7 +118,7 @@ func (ix *Index) Marshal() []byte {
 
 	ne.PutUint64(buf[arenaAt-8:], uint64(len(ix.arena)))
 	copy(buf[arenaAt:], ix.arena)
-	copyU32(buf[offsAt:], ix.offs)
+	copyU64(buf[offsAt:], ix.offs)
 	copyU64(buf[sizesAt:], ix.sizes)
 	copyI64(buf[mtimesAt:], ix.mtimes)
 	copyU64(buf[etagsAt:], ix.etags)
@@ -107,7 +126,7 @@ func (ix *Index) Marshal() []byte {
 
 	ne.PutUint64(buf[dirArenaAt-8:], uint64(len(ix.dirArena)))
 	copy(buf[dirArenaAt:], ix.dirArena)
-	copyU32(buf[dirOffsAt:], ix.dirOffs)
+	copyU64(buf[dirOffsAt:], ix.dirOffs)
 	copyI64(buf[dirMtimesAt:], ix.dirMtimes)
 	copyU64(buf[dirInosAt:], ix.dirInos)
 	return buf
@@ -142,10 +161,10 @@ func (ix *Index) Save(path string) error {
 // they do not alias b; otherwise they point directly into b (mmap loader).
 func parse(b []byte, copyOut bool) (*Index, error) {
 	if len(b) < headerSize {
-		return nil, fmt.Errorf("index: image too small (%d bytes)", len(b))
+		return nil, corruptf(0, "image too small: %d bytes, header needs %d", len(b), headerSize)
 	}
 	if string(b[0:8]) != magic {
-		return nil, fmt.Errorf("index: bad magic")
+		return nil, corruptf(0, "bad magic")
 	}
 	ne := binary.NativeEndian
 	if v := ne.Uint32(b[8:]); v != formatVer {
@@ -155,8 +174,20 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 	if (flags>>1)&1 != hostByteOrder() {
 		return nil, fmt.Errorf("index: image byte order does not match host; rebuild the index")
 	}
-	n := int(ne.Uint64(b[16:]))
-	m := int(ne.Uint64(b[48:]))
+	blen := len(b)
+	// Element counts come from the (attacker-controllable) header. Each key
+	// costs >= 8 bytes (offs) and each dir >= 8 (dirOffs), so a count larger
+	// than the whole image is impossible; reject early so (n+1)*8 below cannot
+	// overflow int.
+	nRaw := ne.Uint64(b[16:])
+	mRaw := ne.Uint64(b[48:])
+	if nRaw > uint64(blen) {
+		return nil, corruptf(16, "key count %d exceeds image size %d", nRaw, blen)
+	}
+	if mRaw > uint64(blen) {
+		return nil, corruptf(48, "dir count %d exceeds image size %d", mRaw, blen)
+	}
+	n, m := int(nRaw), int(mRaw)
 
 	ix := &Index{
 		execMode:   flags&flagExec != 0,
@@ -165,78 +196,147 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 		collisions: ne.Uint64(b[40:]),
 	}
 
+	// bucket + prefix: length-prefixed strings.
 	p := headerSize
-	blen := int(ne.Uint32(b[p:]))
+	if !inBounds(blen, p, 4) {
+		return nil, corruptf(p, "truncated before bucket length")
+	}
+	bkLen := int(ne.Uint32(b[p:]))
 	p += 4
-	ix.bucket = string(b[p : p+blen])
-	p += blen
+	if !inBounds(blen, p, bkLen) {
+		return nil, corruptf(p, "bucket length %d runs past end of image (%d left)", bkLen, blen-p)
+	}
+	ix.bucket = string(b[p : p+bkLen])
+	p += bkLen
+	if !inBounds(blen, p, 4) {
+		return nil, corruptf(p, "truncated before prefix length")
+	}
 	plen := int(ne.Uint32(b[p:]))
 	p += 4
+	if !inBounds(blen, p, plen) {
+		return nil, corruptf(p, "prefix length %d runs past end of image (%d left)", plen, blen-p)
+	}
 	ix.prefix = string(b[p : p+plen])
 	p += plen
 	p = align8(p)
 
+	// arena (length-prefixed).
+	if !inBounds(blen, p, 8) {
+		return nil, corruptf(p, "truncated before arena length")
+	}
 	arenaLen := int(ne.Uint64(b[p:]))
 	arenaAt := p + 8
+	if arenaLen < 0 || !inBounds(blen, arenaAt, arenaLen) {
+		return nil, corruptf(p, "arena length %d runs past end of image (%d left)", arenaLen, blen-arenaAt)
+	}
 	p = align8(arenaAt + arenaLen)
+
+	// Per-key arrays. Validate every region against the image before slicing.
 	offsAt := p
-	p = align8(offsAt + (n+1)*4)
+	if !inBounds(blen, offsAt, (n+1)*8) {
+		return nil, corruptf(offsAt, "offs array (%d entries) runs past end of image", n+1)
+	}
+	p = align8(offsAt + (n+1)*8)
 	sizesAt := p
+	if !inBounds(blen, sizesAt, n*8) {
+		return nil, corruptf(sizesAt, "sizes array runs past end of image")
+	}
 	p += n * 8
 	mtimesAt := p
+	if !inBounds(blen, mtimesAt, n*8) {
+		return nil, corruptf(mtimesAt, "mtimes array runs past end of image")
+	}
 	p += n * 8
 	etagsAt := p
+	if !inBounds(blen, etagsAt, n*8) {
+		return nil, corruptf(etagsAt, "etags array runs past end of image")
+	}
 	p += n * 8
 	inosAt := p
+	if !inBounds(blen, inosAt, n*8) {
+		return nil, corruptf(inosAt, "inos array runs past end of image")
+	}
 	p = align8(inosAt + n*8)
 
+	// dir arena (length-prefixed).
+	if !inBounds(blen, p, 8) {
+		return nil, corruptf(p, "truncated before dir arena length")
+	}
 	dirArenaLen := int(ne.Uint64(b[p:]))
 	dirArenaAt := p + 8
+	if dirArenaLen < 0 || !inBounds(blen, dirArenaAt, dirArenaLen) {
+		return nil, corruptf(p, "dir arena length %d runs past end of image (%d left)", dirArenaLen, blen-dirArenaAt)
+	}
 	p = align8(dirArenaAt + dirArenaLen)
+
 	dirOffsAt := p
-	p = align8(dirOffsAt + (m+1)*4)
+	if !inBounds(blen, dirOffsAt, (m+1)*8) {
+		return nil, corruptf(dirOffsAt, "dirOffs array (%d entries) runs past end of image", m+1)
+	}
+	p = align8(dirOffsAt + (m+1)*8)
 	dirMtimesAt := p
+	if !inBounds(blen, dirMtimesAt, m*8) {
+		return nil, corruptf(dirMtimesAt, "dir mtimes array runs past end of image")
+	}
 	p += m * 8
 	dirInosAt := p
-	p += m * 8
-	if len(b) < p {
-		return nil, fmt.Errorf("index: image truncated (want %d, have %d)", p, len(b))
+	if !inBounds(blen, dirInosAt, m*8) {
+		return nil, corruptf(dirInosAt, "dir inos array runs past end of image")
 	}
 
 	if copyOut {
 		ix.arena = append([]byte(nil), b[arenaAt:arenaAt+arenaLen]...)
-		ix.offs = append([]uint32(nil), asU32(b[offsAt:], n+1)...)
+		ix.offs = append([]uint64(nil), asU64(b[offsAt:], n+1)...)
 		ix.sizes = append([]uint64(nil), asU64(b[sizesAt:], n)...)
 		ix.mtimes = append([]int64(nil), asI64(b[mtimesAt:], n)...)
 		ix.etags = append([]uint64(nil), asU64(b[etagsAt:], n)...)
 		ix.inos = append([]uint64(nil), asU64(b[inosAt:], n)...)
 		ix.dirArena = append([]byte(nil), b[dirArenaAt:dirArenaAt+dirArenaLen]...)
-		ix.dirOffs = append([]uint32(nil), asU32(b[dirOffsAt:], m+1)...)
+		ix.dirOffs = append([]uint64(nil), asU64(b[dirOffsAt:], m+1)...)
 		ix.dirMtimes = append([]int64(nil), asI64(b[dirMtimesAt:], m)...)
 		ix.dirInos = append([]uint64(nil), asU64(b[dirInosAt:], m)...)
 	} else {
 		ix.arena = b[arenaAt : arenaAt+arenaLen]
-		ix.offs = asU32(b[offsAt:], n+1)
+		ix.offs = asU64(b[offsAt:], n+1)
 		ix.sizes = asU64(b[sizesAt:], n)
 		ix.mtimes = asI64(b[mtimesAt:], n)
 		ix.etags = asU64(b[etagsAt:], n)
 		ix.inos = asU64(b[inosAt:], n)
 		ix.dirArena = b[dirArenaAt : dirArenaAt+dirArenaLen]
-		ix.dirOffs = asU32(b[dirOffsAt:], m+1)
+		ix.dirOffs = asU64(b[dirOffsAt:], m+1)
 		ix.dirMtimes = asI64(b[dirMtimesAt:], m)
 		ix.dirInos = asU64(b[dirInosAt:], m)
+	}
+
+	// Validate arena offsets so later arena[offs[i]:offs[i+1]] slicing (Key,
+	// dirName, Readdir) cannot panic on a bit-flipped offset: each must be
+	// monotonic non-decreasing and bounded by its arena length.
+	if err := validateOffsets(ix.offs, arenaLen, offsAt); err != nil {
+		return nil, err
+	}
+	if err := validateOffsets(ix.dirOffs, dirArenaLen, dirOffsAt); err != nil {
+		return nil, err
 	}
 	return ix, nil
 }
 
-// --- unsafe reinterpretation helpers (host byte order) ---
-
-func asU32(b []byte, n int) []uint32 {
-	if n == 0 {
-		return nil
+// validateOffsets checks that offs is monotonic non-decreasing and every entry
+// is <= arenaLen (so arena[offs[i]:offs[i+1]] is always a valid sub-slice).
+func validateOffsets(offs []uint64, arenaLen, baseAt int) error {
+	prev := uint64(0)
+	for i, o := range offs {
+		if o > uint64(arenaLen) {
+			return corruptf(baseAt+i*8, "arena offset %d exceeds arena length %d", o, arenaLen)
+		}
+		if o < prev {
+			return corruptf(baseAt+i*8, "arena offset %d not monotonic (previous %d)", o, prev)
+		}
+		prev = o
 	}
-	return unsafe.Slice((*uint32)(unsafe.Pointer(&b[0])), n)
+	return nil
 }
+
+// --- unsafe reinterpretation helpers (host byte order) ---
 
 func asU64(b []byte, n int) []uint64 {
 	if n == 0 {
@@ -250,13 +350,6 @@ func asI64(b []byte, n int) []int64 {
 		return nil
 	}
 	return unsafe.Slice((*int64)(unsafe.Pointer(&b[0])), n)
-}
-
-func copyU32(dst []byte, src []uint32) {
-	if len(src) == 0 {
-		return
-	}
-	copy(dst, unsafe.Slice((*byte)(unsafe.Pointer(&src[0])), len(src)*4))
 }
 
 func copyU64(dst []byte, src []uint64) {

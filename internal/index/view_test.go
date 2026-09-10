@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
 )
 
@@ -128,4 +129,31 @@ func TestViewNeighborhoodInRoot(t *testing.T) {
 	if got := view.Neighborhood("/c3", 10); len(got) != 0 {
 		t.Fatalf("Neighborhood(/c3) = %v, want empty (root boundary)", got)
 	}
+}
+
+// TestViewTotalSizeConcurrent: TotalSize (what FUSE StatFs reads) must be
+// race-free under concurrent access — it is computed once at Root() and read as
+// an immutable field, not lazily set on first call (session 23).
+func TestViewTotalSizeConcurrent(t *testing.T) {
+	whole := build("", "a/b/x", "a/b/y", "a/b/sub/z", "a/c/other")
+	r, err := whole.Root("a/b/")
+	if err != nil {
+		t.Fatalf("Root: %v", err)
+	}
+	want := r.TotalSize()
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if got := r.TotalSize(); got != want {
+					t.Errorf("TotalSize = %d, want %d", got, want)
+					return
+				}
+				_ = r.Len()
+			}
+		}()
+	}
+	wg.Wait()
 }

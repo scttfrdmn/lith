@@ -47,6 +47,12 @@ type Server struct {
 	// observe per-chunk (mid-fill) completion order.
 	StreamChunkDelay time.Duration
 	StreamChunkBytes int64
+	// OnGetStart, if set, is called at the start of each GetRange/
+	// GetRangeReader — after the call is counted and the requested range is
+	// known, before any GetDelay — so tests can synchronize on a GET being in
+	// flight (the run's chunks already claimed) instead of sleeping. Called
+	// without the server lock held; keep it non-blocking.
+	OnGetStart func(key string, off, length int64)
 }
 
 // New returns an empty fake server.
@@ -178,7 +184,11 @@ func (s *Server) GetRange(_ context.Context, key string, off, length int64) ([]b
 	s.mu.Lock()
 	s.GetCalls++
 	delay := s.GetDelay
+	hook := s.OnGetStart
 	s.mu.Unlock()
+	if hook != nil {
+		hook(key, off, length)
+	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -213,7 +223,11 @@ func (s *Server) GetRangeReader(_ context.Context, key string, off, length int64
 		s.GetBytes += length
 	}
 	delay, chunk, startDelay := s.StreamChunkDelay, s.StreamChunkBytes, s.GetDelay
+	hook := s.OnGetStart
 	s.mu.Unlock()
+	if hook != nil {
+		hook(key, off, length)
+	}
 	if startDelay > 0 {
 		time.Sleep(startDelay)
 	}

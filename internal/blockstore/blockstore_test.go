@@ -94,6 +94,17 @@ func TestMidFillUnblock(t *testing.T) {
 	// completes before the whole run (chunk 31) does, because it lands earlier
 	// in the same stream. Per-chunk sleeps are wall-clock, so chunk 20 also
 	// cannot complete "instantly" — it must have waited for streaming.
+	// Wait for the fill's GET to start rather than sleeping: ensureChunks claims
+	// the whole run's chunks (0..31) before calling GetRangeReader, so once
+	// OnGetStart fires the demand read below is guaranteed to join the in-flight
+	// fill (deterministic under -race -count=N).
+	getStarted := make(chan struct{}, 1)
+	srv.OnGetStart = func(string, int64, int64) {
+		select {
+		case getStarted <- struct{}{}:
+		default:
+		}
+	}
 	var prefetchDone time.Time
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -102,7 +113,7 @@ func TestMidFillUnblock(t *testing.T) {
 		bs.Prefetch(context.Background(), k, 0, size) // slow fill of chunks 0..31
 		prefetchDone = time.Now()
 	}()
-	time.Sleep(40 * time.Millisecond) // let the prefetch claim all chunks
+	<-getStarted // the fill's GET is in flight; all 32 chunks are claimed
 
 	start := time.Now()
 	data, err := bs.GetRange(context.Background(), k, 20*mib, 4096, size)

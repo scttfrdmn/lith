@@ -27,9 +27,15 @@ builds:
       - -X github.com/scttfrdmn/lith/internal/version.Date={{ .Date }}
 
 archives:
+  # Versioned tar.gz archives (the durable, reproducible artifact).
   - id: lith
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  # Stable-name raw binaries so the docs' copy-pasteable one-liner works
+  # unchanged across releases (curl -L .../lith_linux_amd64 -o lith).
+  - id: lith-binary
+    formats: [binary]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"

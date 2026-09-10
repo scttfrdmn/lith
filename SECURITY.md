@@ -7,11 +7,10 @@ lith is pre-1.0. Security fixes are made against the latest tagged release and
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately. Do **not** open a public
-issue for a security report.
-
-- Preferred: [GitHub private vulnerability reporting](https://github.com/scttfrdmn/lith/security/advisories/new).
-- Email: `security@example.com` *(placeholder — replace before v0.1.0)*.
+Please report suspected vulnerabilities privately, through
+[GitHub private vulnerability reporting](https://github.com/scttfrdmn/lith/security/advisories/new)
+(the repository's Security tab → "Report a vulnerability"). Do **not** open a
+public issue for a security report.
 
 Please include a description, reproduction steps, and the affected version or
 commit. We will acknowledge receipt within a few business days and keep you

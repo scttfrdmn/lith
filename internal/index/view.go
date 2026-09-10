@@ -41,12 +41,11 @@ var ErrRootOutside = errors.New("index: requested mount root not contained by in
 // [lo,hi) arena range is the position span of keys under `sub`, found by binary
 // search; sub == "" is a pass-through view equal to the index itself.
 type View struct {
-	ix       *Index
-	sub      string // requested root relative to ix.prefix, "" or "c/d/"
-	root     string // full bucket prefix: ix.prefix + sub
-	lo, hi   int    // arena range of keys under sub
-	totalOne int64
-	haveTot  bool
+	ix     *Index
+	sub    string // requested root relative to ix.prefix, "" or "c/d/"
+	root   string // full bucket prefix: ix.prefix + sub
+	lo, hi int    // arena range of keys under sub
+	total  int64  // sum of sizes over [lo,hi), computed once at Root() (immutable)
 }
 
 // Root returns a Reader rooted at mountPrefix (a full bucket prefix). It
@@ -67,7 +66,13 @@ func (ix *Index) Root(mountPrefix string) (Reader, error) {
 	if hi <= lo {
 		return nil, fmt.Errorf("no objects under mount root %q", mp)
 	}
-	return &View{ix: ix, sub: sub, root: mp, lo: lo, hi: hi}, nil
+	// Sum sizes once, here, so TotalSize is an immutable field read — StatFs is
+	// called concurrently and a lazy set would race (no lock on the read path).
+	var total int64
+	for i := lo; i < hi; i++ {
+		total += int64(ix.sizes[i])
+	}
+	return &View{ix: ix, sub: sub, root: mp, lo: lo, hi: hi, total: total}, nil
 }
 
 // prefixUpperBound returns the smallest string greater than every string with
@@ -100,16 +105,7 @@ func (v *View) Bucket() string { return v.ix.bucket }
 func (v *View) Prefix() string { return v.root }
 func (v *View) Len() int       { return v.hi - v.lo }
 
-func (v *View) TotalSize() int64 {
-	if !v.haveTot {
-		var t int64
-		for i := v.lo; i < v.hi; i++ {
-			t += int64(v.ix.sizes[i])
-		}
-		v.totalOne, v.haveTot = t, true
-	}
-	return v.totalOne
-}
+func (v *View) TotalSize() int64 { return v.total }
 
 func (v *View) Stat(path string) (FileInfo, error)   { return v.ix.Stat(v.abs(path)) }
 func (v *View) Lookup(path string) (FileInfo, error) { return v.ix.Stat(v.abs(path)) }

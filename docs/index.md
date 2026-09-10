@@ -5,6 +5,10 @@ Data bucket. You need a Linux box (lith uses FUSE) and `samtools` for the last
 step. Nothing is written to the bucket; nothing but an index file is written
 locally.
 
+*Why "lith"?* As in *lithic* / *lithology* — rock strata. lith serves a bucket's
+objects as read-only strata, exactly as they were laid down; the bucket's native
+key layout is the stratum, and lith never rewrites it.
+
 ## 1. Install
 
 Download the static binary for your architecture from the
