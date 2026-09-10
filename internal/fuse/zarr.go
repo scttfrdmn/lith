@@ -3,97 +3,63 @@
 package fuse
 
 import (
-	"encoding/json"
 	"path"
-	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/scttfrdmn/lith/internal/blockstore"
+	fzarr "github.com/scttfrdmn/lith/internal/format/zarr"
 )
 
-// Zarr grid-aware readahead (#70 tier 1) — the smallest useful Format plan.
+// Zarr grid-aware readahead (#70). A chunked store (Zarr) is many small objects
+// named by their grid coordinates (`<dir>/i.j.k`). Key-order sibling readahead
+// (#63) walks only the last axis; when the app walks another axis every step is
+// an uncovered miss.
 //
-// A chunked store (Zarr) is many small objects named by their grid coordinates,
-// e.g. a variable's chunks are `<dir>/i.j.k`. Key-order sibling readahead (#63)
-// prefetches the next keys lexically, which walks only the *last* axis; when the
-// app walks a different axis (a year over the time axis, say) the next chunk it
-// needs is `i+1.j.k`, not the next key `i.j.k+1`, so every axis step is an
-// uncovered miss (#63's residual). This shapes readahead to the chunk grid
-// instead: detect the variable is Zarr from a `.zarray` sibling (Index-only, no
-// S3), read the grid once, infer which axis the app is walking from the last two
-// opens, and prefetch the next N chunks along that axis in grid order.
+// Tier 1 (#87): infer the walked axis from the last two opens and prefetch the
+// next N chunks along it. It still stalls the app's bounded worker pool at every
+// grid-row boundary (session-21 diagnosis).
 //
-// Detect = "a `.zarray` sibling exists"; Plan = "next N chunks along the walked
-// axis". Both are cheap and budget-bounded through Limits; the
-// lith_sibling_prefetch_unread_total guardrail applies unchanged.
+// Tier 2 (#70, #109): after K opens, classify each axis as fixed or varying and
+// prefetch the whole **plane** (the selection) — not the walk. An open outside
+// the plane re-plans. The plane is issued in walk order, budget-bounded through
+// Limits and via the parts path, and the sibling-unread guardrail applies. The
+// grid comes from the store's consolidated `.zmetadata` (one small object) with
+// a per-array `.zarray` fallback. Metadata is attacker-controlled and parsed
+// under the #101 rule (size cap, bounds-checked, fuzzed) in internal/format/zarr.
 
-// zarrGrid is the chunk-grid shape of one Zarr variable directory: dims[i] is
-// the number of chunks along axis i (ceil(shape[i]/chunks[i])).
-type zarrGrid struct {
-	dims []int
-}
+const (
+	zarrK        = fzarr.DefaultK        // opens before axis classification
+	zarrMinPlane = fzarr.DefaultMinPlane // below this, tier-1 line behavior
+)
 
-// zarrState caches, per directory, the parsed grid (nil once we've decided the
-// dir is not a parseable Zarr variable) and the last chunk coordinates opened
-// there. Guarded by its own mutex.
+// zarrState caches, per array directory, the parsed grid and the tier-2 planner,
+// plus per-store consolidated metadata. Guarded by its own mutex.
 type zarrState struct {
 	mu      sync.Mutex
-	grid    map[string]*zarrGrid // dir -> grid; entry present with nil = "not zarr"
-	last    map[string][]int     // dir -> last chunk coords seen
-	checked map[string]bool      // dir -> we've attempted .zarray detection
+	grid    map[string]*fzarr.Grid     // dir -> grid; entry present with nil = "not zarr"
+	checked map[string]bool            // dir -> we've attempted grid detection
+	last    map[string][]int           // dir -> last chunk coords (tier-1 fallback)
+	planner map[string]*fzarr.Planner  // dir -> tier-2 planner
+	issued  map[string]map[string]bool // dir -> chunk basenames already plane-dispatched
+	// consolidated caches parsed .zmetadata per store root; consChecked marks a
+	// store root as already attempted (so a missing .zmetadata is not re-read).
+	consChecked map[string]bool
 }
 
 func newZarrState() *zarrState {
-	return &zarrState{grid: map[string]*zarrGrid{}, last: map[string][]int{}, checked: map[string]bool{}}
+	return &zarrState{
+		grid: map[string]*fzarr.Grid{}, checked: map[string]bool{},
+		last: map[string][]int{}, planner: map[string]*fzarr.Planner{},
+		issued: map[string]map[string]bool{}, consChecked: map[string]bool{},
+	}
 }
 
-// chunkCoords parses a Zarr v2 chunk basename ("0.0.5") into integer grid
-// coordinates. Returns false for metadata (".zarray") or non-chunk names.
-func chunkCoords(base string) ([]int, bool) {
-	if base == "" || strings.HasPrefix(base, ".") {
-		return nil, false
-	}
-	parts := strings.Split(base, ".")
-	c := make([]int, len(parts))
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
-			return nil, false
-		}
-		c[i] = n
-	}
-	return c, true
-}
-
-// parseZarray reads shape/chunks from a .zarray JSON body and returns the grid
-// (number of chunks per axis). It is lenient: any structural problem yields
-// (nil,false) so the caller falls back to key-order readahead silently.
-func parseZarray(body []byte) (*zarrGrid, bool) {
-	var z struct {
-		Shape  []int64 `json:"shape"`
-		Chunks []int64 `json:"chunks"`
-	}
-	if json.Unmarshal(body, &z) != nil {
-		return nil, false
-	}
-	if len(z.Shape) == 0 || len(z.Shape) != len(z.Chunks) {
-		return nil, false
-	}
-	dims := make([]int, len(z.Shape))
-	for i := range z.Shape {
-		if z.Chunks[i] <= 0 || z.Shape[i] < 0 {
-			return nil, false
-		}
-		dims[i] = int((z.Shape[i] + z.Chunks[i] - 1) / z.Chunks[i]) // ceil
-	}
-	return &zarrGrid{dims: dims}, true
-}
-
-// gridFor returns the cached grid for dir, reading and parsing <dir>/.zarray on
-// first use. A nil grid (cached) means "not a Zarr variable" — detection is by
-// the Index alone (no S3) except for the one-time .zarray read.
-func (f *rawFS) gridFor(dir string) *zarrGrid {
+// gridFor returns the cached chunk grid for an array directory, detecting it on
+// first use from the store's consolidated `.zmetadata` (preferred, one object
+// for the whole store) or the per-array `.zarray`. A nil grid (cached) means
+// "not a parseable Zarr variable". Detection reads at most one small object per
+// store (`.zmetadata`) or per dir (`.zarray`).
+func (f *rawFS) gridFor(dir string) *fzarr.Grid {
 	f.zarr.mu.Lock()
 	if f.zarr.checked[dir] {
 		g := f.zarr.grid[dir]
@@ -102,16 +68,9 @@ func (f *rawFS) gridFor(dir string) *zarrGrid {
 	}
 	f.zarr.mu.Unlock()
 
-	var g *zarrGrid
-	rel := path.Join(dir, ".zarray") // "" dir -> ".zarray"
-	if fi, err := f.ix.Stat("/" + rel); err == nil && !fi.IsDir && fi.Size > 0 && fi.Size < 1<<20 {
-		f.met.FormatDetect("zarr")
-		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
-		if body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size); err == nil {
-			if parsed, ok := parseZarray(body); ok {
-				g = parsed
-			}
-		}
+	g := f.consolidatedGrid(dir)
+	if g == nil {
+		g = f.zarrayGrid(dir)
 	}
 	f.zarr.mu.Lock()
 	f.zarr.checked[dir] = true
@@ -120,52 +79,188 @@ func (f *rawFS) gridFor(dir string) *zarrGrid {
 	return g
 }
 
-// maybeZarrReadahead handles the open of a Zarr chunk with grid-aware readahead.
-// It returns true when the directory is a Zarr variable (so the caller must NOT
-// also run key-order sibling readahead, which is wrong for a chunk grid), and
-// false when the dir is not Zarr (fall back to key-order).
+// consolidatedGrid finds the store root for dir (the nearest ancestor with a
+// `.zmetadata`), parses it once (size-capped), caches every array's grid keyed
+// by its full directory, and returns the grid for dir (or nil).
+func (f *rawFS) consolidatedGrid(dir string) *fzarr.Grid {
+	// Walk up from dir looking for a `.zmetadata`, bounded.
+	root := ""
+	found := false
+	cur := dir
+	for i := 0; i < 16; i++ {
+		rel := path.Join(cur, ".zmetadata")
+		if fi, err := f.ix.Stat("/" + rel); err == nil && !fi.IsDir && fi.Size > 0 && fi.Size < fzarr.MaxConsolidatedBytes {
+			root, found = cur, true
+			break
+		}
+		if cur == "" {
+			break
+		}
+		cur = dirOf(cur)
+	}
+	if !found {
+		return nil
+	}
+
+	f.zarr.mu.Lock()
+	already := f.zarr.consChecked[root]
+	f.zarr.mu.Unlock()
+	if already {
+		f.zarr.mu.Lock()
+		g := f.zarr.grid[dir]
+		f.zarr.mu.Unlock()
+		return g
+	}
+
+	rel := path.Join(root, ".zmetadata")
+	fi, err := f.ix.Stat("/" + rel)
+	if err != nil {
+		return nil
+	}
+	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+	body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size)
+	if err != nil {
+		return nil
+	}
+	grids, ok := fzarr.ParseConsolidated(body)
+	f.zarr.mu.Lock()
+	f.zarr.consChecked[root] = true
+	if ok {
+		f.met.FormatDetect("zarr")
+		for arrayDir, g := range grids {
+			full := path.Join(root, arrayDir) // arrayDir is relative to the store root
+			f.zarr.checked[full] = true
+			f.zarr.grid[full] = g
+		}
+	}
+	g := f.zarr.grid[dir]
+	f.zarr.mu.Unlock()
+	return g
+}
+
+// zarrayGrid reads and parses <dir>/.zarray (the per-array fallback).
+func (f *rawFS) zarrayGrid(dir string) *fzarr.Grid {
+	rel := path.Join(dir, ".zarray") // "" dir -> ".zarray"
+	fi, err := f.ix.Stat("/" + rel)
+	if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size >= fzarr.MaxConsolidatedBytes {
+		return nil
+	}
+	f.met.FormatDetect("zarr")
+	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+	body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size)
+	if err != nil {
+		return nil
+	}
+	if g, ok := fzarr.ParseArray(body); ok {
+		return g
+	}
+	return nil
+}
+
+// maybeZarrReadahead handles the open of a Zarr chunk. It returns true when the
+// directory is a Zarr variable (so the caller must NOT also run key-order
+// sibling readahead), and false when the dir is not Zarr (fall back to
+// key-order). Tier 2 prefetches the classified plane; before K opens, or for a
+// plane below the minimum, it falls back to tier-1 line readahead.
 func (f *rawFS) maybeZarrReadahead(relPath string) bool {
 	if f.cfg.SiblingReadahead <= 0 || f.cfg.Limits == nil {
 		return false
 	}
 	base := path.Base(relPath)
-	coords, ok := chunkCoords(base)
+	coords, ok := fzarr.ParseCoords(base)
 	if !ok {
 		return false // not a chunk name
 	}
 	dir := dirOf(relPath)
 	grid := f.gridFor(dir)
-	if grid == nil || len(grid.dims) != len(coords) {
+	if grid == nil || len(grid.Dims) != len(coords) {
 		return false // not a parseable Zarr variable -> key-order fallback
 	}
 
-	// Infer the walked axis from the last two opens in this dir: the single axis
-	// whose coordinate advanced. Ambiguous (0 or >1 axes changed) -> prefetch
-	// nothing this open, but still claim it (don't do key-order for a Zarr dir).
-	f.zarr.mu.Lock()
-	last := f.zarr.last[dir]
-	f.zarr.last[dir] = coords
-	f.zarr.mu.Unlock()
 	f.sibMu.Lock()
 	f.markSiblingUsedLocked(relPath)
 	f.sibMu.Unlock()
 
-	// When the walked axis is ambiguous (first open, backward, or >1 axis moved),
-	// fall back to key-order sibling readahead (#63) rather than prefetching
-	// nothing — for a Zarr chunk grid, key order walks the last axis, which is
-	// still useful and never worse than idle.
-	if walkedAxis(coords, last) == -1 {
-		return false
+	// Tier 2: feed the open to the per-dir planner and get the plane to prefetch.
+	f.zarr.mu.Lock()
+	last := f.zarr.last[dir]
+	f.zarr.last[dir] = coords
+	pl := f.zarr.planner[dir]
+	if pl == nil {
+		pl = fzarr.NewPlanner(grid.Dims, zarrK, zarrMinPlane)
+		f.zarr.planner[dir] = pl
 	}
-	// Prefetch the next N chunks along the walked axis, in grid order.
-	for _, rel := range planZarrChunks(dir, coords, last, grid, f.cfg.SiblingReadahead) {
+	plan, replanned := pl.Observe(coords)
+	if replanned {
+		f.zarr.issued[dir] = map[string]bool{} // new plane -> re-issue fresh
+	}
+	issuedSet := f.zarr.issued[dir]
+	if issuedSet == nil {
+		issuedSet = map[string]bool{}
+		f.zarr.issued[dir] = issuedSet
+	}
+	// Snapshot the chunks to dispatch (in plan order) that we haven't issued yet.
+	var todo [][]int
+	for _, c := range plan {
+		if !issuedSet[fzarr.FormatCoords(c)] {
+			todo = append(todo, c)
+		}
+	}
+	f.zarr.mu.Unlock()
+
+	if replanned {
+		f.met.FormatReplan()
+	}
+
+	if plan == nil {
+		// Not enough opens yet, or plane below the minimum: tier-1 line behavior.
+		return f.zarrTier1(dir, coords, last, grid)
+	}
+
+	// Dispatch the plane in walk order, budget-bounded via the parts path.
+	var dispatched []string
+	issued := 0
+	for _, c := range todo {
+		rel := path.Join(dir, fzarr.FormatCoords(c))
 		fi, err := f.ix.Stat("/" + rel)
 		if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size > f.cfg.SmallFile {
-			continue // missing or too large to whole-fetch
+			continue
 		}
 		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
 		if !f.prefetchWhole(key, fi.Size) {
-			break // budget exhausted
+			break // budget exhausted: the rest is offered again as chunks are consumed
+		}
+		f.noteSiblingIssued(rel)
+		dispatched = append(dispatched, fzarr.FormatCoords(c))
+		issued++
+	}
+	if issued > 0 {
+		f.met.FormatPlaneChunks(int64(issued))
+		f.zarr.mu.Lock()
+		for _, k := range dispatched {
+			f.zarr.issued[dir][k] = true
+		}
+		f.zarr.mu.Unlock()
+	}
+	return true
+}
+
+// zarrTier1 is the tier-1 fallback: prefetch the next N chunks along the single
+// walked axis (or fall back to key-order sibling readahead when the walk is
+// ambiguous). Returns whether this open is a Zarr open (true unless ambiguous,
+// in which case key-order is used instead).
+func (f *rawFS) zarrTier1(dir string, coords, last []int, grid *fzarr.Grid) bool {
+	if walkedAxis(coords, last) == -1 {
+		return false // ambiguous -> key-order readahead (#63)
+	}
+	for _, rel := range planZarrChunks(dir, coords, last, grid, f.cfg.SiblingReadahead) {
+		fi, err := f.ix.Stat("/" + rel)
+		if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size > f.cfg.SmallFile {
+			continue
+		}
+		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+		if !f.prefetchWhole(key, fi.Size) {
+			break
 		}
 		f.noteSiblingIssued(rel)
 	}
@@ -173,8 +268,8 @@ func (f *rawFS) maybeZarrReadahead(relPath string) bool {
 }
 
 // walkedAxis returns the single axis whose coordinate advanced from last to
-// coords, or -1 if that is ambiguous (no previous open, a backward step, or
-// more than one axis changed — the app isn't cleanly walking one axis yet).
+// coords, or -1 if ambiguous (no previous open, a backward step, or >1 axis
+// changed).
 func walkedAxis(coords, last []int) int {
 	if len(last) != len(coords) {
 		return -1
@@ -192,9 +287,8 @@ func walkedAxis(coords, last []int) int {
 }
 
 // planZarrChunks returns the relative keys of the next n chunks after coords
-// along the axis the app is walking (inferred from last), in grid order,
-// clamped to the grid bounds. Empty when the walked axis is ambiguous.
-func planZarrChunks(dir string, coords, last []int, grid *zarrGrid, n int) []string {
+// along the walked axis, in grid order, clamped to the grid bounds.
+func planZarrChunks(dir string, coords, last []int, grid *fzarr.Grid, n int) []string {
 	axis := walkedAxis(coords, last)
 	if axis == -1 {
 		return nil
@@ -202,17 +296,12 @@ func planZarrChunks(dir string, coords, last []int, grid *zarrGrid, n int) []str
 	var out []string
 	for d := 1; d <= n; d++ {
 		v := coords[axis] + d
-		if v >= grid.dims[axis] {
-			break // walked off the grid
+		if v >= grid.Dims[axis] {
+			break
 		}
-		parts := make([]string, len(coords))
-		for i, c := range coords {
-			if i == axis {
-				c = v
-			}
-			parts[i] = strconv.Itoa(c)
-		}
-		out = append(out, path.Join(dir, strings.Join(parts, ".")))
+		next := append([]int(nil), coords...)
+		next[axis] = v
+		out = append(out, path.Join(dir, fzarr.FormatCoords(next)))
 	}
 	return out
 }

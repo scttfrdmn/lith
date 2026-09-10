@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\"ņņ\xf1\xa8ņņ\xf1\xa8ņŏ\xf1\xa8ņņ\xf1\xa8ņņԨԙ\"")

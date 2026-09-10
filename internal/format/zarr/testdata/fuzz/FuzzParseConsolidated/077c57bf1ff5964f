@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"metadata\":{\"a/.zarray\":{\"shape\":[1],\"c\x88unks\":[1]}}}")
