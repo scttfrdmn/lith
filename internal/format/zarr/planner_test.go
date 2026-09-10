@@ -4,7 +4,6 @@ package zarr
 
 import (
 	"reflect"
-	"sort"
 	"testing"
 )
 
@@ -128,20 +127,17 @@ func TestObserveNeverPanicsOnRaggedInput(t *testing.T) {
 	}
 }
 
-func TestClassifyPlaneMembershipSorted(t *testing.T) {
-	// Sanity: classify enumerates exactly the varying-axis product.
-	plane, primary, size := classify([][]int{{2, 0, 0}, {2, 0, 1}, {2, 0, 2}}, []int{5, 4, 6})
+func TestClassifyAxes(t *testing.T) {
+	// A walk along axis 2 with axes 0,1 fixed → only axis 2 varies; plane size =
+	// dims[2]; primary = 2.
+	varying, fixedVal, primary, size := classify([][]int{{2, 0, 0}, {2, 0, 1}, {2, 0, 2}}, []int{5, 4, 6})
 	if size != 6 || primary != 2 {
 		t.Fatalf("size=%d primary=%d, want 6,2", size, primary)
 	}
-	var got [][]int
-	for k := range plane {
-		got = append(got, parseKey(k))
+	if !reflect.DeepEqual(varying, []bool{false, false, true}) {
+		t.Fatalf("varying = %v, want [f f t]", varying)
 	}
-	sort.Slice(got, func(i, j int) bool { return got[i][2] < got[j][2] })
-	for i, c := range got {
-		if c[0] != 2 || c[1] != 0 || c[2] != i {
-			t.Fatalf("plane[%d] = %v, want (2,0,%d)", i, c, i)
-		}
+	if fixedVal[0] != 2 || fixedVal[1] != 0 {
+		t.Fatalf("fixedVal = %v, want axis0=2 axis1=0", fixedVal)
 	}
 }
