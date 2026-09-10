@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/scttfrdmn/lith/internal/blockstore"
 	fusefs "github.com/scttfrdmn/lith/internal/fuse"
@@ -73,7 +74,7 @@ func newMountCmd() *cobra.Command {
 		},
 	}
 	fl := cmd.Flags()
-	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built automatically if absent and under --auto-index-limit)")
+	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built automatically if absent and under --auto-index-limit). A whole-bucket or parent-prefix index can back mounts rooted at any prefix at or below its own root, concurrently")
 	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables)")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
@@ -178,6 +179,15 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		defer func() { _ = closeIdx() }()
 	}
 
+	// Root the mount at the requested prefix. For an auto-built index this is a
+	// pass-through (it was built at the prefix); for a loaded index built at or
+	// above the prefix, it is a sub-root view — so one whole-bucket index can
+	// back many prefix mounts (#90). Rejects a prefix the index cannot serve.
+	root, err := ix.Root(prefix)
+	if err != nil {
+		return err
+	}
+
 	var met *metrics.Metrics
 	if f.metrics != "" {
 		met = metrics.New()
@@ -232,7 +242,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 			DiskWriteBPS:  0, // populated once the disk tier reports a sustained rate
 		},
 		func(key string, n int) []prefetch.Sibling {
-			sibs := ix.Neighborhood(key, n)
+			sibs := root.Neighborhood(key, n)
 			out := make([]prefetch.Sibling, len(sibs))
 			for i, s := range sibs {
 				out[i] = prefetch.Sibling{Key: s.Key, Size: s.Size, ETagHash: s.ETagHash}
@@ -242,7 +252,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	)
 
 	fcfg := fusefs.Config{
-		Index:            ix,
+		Index:            root,
 		Store:            bs,
 		Metrics:          met,
 		UID:              uint32(f.uid),
@@ -262,8 +272,20 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	log.Info("mounted", "bucket", bucket, "prefix", prefix, "mountpoint", mountpoint, "keys", ix.Len())
+	log.Info("mounted", "bucket", bucket, "prefix", prefix, "mountpoint", mountpoint, "root", root.Prefix(), "keys", root.Len())
 	log.Info("s3 transport", "info", s3client.TransportInfo(f.s3Concurrency), "s3_concurrency", f.s3Concurrency)
+
+	// Record the mount so `lith mounts`/`lith umount` can find it (#91); removed
+	// on clean exit. Best-effort — a record failure must not fail the mount.
+	if p, werr := writeMountRecord(mountRecord{
+		PID: os.Getpid(), Mountpoint: mountpoint, Bucket: bucket, Root: root.Prefix(),
+		IndexFile: f.indexFile, Start: time.Now(),
+	}); werr != nil {
+		log.Warn("could not write mount record", "err", werr)
+	} else {
+		defer removeMountRecord(mountpoint)
+		_ = p
+	}
 
 	// Serve metrics (and pprof) if requested.
 	var metricsSrv *http.Server
