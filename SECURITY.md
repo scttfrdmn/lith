@@ -36,3 +36,7 @@ Operator responsibilities and trust boundaries:
 - **`--allow-other` exposes the whole mounted subtree to every local user** (files
   are world-readable `0444`/`0555` with no per-object access control), independent
   of the underlying S3 ACLs. Use it only on hosts where that is acceptable.
+- **`--pprof` must never be exposed to an untrusted network.** The Go pprof handlers
+  it serves are unauthenticated and reveal the process argv (`/debug/pprof/cmdline`)
+  and an on-demand CPU/goroutine profiling denial-of-service (`/profile`, `/trace`);
+  bind it to `127.0.0.1`. `--metrics` serves only Prometheus `/metrics` (no pprof).

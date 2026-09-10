@@ -85,5 +85,6 @@ Authentication, endpoint, and how files present to the OS.
 
 | flag | default | why |
 |---|---|---|
-| `--metrics` | off | Serve Prometheus metrics **and** Go `pprof` on an address (e.g. `:9101`): cache hits by tier, S3 bytes/requests, prefetch accuracy, uncovered misses, FUSE op latency. Point Prometheus at it; hit `/debug/pprof/` for profiles. |
+| `--metrics` | off | Serve **Prometheus metrics only** (`/metrics`) on an address (e.g. `:9101`): cache hits by tier, S3 bytes/requests, prefetch accuracy, uncovered misses, FUSE op latency. No pprof (see `--pprof`). |
+| `--pprof` | off | Serve Go `net/http/pprof` handlers on an address (e.g. `127.0.0.1:6060`). **Security:** pprof exposes the process argv (`/cmdline`) and an on-demand CPU/goroutine profiling DoS (`/profile`, `/trace`) with no auth — **bind it to localhost and never expose it to an untrusted network.** Enabling it also turns on block/mutex profiling. |
 | `--timeline-csv` | off | Diagnostic ([#70](https://github.com/scttfrdmn/lith/issues/70)/[#95](https://github.com/scttfrdmn/lith/issues/95)): write a per-chunk demand-read timeline — join-wait, in-flight fill depth, and prefetch-dispatch→open lag — to this CSV on unmount. Opt-in; no effect on the read path when unset. |
