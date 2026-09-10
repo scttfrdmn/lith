@@ -135,6 +135,23 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("s3client: load config: %w", err)
 	}
 
+	// M3 (continued): the flag-only pre-check above catches --endpoint, but the
+	// SDK also resolves AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 / shared-config
+	// endpoint_url into awsCfg.BaseEndpoint. Validate the *effective* endpoint —
+	// the one s3.NewFromConfig will actually use — so a cleartext endpoint from
+	// the environment or shared config cannot reopen the credential-leak hole.
+	if !cfg.NoSignRequest {
+		effective, source := cfg.Endpoint, "--endpoint"
+		if effective == "" && awsCfg.BaseEndpoint != nil {
+			effective, source = *awsCfg.BaseEndpoint, "the environment or shared config (AWS_ENDPOINT_URL / endpoint_url)"
+		}
+		if effective != "" {
+			if u, err := url.Parse(effective); err != nil || u.Scheme != "https" {
+				return nil, fmt.Errorf("s3client: endpoint %q (from %s) uses a non-HTTPS scheme; signed requests may not be sent in cleartext — use https, or pass --no-sign-request for anonymous access", effective, source)
+			}
+		}
+	}
+
 	s3Opts := func(o *s3.Options) {
 		o.UsePathStyle = cfg.PathStyle
 		if cfg.Endpoint != "" {
