@@ -27,7 +27,7 @@ const oneYear = 365 * 24 * time.Hour
 
 // Config wires the FUSE filesystem to its data sources and mount options.
 type Config struct {
-	Index        *index.Index
+	Index        index.Reader
 	Store        *blockstore.BlockStore
 	Metrics      *metrics.Metrics
 	UID          uint32
@@ -133,7 +133,7 @@ type rawFS struct {
 	fuse.RawFileSystem // default (ENOSYS) for anything not overridden
 
 	cfg       Config
-	ix        *index.Index
+	ix        index.Reader
 	store     *blockstore.BlockStore
 	met       *metrics.Metrics
 	blockSize int64

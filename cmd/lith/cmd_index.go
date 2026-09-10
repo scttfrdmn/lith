@@ -200,7 +200,11 @@ func newIndexInspectCmd() *cobra.Command {
 			fmt.Fprintf(&b, "index-file:        %s\n", args[0])
 			fmt.Fprintf(&b, "format-version:    %d\n", index.FormatVersion)
 			fmt.Fprintf(&b, "bucket:            %s\n", ix.Bucket())
-			fmt.Fprintf(&b, "prefix:            %s\n", ix.Prefix())
+			root := ix.Prefix()
+			if root == "" {
+				root = "(bucket root)"
+			}
+			fmt.Fprintf(&b, "root:              %s\n", root)
 			fmt.Fprintf(&b, "keys:              %d\n", n)
 			fmt.Fprintf(&b, "bytes-per-key:     %.1f\n", bytesPerKey)
 			fmt.Fprintf(&b, "dropped-keys:      %d\n", dropped)

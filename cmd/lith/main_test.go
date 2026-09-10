@@ -107,7 +107,7 @@ func TestIndexBuildAndInspect(t *testing.T) {
 		t.Fatalf("inspect: %v", err)
 	}
 	s := out.String()
-	for _, want := range []string{"bucket:            bkt", "prefix:            data/", "keys:              2", "dropped-keys:      1"} {
+	for _, want := range []string{"bucket:            bkt", "root:              data/", "keys:              2", "dropped-keys:      1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("inspect output missing %q in:\n%s", want, s)
 		}
