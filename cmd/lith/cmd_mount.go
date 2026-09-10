@@ -44,6 +44,7 @@ type mountFlags struct {
 	diskWriters    int
 	inflightBytes  string
 	metrics        string
+	timelineCSV    string
 	allowOther     bool
 	uid            int
 	gid            int
@@ -92,6 +93,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics and pprof on this address (e.g. :9101)")
+	fl.StringVar(&f.timelineCSV, "timeline-csv", "", "diagnostic (#70): record a per-chunk demand-read timeline (join-wait, in-flight depth, prefetch-dispatch→open lag) and write it here on unmount")
 	fl.BoolVar(&f.allowOther, "allow-other", false, "allow other users to access the mount")
 	fl.IntVar(&f.uid, "uid", os.Getuid(), "owner uid for all files")
 	fl.IntVar(&f.gid, "gid", os.Getgid(), "owner gid for all files")
@@ -192,6 +194,16 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if f.metrics != "" {
 		met = metrics.New()
 	}
+	// Diagnostic (#70): when --timeline-csv is set, the per-chunk timeline
+	// recorder is the block-store Recorder (it also tallies the basic counters).
+	// It implements the optional chunkTimelineRecorder extension, so the block
+	// store captures join-wait/dispatch events; a plain metrics recorder does not.
+	var tl *mountTimeline
+	var rec blockstore.Recorder = met // nil-safe
+	if f.timelineCSV != "" {
+		tl = newMountTimeline()
+		rec = tl
+	}
 	// Resolve NIC bandwidth (baseline drives the in-flight budget; #79). Cache
 	// nic.json next to the index so repeat mounts and boxes without
 	// ec2:DescribeInstanceTypes still get a real answer.
@@ -223,7 +235,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		PrefetchBudget:      prefetchBudget,
 		DiskWriters:         f.diskWriters,
 		InflightBytes:       inflight,
-		Recorder:            met, // nil-safe
+		Recorder:            rec, // nil-safe; timeline recorder when --timeline-csv
 	})
 	if err != nil {
 		return err
@@ -327,6 +339,16 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 
 	srv.Wait() // blocks until unmounted
 	log.Info("unmounted", "stale_objects", len(bs.StaleKeys()))
+
+	// Flush the #70 timeline on clean unmount.
+	if tl != nil {
+		if n, werr := tl.writeCSV(f.timelineCSV); werr != nil {
+			log.Warn("timeline CSV write failed", "err", werr)
+		} else {
+			log.Info("timeline written", "file", f.timelineCSV, "rows", n)
+			_, _ = fmt.Fprint(os.Stderr, "\n=== #70 chunk timeline ===\n", tl.summary())
+		}
+	}
 	return nil
 }
 

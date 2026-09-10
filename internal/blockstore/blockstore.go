@@ -111,6 +111,11 @@ type BlockStore struct {
 	pfBudgetBytes int64
 
 	rec Recorder
+	// timeline is the optional per-chunk diagnostic sink (#70); nil unless the
+	// installed Recorder implements chunkTimelineRecorder. When nil the read
+	// path takes no extra clock reads or counter updates.
+	timeline  chunkTimelineRecorder
+	inflightN atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
 	mu       sync.Mutex
 	inflight map[string]*chunkState
@@ -185,6 +190,9 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		rec:           cfg.Recorder,
 		inflight:      make(map[string]*chunkState),
 		stale:         make(map[string]struct{}),
+	}
+	if r, ok := cfg.Recorder.(chunkTimelineRecorder); ok {
+		bs.timeline = r
 	}
 	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
@@ -329,6 +337,9 @@ func (bs *BlockStore) claim(k Key, ci int64) (cs *chunkState, mine bool, cachedD
 	}
 	cs = &chunkState{done: make(chan struct{})}
 	bs.inflight[ck] = cs
+	if bs.timeline != nil {
+		bs.inflightN.Add(1)
+	}
 	return cs, true, nil, false
 }
 
@@ -357,6 +368,9 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err
 	bs.mu.Lock()
 	delete(bs.inflight, ck)
 	bs.mu.Unlock()
+	if bs.timeline != nil {
+		bs.inflightN.Add(-1)
+	}
 	if err == nil {
 		bs.enqueueDiskWrite(ck, data, blocking)
 	}
@@ -387,9 +401,18 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			continue
 		}
 		if !mine {
+			var t0 time.Time
+			var pf bool
+			if bs.timeline != nil && !isPrefetch {
+				t0 = time.Now()
+				_, pf = bs.prefetched.Load(bs.cacheKey(k, i))
+			}
 			<-cs.done
 			if cs.err != nil {
 				return cs.err
+			}
+			if bs.timeline != nil && !isPrefetch {
+				bs.emitChunk(k, i, "join", pf, time.Since(t0), t0)
 			}
 			if out != nil {
 				out[i] = cs.data
@@ -511,6 +534,10 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 // so the FUSE layer can hand a sub-slice straight to the kernel. The buffer is
 // immutable; the Go runtime keeps it alive while the reply references it.
 func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]byte, error) {
+	var t0 time.Time
+	if bs.timeline != nil {
+		t0 = time.Now()
+	}
 	if d, tier := bs.lookup(k, ci); tier != "" {
 		switch tier {
 		case "mem":
@@ -518,20 +545,32 @@ func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]by
 		case "disk":
 			bs.record(func(r Recorder) { r.DiskHit() })
 		}
-		bs.notePrefetchHit(bs.cacheKey(k, ci))
+		ck := bs.cacheKey(k, ci)
+		_, pf := bs.prefetched.Load(ck)
+		bs.notePrefetchHit(ck)
+		if bs.timeline != nil {
+			bs.emitChunk(k, ci, "hit", pf, 0, t0)
+		}
 		return d, nil
 	}
 	bs.record(func(r Recorder) { r.Miss() })
 	cs, mine, cachedData, cached := bs.claim(k, ci)
 	if cached {
+		if bs.timeline != nil {
+			bs.emitChunk(k, ci, "hit", false, 0, t0)
+		}
 		return cachedData, nil
 	}
 	if !mine {
+		_, pf := bs.prefetched.Load(bs.cacheKey(k, ci))
 		<-cs.done
 		// A demand read that joined an in-flight prefetch fill still consumes the
 		// chunk: credit the hit and release its budget reservation (#55).
 		if cs.err == nil {
 			bs.notePrefetchHit(bs.cacheKey(k, ci))
+		}
+		if bs.timeline != nil {
+			bs.emitChunk(k, ci, "join", pf, time.Since(t0), t0)
 		}
 		return cs.data, cs.err
 	}
@@ -539,6 +578,9 @@ func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]by
 	owned := []*chunkState{cs}
 	if err := bs.fillRun(ctx, k, ci, ci, objSize, false, owned); err != nil {
 		return nil, err
+	}
+	if bs.timeline != nil {
+		bs.emitChunk(k, ci, "uncovered", false, time.Since(t0), t0)
 	}
 	return owned[0].data, nil
 }
@@ -630,6 +672,9 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 		ck := bs.cacheKey(k, ci)
 		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); !dup {
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
+			if bs.timeline != nil {
+				bs.timeline.PrefetchDispatch(k.Key, ci, time.Now())
+			}
 		}
 	}
 	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
@@ -696,6 +741,42 @@ func (bs *BlockStore) record(fn func(Recorder)) {
 	if bs.rec != nil {
 		fn(bs.rec)
 	}
+}
+
+// ChunkEvent is one demanded-chunk read observed for the #70 timeline
+// diagnostic. Kind is "hit" (served from cache), "join" (blocked on an
+// in-flight fill), or "uncovered" (the demand read originated the fetch). Wait
+// is the time from read entry to data-ready (0 for a hit; the join wait for a
+// join; the self-fill duration for an uncovered miss). Inflight is the number
+// of chunk fetches in flight at read entry.
+type ChunkEvent struct {
+	At         time.Time
+	Key        string
+	Chunk      int64
+	Kind       string
+	Prefetched bool
+	Wait       time.Duration
+	Inflight   int
+}
+
+// chunkTimelineRecorder is an optional Recorder extension: implementers receive
+// a per-demand-chunk timeline and the dispatch time of each prefetch, so the
+// join-wait diagnostic (#70) can correlate prefetch dispatch with app open.
+// Optional (type assertion) so existing Recorder implementers need not change;
+// when the installed Recorder does not implement it, bs.timeline is nil and the
+// read path is unchanged.
+type chunkTimelineRecorder interface {
+	PrefetchDispatch(key string, chunk int64, at time.Time)
+	ChunkRead(ev ChunkEvent)
+}
+
+// emitChunk records one demand-chunk timeline event (only called when
+// bs.timeline != nil).
+func (bs *BlockStore) emitChunk(k Key, ci int64, kind string, prefetched bool, wait time.Duration, at time.Time) {
+	bs.timeline.ChunkRead(ChunkEvent{
+		At: at, Key: k.Key, Chunk: ci, Kind: kind,
+		Prefetched: prefetched, Wait: wait, Inflight: int(bs.inflightN.Load()),
+	})
 }
 
 // prefetchWaitRecorder is an optional Recorder extension: implementers receive
