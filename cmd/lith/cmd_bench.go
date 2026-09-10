@@ -619,7 +619,14 @@ func readSeqProgress(path string, size int64, prog *atomic.Int64) float64 {
 
 // sampleConns443 counts established connections to :443 via ss.
 func sampleConns443() int {
-	out, err := exec.Command("ss", "-tn", "state", "established").CombinedOutput()
+	// Resolve ss against a fixed trusted dir list (not $PATH) so a poisoned PATH
+	// under `sudo` can't run an attacker binary (finding F5); ss is best-effort,
+	// so a missing binary just samples 0.
+	bin, err := trustedExecPath("ss")
+	if err != nil {
+		return 0
+	}
+	out, err := exec.Command(bin, "-tn", "state", "established").CombinedOutput()
 	if err != nil {
 		return 0
 	}
