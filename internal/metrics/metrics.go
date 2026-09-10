@@ -7,6 +7,8 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +42,11 @@ type Metrics struct {
 	formatReplan  prometheus.Counter
 	formatIdxPfB  prometheus.Counter
 	formatRanges  *prometheus.CounterVec // format
+
+	readSize prometheus.Histogram // FUSE read request sizes (#65)
+	readN    atomic.Int64         // read count, for bench mean
+	readSum  atomic.Int64         // summed read bytes, for bench mean
+	distinct *distinctReads       // per-object chunk bitmaps (#65)
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -117,11 +124,23 @@ func New() *Metrics {
 		formatRanges: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_format_plan_ranges_total", Help: "Data byte ranges prefetched by an index-resolved plan, by format (#107 tier 2).",
 		}, []string{"format"}),
+		readSize: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "lith_read_size_bytes",
+			Help:    "FUSE read request sizes in bytes (#65).",
+			Buckets: prometheus.ExponentialBuckets(4096, 2, 12), // 4 KiB .. 8 MiB
+		}),
+		distinct: newDistinctReads(),
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
-		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges)
+		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize)
+	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_distinct_bytes_read",
+		Help: "Distinct object bytes read through the mount, from per-object chunk bitmaps. " +
+			"Granularity is 1 MiB; objects larger than 1 TiB use a coarser 64 MiB granularity to bound the bitmap. " +
+			"Tracking is capped at 2^20 distinct objects (beyond that new objects are not counted).",
+	}, func() float64 { return float64(m.distinct.totalBytes()) }))
 	return m
 }
 
@@ -317,4 +336,118 @@ func (m *Metrics) ObserveFUSE(op string, seconds float64) {
 	if m != nil {
 		m.fuseLatency.WithLabelValues(op).Observe(seconds)
 	}
+}
+
+// ObserveReadSize records one FUSE read request size (#65). Nil-safe.
+func (m *Metrics) ObserveReadSize(n int64) {
+	if m == nil || n < 0 {
+		return
+	}
+	m.readSize.Observe(float64(n))
+	m.readN.Add(1)
+	m.readSum.Add(n)
+}
+
+// MarkDistinctRead marks the object chunks covered by a read of [off,off+length)
+// on an object of the given size, for the distinct-bytes-read metric (#65).
+// Nil-safe.
+func (m *Metrics) MarkDistinctRead(key string, off, length, size int64) {
+	if m != nil {
+		m.distinct.mark(key, off, length, size)
+	}
+}
+
+// DistinctBytesRead returns the distinct object bytes read so far (#65). Nil-safe.
+func (m *Metrics) DistinctBytesRead() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.distinct.totalBytes()
+}
+
+// ReadSizeStats returns the read count and summed read bytes (for a mean; #65).
+// Nil-safe.
+func (m *Metrics) ReadSizeStats() (count, sumBytes int64) {
+	if m == nil {
+		return 0, 0
+	}
+	return m.readN.Load(), m.readSum.Load()
+}
+
+// --- distinct-bytes-read tracking (#65) ---
+
+const (
+	distinctFineGran    = 1 << 20 // 1 MiB chunk granularity
+	distinctCoarseGran  = 64 << 20
+	distinctCoarseAbove = 1 << 40 // objects larger than 1 TiB use the coarse granularity
+	distinctMaxObjs     = 1 << 20 // defensive cap on tracked objects
+)
+
+// objBits is a per-object touched-chunk bitmap at a fixed granularity.
+type objBits struct {
+	gran  int64
+	words []uint64
+	set   int64
+}
+
+func (o *objBits) mark(ci int64) {
+	w := ci >> 6
+	for int64(len(o.words)) <= w {
+		o.words = append(o.words, 0)
+	}
+	b := uint64(1) << uint(ci&63)
+	if o.words[w]&b == 0 {
+		o.words[w] |= b
+		o.set++
+	}
+}
+
+// distinctReads aggregates per-object chunk bitmaps to report distinct bytes
+// read across a mount. Bounded: each object's bitmap is O(size/gran) bits (and
+// gran coarsens above 1 TiB), and the object count is capped.
+type distinctReads struct {
+	mu   sync.Mutex
+	objs map[string]*objBits
+}
+
+func newDistinctReads() *distinctReads { return &distinctReads{objs: map[string]*objBits{}} }
+
+func (d *distinctReads) mark(key string, off, length, size int64) {
+	if length <= 0 || off < 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	o := d.objs[key]
+	if o == nil {
+		if len(d.objs) >= distinctMaxObjs {
+			return
+		}
+		gran := int64(distinctFineGran)
+		if size > distinctCoarseAbove {
+			gran = distinctCoarseGran
+		}
+		o = &objBits{gran: gran}
+		d.objs[key] = o
+	}
+	end := off + length
+	if size > 0 && end > size {
+		end = size
+	}
+	if end <= off {
+		return
+	}
+	for ci := off / o.gran; ci <= (end-1)/o.gran; ci++ {
+		o.mark(ci)
+	}
+}
+
+func (d *distinctReads) totalBytes() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var total int64
+	for _, o := range d.objs {
+		total += o.set * o.gran
+	}
+	return total
 }

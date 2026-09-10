@@ -21,6 +21,7 @@ import (
 	"github.com/scttfrdmn/lith/internal/blockstore"
 	fusefs "github.com/scttfrdmn/lith/internal/fuse"
 	"github.com/scttfrdmn/lith/internal/index"
+	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/s3client"
 	"github.com/spf13/cobra"
 )
@@ -224,7 +225,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 
 // mountObjects builds an index over the given keys and mounts it, returning the
 // mount dir, the server, the recorder, and a cleanup func.
-func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64, stats *fusefs.PrefetchStats) (string, *fusefs.Config, func(), error) {
+func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64, stats *fusefs.PrefetchStats, met *metrics.Metrics) (string, *fusefs.Config, func(), error) {
 	entries := make([]index.Entry, 0, len(keys))
 	for _, k := range keys {
 		h, err := client.HeadObject(ctx, k)
@@ -238,7 +239,7 @@ func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.Block
 	if err != nil {
 		return "", nil, nil, err
 	}
-	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead, PrefetchStats: stats}
+	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead, PrefetchStats: stats, Metrics: met}
 	srv, err := fusefs.Mount(mnt, *cfg, fusefs.MountOptions{FsName: "lith-bench"})
 	if err != nil {
 		_ = os.RemoveAll(mnt)
@@ -259,6 +260,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	var aggAll, aggPost []time.Duration
 	var ttfb time.Duration
 	var s3reqs, s3bytes, prefetch, uncovered int64
+	var lastMet *metrics.Metrics
 
 	for r := 0; r < f.runs; r++ {
 		cacheDir := filepath.Join(cacheBase, fmt.Sprintf("lith-bench-cold-%d-%d", os.Getpid(), r))
@@ -266,7 +268,9 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 		if berr != nil {
 			return berr
 		}
-		mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil)
+		met := metrics.New()
+		lastMet = met
+		mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, met)
 		if merr != nil {
 			return merr
 		}
@@ -292,7 +296,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	if berr != nil {
 		return berr
 	}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil)
+	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, nil)
 	if merr != nil {
 		return merr
 	}
@@ -329,6 +333,10 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	pr("TTFB (open->first read)", ttfb.String(), "-")
 	pr("S3 reqs / MB (lith, last cold)", fmt.Sprintf("%d / %.0f", s3reqs, float64(s3bytes)/(1<<20)), "-")
 	pr("prefetch issued / uncovered", fmt.Sprintf("%d / %d", prefetch, uncovered), "-")
+	if n, sum := lastMet.ReadSizeStats(); n > 0 {
+		pr("reads / mean size (last cold)", fmt.Sprintf("%d / %.0f KiB", n, float64(sum)/float64(n)/1024), "-")
+	}
+	pr("distinct bytes read (last cold)", fmt.Sprintf("%.0f MiB", float64(lastMet.DistinctBytesRead())/(1<<20)), "-")
 	_ = tw.Flush()
 	if f.pattern == "seq" && prefetch == 0 {
 		_, _ = fmt.Fprintln(out, "\nWARNING: prefetch count 0 during seq (see #36)")
@@ -350,7 +358,7 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 		return berr
 	}
 	pfStats := &fusefs.PrefetchStats{}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, benchBucket, keys, f.maxReadahead, pfStats)
+	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, benchBucket, keys, f.maxReadahead, pfStats, nil)
 	if merr != nil {
 		return merr
 	}
