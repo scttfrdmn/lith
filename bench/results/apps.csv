@@ -1,0 +1,10 @@
+# lith application benchmarks (canonical; supersedes apps-v0.1.0.csv on the stranded PR #62). c8gd.4xlarge, us-east-1, fair --disk-cache 0.
+# lith cold/warm from #61 (v0.1) + session-19 corrections; mount_s3 = mountpoint-s3 1.24 cold (session 18/19); copy = s5cmd + gp3-1000 (session 18, #84).
+# W3 lith corrected to 141 s (post-#79 NIC-baseline sizing; the 184 s was pre-#79, #85). gb = bytes pulled from S3 (lith metrics / NIC).
+version,workload,object,lith_cold_s,lith_warm_s,mount_s3_cold_s,gb_touched,copy_note
+v0.2,R2 samtools view -c 1000x1Mb,14 GB CRAM,50,44,59.3,0.86,copy-best 62s (stages whole 14 GB)
+v0.2,S1 samtools flagstat,3.8 GB CRAM,47.5,46.5,49.1,3.82,copy-best 66s
+v0.2,W3 flagstat 8 CRAMs 8-way,60 GB,141,141,143.8,60.0,copy-best 219s
+v0.2,R1 tabix 1000x10kb,341 MB VCF,7.9,7.2,37.0,0.32,-
+v0.2,S3 xarray yearly-mean,1.4 TB Zarr store,35,22,79,0.80,in-place s3fs ~25s (same box); copy = whole store infeasible
+v0.2,BIG xarray ONE-MONTH (large-object selectivity),1.4 TB Zarr store,7.3,0.8,36.3,0.13,copy s5cmd+gp3-1000+NVMe DID NOT FINISH: staged 886 of 1434 GB in 20 min
