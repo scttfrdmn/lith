@@ -79,11 +79,12 @@ still moves 0.8 GB, not 14). On the **smaller** boxes staging is NIC-bound, so
 the best copier is no faster there and lith wins by more (2xlarge/4xl measured;
 large/xlarge estimated).
 
-Against **mountpoint-s3** (the other in-place reader), lith wins the selective
-and small-object shapes and ties the CPU-bound stream, but **trails on
-large-file batch** (W3: 143 s vs lith's 184 s on a 4xl) — mountpoint's CRT
-client fans more concurrent range GETs per object, tracked in
-[#85](https://github.com/scttfrdmn/lith/issues/85).
+Against **mountpoint-s3** (the other in-place reader), lith wins or ties **every**
+app shape: selective (region query, tabix) and small-object (Zarr) it wins
+clearly, and on the two large-file shapes it now matches — stream (S1) is a tie,
+and large-file batch (W3) is **141 s vs mountpoint's 144 s** on a 4xl once the NIC
+in-flight budget is sized to the detected baseline ([#79](https://github.com/scttfrdmn/lith/issues/79);
+an earlier 184 s was pre-#79 and drove the now-closed [#85](https://github.com/scttfrdmn/lith/issues/85)).
 
 ² lith's batch cell on the 2-vCPU `c8g.large` wasn't run (60 GB × 8-way on 2
 cores overran the test budget); the copy-best cost there (~$0.044) is shown for
@@ -100,6 +101,25 @@ which favor the mount.
     **staging it avoids**, not cache hits. Warm reuse matters for *repeated
     selective queries* over a working set that fits RAM (see
     [Sizing the node](sizing.md)).
+
+## Where the margin grows
+
+The crossover table above uses a 14 GB object, so staging is a ~10-second
+afterthought on a fast box and lith's edge looks modest (1.2–1.5×). **The margin
+widens with:**
+
+- **Object (or store) size.** Staging scales with bytes; lith's selective read
+  does not. On the **1.4 TB `chrtout.zarr` store**, a one-month query touches
+  **0.13 GB** — lith answers it **cold in 7.3 s** (mountpoint-s3 36 s), while
+  copying the store with the best copier **did not finish in 20 minutes** (886 of
+  1434 GB staged). At RODA scale, "stage first" isn't slower — it's *infeasible*.
+- **Smaller NICs.** Staging is NIC-bound on small boxes, so the copy path is no
+  faster there while lith still moves only the bytes touched — the margin is
+  larger on a `c8g.large` than on a 4xl.
+- **Repeated jobs.** A second query over the same working set is warm and free on
+  lith; the copy path re-stages every fresh volume.
+- **Fan-out.** N nodes each stage their shard; lith mounts the same index N times
+  and moves no bulk data (see [Meet a deadline](deadline.md)).
 
 ## The rule
 
