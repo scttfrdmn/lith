@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,6 +169,26 @@ func TestFooterParquetProjectionNoSpeculation(t *testing.T) {
 			t.Fatalf("plan reached row group 2+ (start %d) after touching only RG0,RG1", start)
 		}
 	}
+}
+
+// TestFooterParquetConcurrentReads: many concurrent reads on one handle (as FUSE
+// serves them) must not race on the per-handle projection state.
+func TestFooterParquetConcurrentReads(t *testing.T) {
+	srv := fake.New()
+	srv.Put("c.parquet", buildParquetObject(4, 2), time.Unix(1_700_000_000, 0))
+	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: metrics.New()})
+	_, fh := openHandle(t, raw, "c.parquet")
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := parquetColStart(i%4, i%2)
+			buf := make([]byte, 4096)
+			raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+		}(i)
+	}
+	wg.Wait()
 }
 
 // TestFooterParquetMalformedTier1: a .parquet whose footer does not parse falls
