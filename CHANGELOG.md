@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
 ### Added
 
 - **Mount root at a prefix** (#90): `lith mount s3://bucket/some/prefix /mnt`
@@ -22,6 +24,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported with the holding pids and refused without `--force`. `--all`
   unmounts every lith mount for the user. `lith mounts` lists live mounts
   (cross-checked against `/proc/mounts`) and stale records, with `--prune`.
+- **Sibling readahead for chunked stores** (#63): when successive opens in a
+  directory are close in index order (a detected directory walk), lith
+  prefetches the next N siblings whole — turning many-small-object access (Zarr
+  chunks, WebDataset shards, per-chromosome BAM) into large-object streaming,
+  lith's best shape. New `--sibling-window` (default 4, the max index-position
+  gap that still counts as walking) and `--sibling-readahead` (default 16;
+  0 disables).
+- **Parallel parts for mid-size files** (#69): a file at or below `--parts-max`
+  (default 64 MiB) is fetched on first read as concurrent block-sized range GETs
+  instead of one serial stream, so a mid-size file reaches full bandwidth
+  without waiting on a single sequential fill.
+- **Zarr grid-aware readahead — the first format-aware access plan** (#70,
+  tier 1): on a `.zarray`/`.zmetadata`-shaped store, sibling readahead follows
+  the chunk grid along the walked axis instead of flat key order, so
+  grid-boundary jumps no longer reset the walk. On the NWM `chrtout.zarr` year
+  read this halved the uncovered misses (114 → 64) with 100%-used prefetch.
+- `lith mount --timeline-csv <path>`: an **opt-in** per-chunk diagnostic
+  timeline (per demanded chunk: join-wait, in-flight fill depth, and the lag
+  from a covering prefetch's dispatch to the app's open) for prefetch
+  investigations. No effect on the read path when unset (#95, #70).
+- `--nic-gbps` on `lith mount` overrides the detected NIC bandwidth (which sizes
+  `--inflight-bytes` and the readahead window) (#79).
+- **Documentation site** (mkdocs-material, #80): Start here, Copy or mount?,
+  Sizing, Deadline, Knobs, and What lith is not.
+
+### Changed
+
+- **The in-flight budget is now sized from NIC baseline bandwidth** (#79):
+  NIC detection is ethtool → EC2 `DescribeInstanceTypes` baseline → a fixed
+  fallback (was ethtool → 512 MiB), and both the `--inflight-bytes` default and
+  the readahead window derive from the baseline. This fixes burst-credit
+  instance classes (e.g. `c8g`) the old bandwidth table missed and silently
+  defaulted to 512 MiB in-flight. The NIC result is cached in `nic.json` next to
+  the index so repeat mounts and boxes without `ec2:DescribeInstanceTypes` still
+  get a real answer.
+- **Unified prefetch limits** (#64): per-handle readahead, sibling readahead,
+  and the parts path now draw on one shared prefetch budget and query the index
+  for neighborhoods through a single policy, so aggregate readahead stays
+  bounded by the memory tier across all three paths (extends #55).
 
 ## [0.1.0] - 2026-09-08
 
@@ -180,5 +221,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/scttfrdmn/lith/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/lith/releases/tag/v0.1.0
