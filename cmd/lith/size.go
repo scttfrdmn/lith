@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -36,5 +37,18 @@ func parseSize(s string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid size %q: %w", s, err)
 	}
-	return int64(n * float64(mult)), nil
+	if math.IsInf(n, 0) || math.IsNaN(n) {
+		return 0, fmt.Errorf("invalid size %q: not a finite number", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("invalid size %q: must not be negative", s)
+	}
+	// Guard the float->int64 conversion: int64(v) is implementation-defined when
+	// v overflows the int64 range. math.MaxInt64 is not exactly representable as
+	// a float64, so compare against a power-of-two bound that is.
+	bytes := n * float64(mult)
+	if bytes >= float64(1<<63) {
+		return 0, fmt.Errorf("invalid size %q: too large", s)
+	}
+	return int64(bytes), nil
 }

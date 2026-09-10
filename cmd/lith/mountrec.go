@@ -105,7 +105,16 @@ func writeMountRecord(rec mountRecord) (string, error) {
 	if err := dirTrusted(dir); err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// Create the run dir with Mkdir (single level; the parent — $XDG_RUNTIME_DIR,
+	// /run/user/<uid>, or /tmp — already exists) rather than MkdirAll: Mkdir does
+	// not silently accept a pre-existing symlink an attacker swapped in after the
+	// dirTrusted Lstat above (the /tmp/lith-<uid> fallback is the racy path).
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return "", err
+	}
+	// Re-verify AFTER creation and immediately before the write: closes the TOCTOU
+	// window between the first dirTrusted and the create.
+	if err := dirTrusted(dir); err != nil {
 		return "", err
 	}
 	rec.path = recordPath(rec.Mountpoint)
@@ -113,7 +122,18 @@ func writeMountRecord(rec mountRecord) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return rec.path, os.WriteFile(rec.path, b, 0o600)
+	// O_NOFOLLOW so a symlink planted at the record path is not followed;
+	// O_TRUNC because a record is rewritten on each mount. os.WriteFile would
+	// follow a symlink.
+	f, err := os.OpenFile(rec.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	return rec.path, f.Close()
 }
 
 func removeMountRecord(mountpoint string) { _ = os.Remove(recordPath(mountpoint)) }
