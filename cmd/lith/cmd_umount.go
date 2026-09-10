@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,23 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// trustedExecDirs are the only directories lith will exec system helpers from.
+// Resolving against a fixed list (not $PATH) stops a poisoned PATH under `sudo`
+// without secure_path from running an attacker binary as root (finding L7).
+var trustedExecDirs = []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+
+// trustedExecPath returns the first existing absolute path for name in
+// trustedExecDirs, or an error if none is found.
+func trustedExecPath(name string) (string, error) {
+	for _, d := range trustedExecDirs {
+		p := filepath.Join(d, name)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found in %v", name, trustedExecDirs)
+}
+
 // Injectable hooks (overridden in tests).
 var (
 	signalMount = func(pid int, sig syscall.Signal) error { return syscall.Kill(pid, sig) }
@@ -23,7 +41,11 @@ var (
 		if lazy {
 			flag = "-uz"
 		}
-		out, err := exec.Command("fusermount3", flag, mountpoint).CombinedOutput()
+		bin, err := trustedExecPath("fusermount3")
+		if err != nil {
+			return err
+		}
+		out, err := exec.Command(bin, flag, mountpoint).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 		}
@@ -31,7 +53,11 @@ var (
 	}
 	// fuserHolders returns the pids with open files under the mountpoint.
 	fuserHolders = func(mountpoint string) []int {
-		out, _ := exec.Command("fuser", "-m", mountpoint).Output()
+		bin, err := trustedExecPath("fuser")
+		if err != nil {
+			return nil
+		}
+		out, _ := exec.Command(bin, "-m", mountpoint).Output()
 		var pids []int
 		for _, tok := range strings.Fields(string(out)) {
 			if p, err := strconv.Atoi(tok); err == nil {
@@ -160,14 +186,19 @@ func umountOne(out interface{ Write([]byte) (int, error) }, mp string, timeout t
 		return nil
 	}
 	var pid int
+	// listMountRecords only returns records from a run dir we own (finding H2),
+	// but even a trusted record's pid is not proof it owns this mount — verify it
+	// against the processes actually holding the mount open before signalling.
 	for _, r := range listMountRecords() {
 		if abs, _ := filepath.Abs(r.Mountpoint); abs == mp {
 			pid = r.PID
 		}
 	}
+	holders := fuserHolders(mp)
 
-	// SIGTERM the owning process and wait for the mount to disappear.
-	if pid > 0 {
+	// SIGTERM the owning process only if it genuinely holds this mount; never
+	// signal a pid we cannot verify (it may be forged or unrelated).
+	if pid > 0 && containsInt(holders, pid) {
 		_ = signalMount(pid, syscall.SIGTERM)
 		if waitUnmounted(mp, timeout) {
 			removeMountRecord(mp)
@@ -176,8 +207,8 @@ func umountOne(out interface{ Write([]byte) (int, error) }, mp string, timeout t
 		}
 	}
 
-	// Still mounted. If the process is gone but files are open, refuse unless force.
-	if holders := fuserHolders(mp); len(holders) > 0 && !force {
+	// Still mounted. If files are open, refuse unless force.
+	if len(holders) > 0 && !force {
 		return fmt.Errorf("busy — open files held by pids %v (retry with --force to lazy-unmount)", holders)
 	}
 
@@ -200,6 +231,16 @@ func umountOne(out interface{ Write([]byte) (int, error) }, mp string, timeout t
 	}
 	removeMountRecord(mp)
 	return nil
+}
+
+// containsInt reports whether n is in s.
+func containsInt(s []int, n int) bool {
+	for _, v := range s {
+		if v == n {
+			return true
+		}
+	}
+	return false
 }
 
 // waitUnmounted polls until the mount leaves /proc/mounts or the timeout.

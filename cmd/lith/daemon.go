@@ -34,8 +34,11 @@ func daemonize() error {
 	if err != nil {
 		return err
 	}
-	logPath := filepath.Join(os.TempDir(), "lith-mount.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// Per-uid log opened 0600 with O_NOFOLLOW: a world-writable predictable log
+	// in a shared /tmp would let another user pre-plant a symlink so a root
+	// daemon appends to an arbitrary file (finding M2).
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("lith-%d-mount.log", os.Getuid()))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
