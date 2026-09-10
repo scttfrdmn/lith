@@ -52,7 +52,7 @@ func newMountsCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			recs := listMountRecords()
 			seen := map[string]bool{}
-			fmt.Fprintf(out, "%-24s %-10s %-14s %-8s %s\n", "MOUNTPOINT", "STATUS", "BUCKET", "PID", "ROOT / INDEX")
+			_, _ = fmt.Fprintf(out, "%-24s %-10s %-14s %-8s %s\n", "MOUNTPOINT", "STATUS", "BUCKET", "PID", "ROOT / INDEX")
 			for _, r := range recs {
 				abs, _ := filepath.Abs(r.Mountpoint)
 				seen[abs] = true
@@ -67,12 +67,12 @@ func newMountsCmd() *cobra.Command {
 				if root == "" {
 					root = "(bucket root)"
 				}
-				fmt.Fprintf(out, "%-24s %-10s %-14s %-8d %s  [%s]\n", r.Mountpoint, status, r.Bucket, r.PID, root, r.IndexFile)
+				_, _ = fmt.Fprintf(out, "%-24s %-10s %-14s %-8d %s  [%s]\n", r.Mountpoint, status, r.Bucket, r.PID, root, r.IndexFile)
 			}
 			// lith mounts in /proc with no record (started elsewhere).
 			for _, pm := range procMountsReader() {
 				if isLithMount(pm) && !seen[pm.Target] {
-					fmt.Fprintf(out, "%-24s %-10s %-14s %-8s %s\n", pm.Target, "live", pm.Source, "?", "(no record)")
+					_, _ = fmt.Fprintf(out, "%-24s %-10s %-14s %-8s %s\n", pm.Target, "live", pm.Source, "?", "(no record)")
 				}
 			}
 			return nil
@@ -104,13 +104,13 @@ func newUmountCmd() *cobra.Command {
 				targets = []string{abs}
 			}
 			if len(targets) == 0 {
-				fmt.Fprintln(out, "no lith mounts")
+				_, _ = fmt.Fprintln(out, "no lith mounts")
 				return nil
 			}
 			failed := 0
 			for _, mp := range targets {
 				if err := umountOne(out, mp, timeout, force); err != nil {
-					fmt.Fprintf(out, "%s: %v\n", mp, err)
+					_, _ = fmt.Fprintf(out, "%s: %v\n", mp, err)
 					failed++
 				}
 			}
@@ -153,7 +153,7 @@ func allLithMountpoints() []string {
 // (open files, process gone) is reported and refused unless force. Returns an
 // error if the mountpoint is still mounted at the end.
 func umountOne(out interface{ Write([]byte) (int, error) }, mp string, timeout time.Duration, force bool) error {
-	pf := func(format string, a ...any) { fmt.Fprintf(out, format, a...) }
+	pf := func(format string, a ...any) { _, _ = fmt.Fprintf(out, format, a...) }
 	if !mountedAt(mp) {
 		removeMountRecord(mp)
 		pf("%s: not mounted\n", mp)
