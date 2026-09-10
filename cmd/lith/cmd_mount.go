@@ -26,32 +26,33 @@ import (
 )
 
 type mountFlags struct {
-	indexFile      string
-	memCache       string
-	diskCache      string
-	diskPath       string
-	blockSize      string
-	maxRange       string
-	smallFile      string
-	partsMax       string
-	s3Concurrency  int
-	prefetchConc   int
-	prefetchBudget string
-	maxReadahead   int64
-	nicGbps        float64
-	siblingWindow  int
-	siblingRead    int
-	diskWriters    int
-	inflightBytes  string
-	metrics        string
-	pprof          string
-	timelineCSV    string
-	allowOther     bool
-	uid            int
-	gid            int
-	exec           bool
-	autoIndexLimit int
-	daemon         bool
+	indexFile        string
+	memCache         string
+	diskCache        string
+	diskPath         string
+	blockSize        string
+	maxRange         string
+	smallFile        string
+	partsMax         string
+	bgzfWholeFileMax string
+	s3Concurrency    int
+	prefetchConc     int
+	prefetchBudget   string
+	maxReadahead     int64
+	nicGbps          float64
+	siblingWindow    int
+	siblingRead      int
+	diskWriters      int
+	inflightBytes    string
+	metrics          string
+	pprof            string
+	timelineCSV      string
+	allowOther       bool
+	uid              int
+	gid              int
+	exec             bool
+	autoIndexLimit   int
+	daemon           bool
 
 	// S3 client options (shared with index build).
 	noSignRequest bool
@@ -84,6 +85,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
+	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
@@ -149,6 +151,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 	partsMax, err := parseSize(f.partsMax)
+	if err != nil {
+		return err
+	}
+	bgzfWholeFileMax, err := parseSize(f.bgzfWholeFileMax)
 	if err != nil {
 		return err
 	}
@@ -273,6 +279,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		GID:              uint32(f.gid),
 		SmallFile:        smallFile,
 		PartsMax:         partsMax,
+		BgzfWholeFileMax: bgzfWholeFileMax,
 		MaxReadahead:     f.maxReadahead,
 		SiblingWindow:    f.siblingWindow,
 		SiblingReadahead: f.siblingRead,

@@ -8,3 +8,6 @@ v0.2,W3 flagstat 8 CRAMs 8-way,60 GB,141,141,143.8,60.0,copy-best 219s
 v0.2,R1 tabix 1000x10kb,341 MB VCF,7.9,7.2,37.0,0.32,-
 v0.2,S3 xarray yearly-mean,1.4 TB Zarr store,35,22,79,0.80,in-place s3fs ~25s (same box); copy = whole store infeasible
 v0.2,BIG xarray ONE-MONTH (large-object selectivity),1.4 TB Zarr store,7.3,0.8,36.3,0.13,copy s5cmd+gp3-1000+NVMe DID NOT FINISH: staged 886 of 1434 GB in 20 min
+# v0.3 bgzf-family access plan (#107). R1/R2/S1 wall-clock unchanged (samtools/tabix decode-bound: samtools ~90-99% one core, lith ~2%). bgzf's effect is byte-selectivity, not latency. gb = S3 bytes pulled (lith metric).
+v0.3,R2single samtools view -c 20:30M-31M (point query),14 GB CRAM,0.28,0.06,,0.051,base adaptive readahead pulls 0.143 GB; bgzf tier-2 slice-precise pulls 0.051 (2.8x fewer bytes)
+v0.3,R2 samtools view -c 1000x1Mb,14 GB CRAM,46.4,44.5,,0.588,bgzf ties base 0.586 GB (was 2.41 GB / 4x before the per-slice seek-extend fix)
