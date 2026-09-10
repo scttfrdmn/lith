@@ -99,9 +99,12 @@ func (ix *CRAIIndex) RegionRanges(refID, beg, end int, fileSize int64) []Range {
 		if en <= int64(beg) || s > int64(end) {
 			continue
 		}
-		start := e.ContainerOffset
-		end2 := e.ContainerOffset + e.SliceOffset + e.SliceSize + maxBlockSize
-		rs = append(rs, Range{Start: start, End: end2})
+		// Slice-precise (ruling 3): the slice occupies
+		// [containerOffset+sliceOffset, +sliceSize) — prefetch exactly that, not
+		// the whole container (which was the 4× over-fetch). Adjacent slices
+		// coalesce.
+		start := e.ContainerOffset + e.SliceOffset
+		rs = append(rs, Range{Start: start, End: start + e.SliceSize})
 	}
 	return coalesce(rs, maxBlockSize, fileSize)
 }
@@ -110,7 +113,8 @@ func (ix *CRAIIndex) RegionRanges(refID, beg, end int, fileSize int64) []Range {
 func (ix *CRAIIndex) AllRanges(fileSize int64) []Range {
 	var rs []Range
 	for _, e := range ix.entries {
-		rs = append(rs, Range{Start: e.ContainerOffset, End: e.ContainerOffset + e.SliceOffset + e.SliceSize + maxBlockSize})
+		start := e.ContainerOffset + e.SliceOffset // slice-precise (ruling 3)
+		rs = append(rs, Range{Start: start, End: start + e.SliceSize})
 	}
 	return coalesce(rs, maxBlockSize, fileSize)
 }

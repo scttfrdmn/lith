@@ -38,6 +38,10 @@ type Config struct {
 	SmallFile    int64 // whole-file prefetch threshold in bytes
 	PartsMax     int64 // largest file fetched whole as parallel parts on first read (#69); 0 falls back to SmallFile
 	MaxReadahead int64 // max sequential readahead window in blocks
+	// BgzfWholeFileMax is the largest bgzf data file (with an index sibling)
+	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
+	// 0 uses the default of 512 MiB.
+	BgzfWholeFileMax int64
 	// Limits is the single prefetch policy object (#64): the per-handle
 	// readahead window, sibling readahead (#63), and small-file parts (#69) all
 	// query it for budget and neighborhood. When nil, the FUSE layer falls back
@@ -130,12 +134,11 @@ type fileHandle struct {
 	// the parts fetch already covers every block, so readahead would only
 	// contend with it for the same chunks (see Open).
 	partsDispatched atomic.Bool
-	// randomProtect suppresses per-handle sequential readahead for a bgzf data
-	// file with an index (#107): access is seek-driven, so a scan-shaped window
-	// would only over-fetch. bgzfRanges (if set) carries the index's compressed
-	// byte ranges for tier-2 seek extension.
-	randomProtect bool
-	bgzfRanges    []bgzf.Range
+	// bgzfRanges (if set) carries a large bgzf data file's index byte ranges for
+	// tier-2 slice-precise seek extension (#107). The handle keeps its adaptive
+	// readahead window regardless — the Format layer only adds ranges, it never
+	// changes the detector (ruling 1); any overlap joins via the singleflight.
+	bgzfRanges []bgzf.Range
 }
 
 type rawFS struct {
@@ -341,7 +344,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// data-header prefetch. Detected from the Index (sibling presence), no S3 call.
 	bgzfHandled := f.maybeBgzfReadahead(n.path, h, fi.Size)
 
-	if fi.Size > f.partsThreshold() && !h.randomProtect {
+	if fi.Size > f.partsThreshold() {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -414,7 +417,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// Drive the prefetcher off the block this read falls in — unless a whole-file
 	// parts fetch is in flight for this handle, which already covers every block
 	// (see Open: readahead would only contend with the parts fetch).
-	if !h.partsDispatched.Load() && !h.randomProtect {
+	if !h.partsDispatched.Load() {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			pb := pb

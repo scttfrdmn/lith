@@ -86,10 +86,28 @@ func (f *rawFS) maybeBgzfReadahead(relPath string, h *fileHandle, size int64) bo
 		return false // no coordinate index sibling → leave to normal handling
 	}
 	f.met.FormatDetect("bgzf")
-	h.randomProtect = true
-	f.prefetchByteRange(h.key, 0, headerBytes(size), size) // header block
-	h.bgzfRanges = f.bgzfRangesFor(idxRel, kind, size)     // tier-2 substrate (cached)
+	// The handle keeps its adaptive readahead window (ruling 1) — we never flip a
+	// detector by file type. We only *add* a plan; overlaps join via singleflight.
+	if size <= f.bgzfWholeFileMax() {
+		// A small indexed data file's working set is essentially the whole file
+		// (e.g. tabix over 1000 regions touches nearly every bgzf block), so
+		// fetch it all through the parts path on open → cold ≈ warm (ruling 2).
+		f.prefetchByteRange(h.key, 0, size, size)
+		return true
+	}
+	// Large data file (e.g. a 14 GB CRAM): header + slice-precise tier-2 ranges.
+	f.prefetchByteRange(h.key, 0, headerBytes(size), size)
+	h.bgzfRanges = f.bgzfRangesFor(idxRel, kind, size)
 	return true
+}
+
+// bgzfWholeFileMax is the largest bgzf data file prefetched whole on open;
+// above it, tier-2 slice ranges are used. 0 disables whole-file prefetch.
+func (f *rawFS) bgzfWholeFileMax() int64 {
+	if f.cfg.BgzfWholeFileMax > 0 {
+		return f.cfg.BgzfWholeFileMax
+	}
+	return 512 << 20
 }
 
 // bgzfDataFor returns the data-file key an index-file key indexes, if present.

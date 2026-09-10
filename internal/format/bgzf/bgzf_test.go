@@ -170,15 +170,16 @@ func TestParseCRAI(t *testing.T) {
 	if !ok || ix.Len() != 3 {
 		t.Fatalf("ParseCRAI ok=%v len=%d", ok, ix.Len())
 	}
-	// Region ref0 [0,500) overlaps only the first slice (container@100).
+	// Region ref0 [0,500) overlaps only the first slice; slice-precise start is
+	// containerOffset(100)+sliceOffset(50)=150, size 2000 → [150,2150).
 	got := ix.RegionRanges(0, 0, 500, 1<<30)
-	if len(got) != 1 || got[0].Start != 100 {
-		t.Fatalf("CRAI RegionRanges = %v, want one range from 100", got)
+	if len(got) != 1 || got[0].Start != 150 || got[0].End != 2150 {
+		t.Fatalf("CRAI RegionRanges = %v, want one slice-precise range [150,2150)", got)
 	}
-	// A region on ref1 uses ref1's container only.
+	// A region on ref1 uses ref1's slice only (container@9000 + 50).
 	got = ix.RegionRanges(1, 0, 500, 1<<30)
-	if len(got) != 1 || got[0].Start != 9000 {
-		t.Fatalf("CRAI ref1 = %v, want from 9000", got)
+	if len(got) != 1 || got[0].Start != 9050 {
+		t.Fatalf("CRAI ref1 = %v, want from 9050", got)
 	}
 }
 

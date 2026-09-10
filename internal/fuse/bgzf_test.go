@@ -24,8 +24,7 @@ func gz(s string) []byte {
 	return b.Bytes()
 }
 
-// openHandle opens rel (single component under root) and returns its handle.
-func openHandle(t *testing.T, raw *rawFS, rel string) *fileHandle {
+func openHandle(t *testing.T, raw *rawFS, rel string) (*fileHandle, uint64) {
 	t.Helper()
 	var eo fuse.EntryOut
 	if s := raw.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, rel, &eo); s != fuse.OK {
@@ -38,110 +37,118 @@ func openHandle(t *testing.T, raw *rawFS, rel string) *fileHandle {
 	raw.mu.RLock()
 	h := raw.handles[oo.Fh]
 	raw.mu.RUnlock()
-	return h
+	return h, oo.Fh
 }
 
-// TestBgzfTier1And2: opening a CRAM with a `.crai` sibling puts the handle in
-// random-protection mode and loads the index's container ranges; a read that
-// seeks into a container prefetches that whole container (tier-2), so a
-// follow-on read inside it is a cache hit.
-func TestBgzfTier1And2(t *testing.T) {
-	srv := fake.New()
-	now := time.Unix(1_700_000_000, 0)
-	const dataSize = 8 << 20
-	srv.Put("aln.cram", make([]byte, dataSize), now)
-	// Two containers: ref0 @0 (1 MiB) and ref0 @ 4 MiB (1 MiB).
-	srv.Put("aln.cram.crai", gz(
-		"0\t0\t1000\t0\t0\t1048576\n"+
-			"0\t5000\t1000\t4194304\t0\t1048576\n"), now)
-
+func mkFS(t *testing.T, srv *fake.Server, cfg Config) *rawFS {
+	t.Helper()
 	ix, err := index.BuildFromList(context.Background(), srv, index.ListOptions{Options: index.Options{Bucket: "b"}})
 	if err != nil {
 		t.Fatalf("index: %v", err)
 	}
 	bs, _ := blockstore.New(srv, blockstore.Config{Bucket: "b", BlockSize: 1 << 20, MemCache: 256 << 20, MaxRange: 16 << 20})
-	pol := prefetch.NewPolicy(128<<20, prefetch.DeviceLimits{}, nil)
-	raw := NewRawFileSystem(Config{Index: ix, Store: bs, SmallFile: 1 << 20, Limits: pol}).(*rawFS)
+	cfg.Index, cfg.Store = ix, bs
+	if cfg.Limits == nil {
+		cfg.Limits = prefetch.NewPolicy(128<<20, prefetch.DeviceLimits{}, nil)
+	}
+	return NewRawFileSystem(cfg).(*rawFS)
+}
 
-	h := openHandle(t, raw, "aln.cram")
-	if !h.randomProtect {
-		t.Fatal("CRAM with a .crai sibling did not enter random-protection mode")
-	}
-	if len(h.bgzfRanges) == 0 {
-		t.Fatal("no bgzf ranges loaded from .crai")
-	}
-	// Second container range starts at 4 MiB.
-	found := false
-	for _, r := range h.bgzfRanges {
-		if r.Start == 4194304 {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected a range starting at 4 MiB; got %v", h.bgzfRanges)
-	}
+// TestBgzfWholeFileSmall: a CRAM at/below --bgzf-whole-file-max with a .crai
+// sibling is prefetched whole on open (ruling 2) — no tier-2 ranges, and a read
+// anywhere is a cache hit. The adaptive window is untouched (ruling 1).
+func TestBgzfWholeFileSmall(t *testing.T) {
+	srv := fake.New()
+	now := time.Unix(1_700_000_000, 0)
+	srv.Put("aln.cram", make([]byte, 8<<20), now)
+	srv.Put("aln.cram.crai", gz("0\t0\t1000\t0\t0\t1048576\n"), now)
+	raw := mkFS(t, srv, Config{SmallFile: 1 << 20, PartsMax: 4 << 20, BgzfWholeFileMax: 512 << 20})
 
-	// Seek into the 2nd container (offset 4 MiB) → tier-2 prefetches it whole.
-	readAt := func(off int64) {
-		buf := make([]byte, 4096)
-		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fhOf(raw, h), Offset: uint64(off), Size: 4096}, buf)
+	h, fh := openHandle(t, raw, "aln.cram")
+	if len(h.bgzfRanges) != 0 {
+		t.Fatalf("small file should use whole-file prefetch, not tier-2 ranges; got %d ranges", len(h.bgzfRanges))
 	}
-	readAt(4 << 20)
 	waitStableGets(srv)
 	before := srv.GetCallCount()
-	// A read elsewhere in that container is now a cache hit (no new GET).
-	readAt(4<<20 + 512<<10)
+	buf := make([]byte, 4096)
+	raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: 6 << 20, Size: 4096}, buf)
 	waitStableGets(srv)
 	if after := srv.GetCallCount(); after != before {
-		t.Fatalf("read within the prefetched container issued %d new GET(s); tier-2 range prefetch not effective", after-before)
+		t.Fatalf("read after whole-file prefetch issued %d new GET(s); file not prefetched whole", after-before)
 	}
 }
 
-// fhOf finds the fh for a handle (test helper).
-func fhOf(raw *rawFS, h *fileHandle) uint64 {
-	raw.mu.RLock()
-	defer raw.mu.RUnlock()
-	for fh, hh := range raw.handles {
-		if hh == h {
-			return fh
+// TestBgzfTier2LargeSlicePrecise: above the whole-file threshold, tier-2 loads
+// slice-precise ranges from the .crai and a seek prefetches just that slice —
+// starting at containerOffset+sliceOffset (not the whole container), and a
+// follow-on read in the slice is a hit.
+func TestBgzfTier2LargeSlicePrecise(t *testing.T) {
+	srv := fake.New()
+	now := time.Unix(1_700_000_000, 0)
+	srv.Put("big.cram", make([]byte, 8<<20), now)
+	// Container @4 MiB, slice offset 64 KiB, size 1 MiB → slice [4259840, 5308416).
+	srv.Put("big.cram.crai", gz(
+		"0\t0\t1000\t0\t0\t1048576\n"+
+			"0\t5000\t1000\t4194304\t65536\t1048576\n"), now)
+	raw := mkFS(t, srv, Config{SmallFile: 1 << 20, PartsMax: 4 << 20, BgzfWholeFileMax: 1 << 20}) // 8 MiB > 1 MiB → large
+
+	h, fh := openHandle(t, raw, "big.cram")
+	if len(h.bgzfRanges) == 0 {
+		t.Fatal("large file with .crai should load tier-2 ranges")
+	}
+	// Slice-precise: a range starts at container(4 MiB)+sliceOffset(64 KiB), not
+	// at the container start.
+	const sliceStart = 4194304 + 65536
+	foundSlice, foundContainerStart := false, false
+	for _, r := range h.bgzfRanges {
+		if r.Start == sliceStart {
+			foundSlice = true
+		}
+		if r.Start == 4194304 {
+			foundContainerStart = true
 		}
 	}
-	return 0
-}
+	if !foundSlice {
+		t.Fatalf("expected a slice-precise range starting at %d; got %v", sliceStart, h.bgzfRanges)
+	}
+	if foundContainerStart {
+		t.Fatalf("range started at the container offset (whole-container over-fetch): %v", h.bgzfRanges)
+	}
 
-// TestBgzfNoIndexNoProtection: a CRAM without a .crai sibling is handled
-// normally (no random protection, no ranges).
-func TestBgzfNoIndexNoProtection(t *testing.T) {
-	srv := fake.New()
-	now := time.Unix(1_700_000_000, 0)
-	srv.Put("plain.cram", make([]byte, 8<<20), now)
-	ix, _ := index.BuildFromList(context.Background(), srv, index.ListOptions{Options: index.Options{Bucket: "b"}})
-	bs, _ := blockstore.New(srv, blockstore.Config{Bucket: "b", BlockSize: 1 << 20, MemCache: 64 << 20, MaxRange: 8 << 20})
-	pol := prefetch.NewPolicy(64<<20, prefetch.DeviceLimits{}, nil)
-	raw := NewRawFileSystem(Config{Index: ix, Store: bs, SmallFile: 1 << 20, Limits: pol}).(*rawFS)
-
-	h := openHandle(t, raw, "plain.cram")
-	if h.randomProtect || len(h.bgzfRanges) != 0 {
-		t.Fatalf("CRAM without an index got bgzf treatment: protect=%v ranges=%d", h.randomProtect, len(h.bgzfRanges))
+	readAt := func(off int64) {
+		buf := make([]byte, 4096)
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+	}
+	readAt(sliceStart) // seek into the slice → tier-2 prefetches it
+	waitStableGets(srv)
+	before := srv.GetCallCount()
+	readAt(sliceStart + 512<<10) // elsewhere in the slice → hit
+	waitStableGets(srv)
+	if after := srv.GetCallCount(); after != before {
+		t.Fatalf("read within the prefetched slice issued %d new GET(s)", after-before)
 	}
 }
 
-// TestBgzfMalformedIndexTier1: a corrupt .crai still detects (random protection
-// on) but loads no ranges — tier 1 only, no panic.
-func TestBgzfMalformedIndexTier1(t *testing.T) {
+// TestBgzfNoIndex: a CRAM without a .crai sibling gets no bgzf treatment.
+func TestBgzfNoIndex(t *testing.T) {
+	srv := fake.New()
+	srv.Put("plain.cram", make([]byte, 8<<20), time.Unix(1_700_000_000, 0))
+	raw := mkFS(t, srv, Config{SmallFile: 1 << 20, BgzfWholeFileMax: 1 << 20})
+	h, _ := openHandle(t, raw, "plain.cram")
+	if len(h.bgzfRanges) != 0 {
+		t.Fatalf("CRAM without an index got tier-2 ranges: %d", len(h.bgzfRanges))
+	}
+}
+
+// TestBgzfMalformedIndexLargeTier1: a corrupt .crai on a large file yields no
+// ranges (tier 1 only) and does not panic.
+func TestBgzfMalformedIndexLargeTier1(t *testing.T) {
 	srv := fake.New()
 	now := time.Unix(1_700_000_000, 0)
-	srv.Put("x.cram", make([]byte, 4<<20), now)
+	srv.Put("x.cram", make([]byte, 8<<20), now)
 	srv.Put("x.cram.crai", []byte("not a gzip stream"), now)
-	ix, _ := index.BuildFromList(context.Background(), srv, index.ListOptions{Options: index.Options{Bucket: "b"}})
-	bs, _ := blockstore.New(srv, blockstore.Config{Bucket: "b", BlockSize: 1 << 20, MemCache: 64 << 20, MaxRange: 8 << 20})
-	pol := prefetch.NewPolicy(64<<20, prefetch.DeviceLimits{}, nil)
-	raw := NewRawFileSystem(Config{Index: ix, Store: bs, SmallFile: 1 << 20, Limits: pol}).(*rawFS)
-
-	h := openHandle(t, raw, "x.cram")
-	if !h.randomProtect {
-		t.Fatal("detection should still set random protection with a present (if corrupt) index")
-	}
+	raw := mkFS(t, srv, Config{SmallFile: 1 << 20, BgzfWholeFileMax: 1 << 20})
+	h, _ := openHandle(t, raw, "x.cram")
 	if len(h.bgzfRanges) != 0 {
 		t.Fatalf("malformed .crai yielded ranges: %v", h.bgzfRanges)
 	}
