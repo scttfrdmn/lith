@@ -135,7 +135,9 @@ func (ix *CSIIndex) RegionRanges(refID, beg, end int, fileSize int64) []Range {
 	return coalesce(rs, maxBlockSize, fileSize)
 }
 
-// AllRanges returns every compressed byte range the index points at, coalesced.
+// AllRanges returns every compressed chunk range the index points at, as sorted
+// per-chunk units (not coalesced) — see units and (*Index).AllRanges for why the
+// seek-extension feed must keep unit boundaries.
 func (ix *CSIIndex) AllRanges(fileSize int64) []Range {
 	var rs []Range
 	for _, ref := range ix.refs {
@@ -145,5 +147,5 @@ func (ix *CSIIndex) AllRanges(fileSize int64) []Range {
 			}
 		}
 	}
-	return coalesce(rs, maxBlockSize, fileSize)
+	return units(rs, fileSize)
 }

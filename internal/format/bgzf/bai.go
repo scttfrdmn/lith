@@ -188,9 +188,11 @@ func (ix *Index) RegionRanges(refID, beg, end int, fileSize int64) []Range {
 	return coalesce(rs, maxBlockSize, fileSize)
 }
 
-// AllRanges returns every compressed byte range the index points at, coalesced —
-// the union over all references. Tier-2 seek-extension uses it to map a demand
-// read offset to the enclosing chunk range.
+// AllRanges returns every compressed chunk range the index points at, as sorted
+// per-chunk units (not coalesced) — the union over all references. Tier-2
+// seek-extension uses it to map a demand read offset to the enclosing chunk and
+// prefetch just that chunk; keeping chunk boundaries is what bounds the fetch
+// (see units).
 func (ix *Index) AllRanges(fileSize int64) []Range {
 	var rs []Range
 	for _, ref := range ix.refs {
@@ -203,5 +205,5 @@ func (ix *Index) AllRanges(fileSize int64) []Range {
 			}
 		}
 	}
-	return coalesce(rs, maxBlockSize, fileSize)
+	return units(rs, fileSize)
 }

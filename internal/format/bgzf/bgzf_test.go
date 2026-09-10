@@ -183,6 +183,29 @@ func TestParseCRAI(t *testing.T) {
 	}
 }
 
+// TestCRAIAllRangesPerSlice: physically contiguous slices must stay as separate
+// units in AllRanges (the tier-2 seek-extension feed), not fuse into one
+// whole-file range — otherwise seek-extension prefetches from the first seek to
+// EOF (the 4× over-fetch ruling 3 prevents).
+func TestCRAIAllRangesPerSlice(t *testing.T) {
+	// Three back-to-back 1000-byte slices: [0,1000) [1000,2000) [2000,3000).
+	raw := gzipBytes([]byte(
+		"0\t0\t100\t0\t0\t1000\n" +
+			"0\t100\t100\t1000\t0\t1000\n" +
+			"0\t200\t100\t2000\t0\t1000\n"))
+	ix, ok := ParseCRAI(raw)
+	if !ok {
+		t.Fatal("ParseCRAI failed")
+	}
+	got := ix.AllRanges(1 << 30)
+	if len(got) != 3 {
+		t.Fatalf("contiguous slices coalesced: AllRanges = %v, want 3 separate units", got)
+	}
+	if got[0] != (Range{0, 1000}) || got[2] != (Range{2000, 3000}) {
+		t.Fatalf("unexpected units: %v", got)
+	}
+}
+
 func TestParsersRejectMalformed(t *testing.T) {
 	for _, tc := range []struct {
 		name string

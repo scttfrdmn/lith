@@ -109,12 +109,16 @@ func (ix *CRAIIndex) RegionRanges(refID, beg, end int, fileSize int64) []Range {
 	return coalesce(rs, maxBlockSize, fileSize)
 }
 
-// AllRanges returns every container byte range in the index, coalesced.
+// AllRanges returns every slice byte range in the index as sorted per-slice
+// units (not coalesced). CRAM slices are physically contiguous, so coalescing
+// would fuse them into one whole-file range; keeping per-slice boundaries lets
+// tier-2 seek-extension prefetch just the enclosing slice (ruling 3, near-zero
+// over-fetch). See units.
 func (ix *CRAIIndex) AllRanges(fileSize int64) []Range {
 	var rs []Range
 	for _, e := range ix.entries {
 		start := e.ContainerOffset + e.SliceOffset // slice-precise (ruling 3)
 		rs = append(rs, Range{Start: start, End: start + e.SliceSize})
 	}
-	return coalesce(rs, maxBlockSize, fileSize)
+	return units(rs, fileSize)
 }

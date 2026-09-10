@@ -174,5 +174,56 @@ func coalesce(rs []Range, slack, fileSize int64) []Range {
 	return out
 }
 
+// units clamps and sorts ranges to [0,fileSize] and drops empty ones, but does
+// NOT merge adjacent ranges. It is the feed for tier-2 seek-extension, which
+// prefetches only the single unit (slice/chunk) enclosing a demand offset. We
+// must keep unit boundaries here: CRAM slices (and bgzf chunks) are physically
+// contiguous, so coalescing within a block of slack would fuse the whole file
+// into one range and seek-extension would then prefetch from the first seek to
+// EOF — the 4× over-fetch ruling 3 exists to prevent. Overlapping units are
+// merged (a later unit fully inside an earlier one is dropped) so the sorted
+// list stays non-degenerate, but merely-touching units stay separate.
+func units(rs []Range, fileSize int64) []Range {
+	if len(rs) == 0 {
+		return nil
+	}
+	cl := rs[:0]
+	for _, r := range rs {
+		if r.Start < 0 {
+			r.Start = 0
+		}
+		if fileSize > 0 && r.End > fileSize {
+			r.End = fileSize
+		}
+		if r.End > r.Start {
+			cl = append(cl, r)
+		}
+	}
+	if len(cl) == 0 {
+		return nil
+	}
+	sort.Slice(cl, func(i, j int) bool {
+		if cl[i].Start != cl[j].Start {
+			return cl[i].Start < cl[j].Start
+		}
+		return cl[i].End < cl[j].End
+	})
+	out := []Range{cl[0]}
+	for _, r := range cl[1:] {
+		last := &out[len(out)-1]
+		if r.Start == last.Start && r.End == last.End {
+			continue // exact duplicate
+		}
+		if r.Start < last.End { // strictly overlapping (not merely touching) → merge
+			if r.End > last.End {
+				last.End = r.End
+			}
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 // cvo splits a bgzf virtual offset into its compressed block offset.
 func cvo(voffset uint64) int64 { return int64(voffset >> 16) }
