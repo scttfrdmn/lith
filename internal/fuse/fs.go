@@ -378,6 +378,9 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 
 	off := int64(input.Offset)
 	length := int64(len(buf))
+	// Record the read size and the distinct object bytes this read touches (#65).
+	f.met.ObserveReadSize(length)
+	f.met.MarkDistinctRead(h.key.Key, off, length, h.size)
 	end := off + length
 	if end > h.size {
 		end = h.size
