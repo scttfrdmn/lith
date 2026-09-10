@@ -70,9 +70,11 @@ credentials:
 ```
 lith index build s3://1000genomes/changelog_details --index-file /tmp/1kg.lithidx --no-sign-request
 lith index inspect /tmp/1kg.lithidx
+sudo mkdir -p /mnt/1kg && sudo chown "$USER" /mnt/1kg   # you must own the mountpoint
 lith mount  s3://1000genomes/changelog_details /mnt/1kg --index-file /tmp/1kg.lithidx --no-sign-request
 ls -l /mnt/1kg
 cat /mnt/1kg/changelog_details_20081219
+lith umount /mnt/1kg
 ```
 
 ## Documentation

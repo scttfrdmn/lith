@@ -42,11 +42,14 @@ lith calls S3 for metadata; from here `ls` and `stat` are answered locally.
 ## 3. Mount it
 
 ```bash
-sudo mkdir -p /mnt/hg00100
+sudo mkdir -p /mnt/hg00100 && sudo chown "$USER" /mnt/hg00100  # you must own the mountpoint
 lith mount s3://1000genomes/phase3/data/HG00100/alignment /mnt/hg00100 \
   --index-file /tmp/hg00100.lithidx --no-sign-request --daemon
 ls -lh /mnt/hg00100
 ```
+
+(`fusermount3` requires write access to the mountpoint, so the user running
+`lith` must own it — hence the `chown` after the `sudo mkdir`.)
 
 `ls` returns immediately and shows a **14 GiB** `…low_coverage…bam.cram` and its
 `.crai` index — real sizes and mtimes, served from the local index without
