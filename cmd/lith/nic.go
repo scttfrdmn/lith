@@ -5,10 +5,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -129,11 +131,32 @@ func imdsInstanceType(ctx context.Context) string {
 	return strings.TrimSpace(string(b))
 }
 
-func nicCachePath(dir string) string { return filepath.Join(dir, "nic.json") }
+// nicCachePath is the per-uid cache file. Callers pass os.TempDir() when
+// --index-file is unset (and bench always), so a shared name like nic.json in a
+// world-writable /tmp would let another user pre-plant a symlink or a decoy
+// (findings F2/F3). Scoping the name by euid — mirroring the daemon log in
+// daemon.go — keeps each user's cache in a path only they write.
+func nicCachePath(dir string) string {
+	return filepath.Join(dir, fmt.Sprintf("nic-%d.json", os.Geteuid()))
+}
 
-// readNICCache reads a previously written nic.json.
+// readNICCache reads a previously written per-uid cache, but only trusts it if
+// it is a regular file (not a symlink or a directory) owned by the current euid.
+// A planted symlink or a file owned by another user could otherwise steer our
+// in-flight/readahead budget (F3). Any failure falls through to live detection.
 func readNICCache(dir string) (nicInfo, bool) {
-	b, err := os.ReadFile(nicCachePath(dir))
+	path := nicCachePath(dir)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nicInfo{}, false
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return nicInfo{}, false
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != uint32(os.Geteuid()) {
+		return nicInfo{}, false
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nicInfo{}, false
 	}
@@ -144,12 +167,33 @@ func readNICCache(dir string) (nicInfo, bool) {
 	return ni, true
 }
 
-// writeNICCache persists the resolved NIC info next to the index (best-effort).
+// writeNICCache persists the resolved NIC info to a per-uid file (best-effort).
+// It never follows a symlink and never truncates a file it does not own: an
+// attacker who pre-plants the cache path (as a symlink or a decoy owned by
+// another user) must not be able to redirect our write to an arbitrary file or
+// have us clobber it as root (F2). A stale cache we do own is refreshed via an
+// Lstat-verified unlink-then-create; the create is O_EXCL|O_NOFOLLOW so a symlink
+// raced in after the Lstat still makes us skip rather than follow it.
 func writeNICCache(dir string, ni nicInfo) {
 	b, err := json.Marshal(ni)
 	if err != nil {
 		return
 	}
 	_ = os.MkdirAll(dir, 0o755)
-	_ = os.WriteFile(nicCachePath(dir), b, 0o644)
+	path := nicCachePath(dir)
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			return // symlink or non-regular: never touch it
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != uint32(os.Geteuid()) {
+			return // owned by someone else: never overwrite it
+		}
+		_ = os.Remove(path) // our own stale cache: safe to replace
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return // EEXIST (raced) / ELOOP (symlink) / other: skip, cache is best-effort
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.Write(b)
 }
