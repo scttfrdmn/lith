@@ -98,6 +98,31 @@ func TestReaddirListsChildrenAndDots(t *testing.T) {
 	}
 }
 
+// TestReaddirUntrustedOffset drives ReadDir and ReadDirPlus with directory
+// offsets a local process can force via lseek (1, and a huge value). The
+// readdirplus path must not underflow rc = cursor - 2, and neither path may
+// panic the mount server (M1 + H-a recover guard). Expect fuse.OK.
+func TestReaddirUntrustedOffset(t *testing.T) {
+	raw, _ := newTestFS(t)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("readdir with untrusted offset panicked: %v", r)
+		}
+	}()
+	offsets := []uint64{0, 1, 2, ^uint64(0), 1 << 40}
+	for _, off := range offsets {
+		in := &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Offset: off}
+		de := fuse.NewDirEntryList(make([]byte, 4096), off)
+		if s := raw.ReadDir(nil, in, de); s != fuse.OK {
+			t.Errorf("ReadDir(offset=%d) = %v, want OK", off, s)
+		}
+		dep := fuse.NewDirEntryList(make([]byte, 4096), off)
+		if s := raw.ReadDirPlus(nil, in, dep); s != fuse.OK {
+			t.Errorf("ReadDirPlus(offset=%d) = %v, want OK", off, s)
+		}
+	}
+}
+
 func TestStatFsReportsIndexTotals(t *testing.T) {
 	raw, _ := newTestFS(t)
 	var so fuse.StatfsOut

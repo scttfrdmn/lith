@@ -30,7 +30,10 @@ func Open(path string) (*Index, func() error, error) {
 		return nil, nil, fmt.Errorf("index: file too small: %s", path)
 	}
 
-	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	// MAP_PRIVATE gives a read-only, copy-on-write mapping: zero-copy loads (lith
+	// never writes it) that are immune to post-validation mutation of the backing
+	// file (L6).
+	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_PRIVATE)
 	if err != nil {
 		return nil, nil, fmt.Errorf("index: mmap %s: %w", path, err)
 	}

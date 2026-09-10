@@ -8,6 +8,8 @@ package fuse
 
 import (
 	"context"
+	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,6 +187,18 @@ func (f *rawFS) observe(op string, start time.Time) {
 	f.met.ObserveFUSE(op, time.Since(start).Seconds())
 }
 
+// recoverToStatus recovers a panic in a query-path handler and degrades it to
+// EIO rather than letting it crash the single mount server for every user
+// (defense-in-depth, H-a). It is deferred with the address of the handler's
+// named return status; the success paths are untouched.
+func (f *rawFS) recoverToStatus(status *fuse.Status) {
+	if r := recover(); r != nil {
+		slog.Error("lith: recovered panic in FUSE handler; returning EIO",
+			"panic", r, "stack", string(debug.Stack()))
+		*status = fuse.EIO
+	}
+}
+
 // resolve returns the node for a NodeId.
 func (f *rawFS) resolve(id uint64) (*node, bool) {
 	f.mu.RLock()
@@ -231,7 +245,8 @@ func (f *rawFS) fillAttr(a *fuse.Attr, fi index.FileInfo) {
 }
 
 // Lookup resolves a child name under a directory NodeId.
-func (f *rawFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
+func (f *rawFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) (status fuse.Status) {
+	defer f.recoverToStatus(&status)
 	defer f.observe("lookup", time.Now())
 	parent, ok := f.resolve(header.NodeId)
 	if !ok {
@@ -268,7 +283,8 @@ func (f *rawFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 }
 
 // Open opens a file for reading and allocates a handle with a prefetcher.
-func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
+	defer f.recoverToStatus(&status)
 	n, ok := f.resolve(input.NodeId)
 	if !ok {
 		return fuse.ENOENT
@@ -328,7 +344,8 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 }
 
 // Read serves a read from the block store and drives prefetch.
-func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr fuse.ReadResult, status fuse.Status) {
+	defer f.recoverToStatus(&status)
 	start := time.Now()
 	defer f.observe("read", start)
 	f.mu.RLock()
@@ -597,7 +614,8 @@ func (f *rawFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	return f.readdir(input, out, true)
 }
 
-func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) fuse.Status {
+func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (status fuse.Status) {
+	defer f.recoverToStatus(&status)
 	n, ok := f.resolve(input.NodeId)
 	if !ok || !n.isDir {
 		return fuse.ENOTDIR
@@ -628,7 +646,11 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) f
 			}
 			cursor = 2
 		}
-	} else if cursor == 0 {
+	} else if cursor < 2 {
+		// The plus path has no "."/".." entries, but it must still treat an
+		// untrusted low offset the same as a fresh listing: a cursor of 1 (or 0)
+		// would otherwise underflow rc = cursor - 2 to ~2^64 and hand Readdir a
+		// bogus cursor. Clamp to the offset base (M1).
 		cursor = 2 // keep the same offset base as the non-plus path
 	}
 
