@@ -3,9 +3,11 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,16 +107,47 @@ func (m *mountTimeline) writeCSV(path string) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := fmt.Fprintln(f, "ms,kind,prefetched,wait_ms,inflight,lag_ms,chunk,key"); err != nil {
+
+	w := csv.NewWriter(f)
+	if err := w.Write([]string{"ms", "kind", "prefetched", "wait_ms", "inflight", "lag_ms", "chunk", "key"}); err != nil {
 		return 0, err
 	}
 	for _, r := range rows {
-		if _, err := fmt.Fprintf(f, "%.3f,%s,%t,%.3f,%d,%.3f,%d,%s\n",
-			r.ms, r.kind, r.prefetched, r.waitMs, r.inflight, r.lagMs, r.chunk, r.key); err != nil {
+		rec := []string{
+			strconv.FormatFloat(r.ms, 'f', 3, 64),
+			sanitizeCSVCell(r.kind),
+			strconv.FormatBool(r.prefetched),
+			strconv.FormatFloat(r.waitMs, 'f', 3, 64),
+			strconv.Itoa(r.inflight),
+			strconv.FormatFloat(r.lagMs, 'f', 3, 64),
+			strconv.FormatInt(r.chunk, 10),
+			sanitizeCSVCell(r.key),
+		}
+		if err := w.Write(rec); err != nil {
 			return 0, err
 		}
 	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return 0, err
+	}
 	return len(rows), nil
+}
+
+// sanitizeCSVCell neutralizes spreadsheet formula injection: encoding/csv
+// already quotes/escapes structural characters (comma, quote, newline), but a
+// cell whose first character is one of = + - @ \t \r is interpreted as a live
+// formula when the file is opened in Excel/Sheets. Per OWASP guidance we prefix
+// such a cell with a single quote to force it to be treated as literal text.
+func sanitizeCSVCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 
 // summary returns a short human-readable digest of the distributions #70 asks
