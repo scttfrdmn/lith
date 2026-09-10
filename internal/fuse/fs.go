@@ -149,6 +149,7 @@ type fileHandle struct {
 	// on first read and shared across handles via footerState. footerParsed marks
 	// that a parse was attempted (nil result = tier 1 only).
 	footerKind    footer.Format
+	footerMu      sync.Mutex // guards the footer tier-2 state below (Read is concurrent per handle)
 	footerParsed  bool
 	footerMeta    *footer.ParquetMeta
 	footerProj    *footerProjection

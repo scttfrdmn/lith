@@ -90,8 +90,14 @@ func (f *rawFS) maybeFooterReadahead(relPath string, h *fileHandle, size int64) 
 	return true
 }
 
-// footerReadExtend is the tier-2 read hook.
+// footerReadExtend is the tier-2 read hook. FUSE serves reads for one handle
+// concurrently, and the parquet/zip paths mutate per-handle state (the parse
+// result, the learned projection, the dispatched set), so the whole hook runs
+// under the handle's footerMu. The one-time parse's GetRange runs under the lock
+// too — it blocks only the first concurrent reads on this handle, once.
 func (f *rawFS) footerReadExtend(h *fileHandle, off int64) {
+	h.footerMu.Lock()
+	defer h.footerMu.Unlock()
 	switch h.footerKind {
 	case footer.FormatParquet:
 		f.footerParquetRead(h, off)
