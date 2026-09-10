@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -32,12 +33,36 @@ func newDiskTier(root string, capacity int64) (*diskTier, error) {
 	if capacity <= 0 {
 		return nil, nil
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := ensureOwnedDir(root); err != nil {
 		return nil, fmt.Errorf("blockstore: create disk cache %s: %w", root, err)
 	}
 	d := &diskTier{root: root, capacity: capacity}
 	d.size = d.scanSize()
 	return d, nil
+}
+
+// ensureOwnedDir creates dir 0700, verifying first that an existing dir is a
+// real directory (not a symlink) owned by the effective uid. A shared/world-
+// writable cache dir would let another user poison cached blocks, since Get
+// returns whatever bytes sit at the hashed path (finding M2).
+func ensureOwnedDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return os.MkdirAll(dir, 0o700)
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("%s is not owned by uid %d", dir, os.Geteuid())
+	}
+	return nil
 }
 
 // path returns the on-disk path for a cache key, sharded two levels deep.
@@ -71,7 +96,7 @@ func (d *diskTier) Put(cacheKey string, data []byte) {
 		time.Sleep(d.putDelay)
 	}
 	p := d.path(cacheKey)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".blk-*")

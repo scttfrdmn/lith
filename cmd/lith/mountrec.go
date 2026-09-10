@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -40,9 +41,47 @@ func lithRunDir() string {
 	return filepath.Join(os.TempDir(), "lith")
 }
 
+// dirWritable reports whether an existing dir is a real directory (not a
+// symlink) owned by the effective uid — the trust bar for using it to hold
+// mount records. A missing dir is not "writable" here (callers create it 0700).
 func dirWritable(d string) bool {
-	fi, err := os.Stat(d)
-	return err == nil && fi.IsDir()
+	fi, err := os.Lstat(d)
+	if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(os.Geteuid()) {
+		return false
+	}
+	return true
+}
+
+// dirTrusted verifies that a dir is safe to use for mount records: if it exists
+// it must be a directory (not a symlink) owned by the effective uid. A path that
+// does not yet exist is trusted (it will be created 0700). This blocks an
+// attacker who pre-creates the (predictable) run dir to plant forged records
+// (finding H2/M2).
+func dirTrusted(d string) error {
+	fi, err := os.Lstat(d)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", d)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", d)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: cannot verify ownership", d)
+	}
+	if st.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("%s is not owned by uid %d", d, os.Geteuid())
+	}
+	return nil
 }
 
 // recordPath is the record file for a mountpoint: <rundir>/<sanitized-abs>.json.
@@ -63,7 +102,10 @@ func recordPath(mountpoint string) string {
 // does not fail the mount). Returns the path written.
 func writeMountRecord(rec mountRecord) (string, error) {
 	dir := lithRunDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := dirTrusted(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	rec.path = recordPath(rec.Mountpoint)
@@ -71,7 +113,7 @@ func writeMountRecord(rec mountRecord) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return rec.path, os.WriteFile(rec.path, b, 0o644)
+	return rec.path, os.WriteFile(rec.path, b, 0o600)
 }
 
 func removeMountRecord(mountpoint string) { _ = os.Remove(recordPath(mountpoint)) }
@@ -79,6 +121,11 @@ func removeMountRecord(mountpoint string) { _ = os.Remove(recordPath(mountpoint)
 // listMountRecords reads all mount records in the run dir.
 func listMountRecords() []mountRecord {
 	dir := lithRunDir()
+	// Never trust records from a run dir we do not own (finding H2): a pid read
+	// from a forged record must never be signalled.
+	if err := dirTrusted(dir); err != nil {
+		return nil
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -151,7 +198,7 @@ var procMountsReader = func() []procMount {
 // isLithMount reports whether a /proc/mounts entry is a lith FUSE mount. lith
 // sets the FUSE subtype to "lith", so the fstype is "fuse.lith".
 func isLithMount(pm procMount) bool {
-	return strings.HasPrefix(pm.Fstype, "fuse") && strings.Contains(pm.Fstype, "lith")
+	return pm.Fstype == "fuse.lith"
 }
 
 // mountedAt reports whether a lith FUSE mount is live at mountpoint.

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -56,6 +57,7 @@ func TestUmountCleanSIGTERM(t *testing.T) {
 		}
 		return nil
 	}
+	fuserHolders = func(string) []int { return []int{111} } // pid genuinely holds the mount
 	var gotSig int
 	signalMount = func(pid int, sig syscall.Signal) error { gotSig = pid; mounted = false; return nil }
 	fusermountUnmount = func(string, bool) error { t.Fatal("fusermount should not be called on a clean SIGTERM"); return nil }
@@ -98,6 +100,71 @@ func TestUmountTimeoutFallback(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "fusermount3 -u") {
 		t.Fatalf("out = %q", out.String())
+	}
+}
+
+// TestMountRecordPerms: records are written 0600 inside a 0700 run dir (H2/M2).
+func TestMountRecordPerms(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	p, err := writeMountRecord(mountRecord{PID: 1, Mountpoint: "/mnt/x", Bucket: "b"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat record: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("record perm = %o, want 0600", perm)
+	}
+	di, err := os.Stat(lithRunDir())
+	if err != nil {
+		t.Fatalf("stat run dir: %v", err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("run dir perm = %o, want 0700", perm)
+	}
+}
+
+// TestIsLithMount: exact fstype match only (finding L1).
+func TestIsLithMount(t *testing.T) {
+	cases := map[string]bool{"fuse.lith": true, "fuse.monolith": false, "fuse.lithium": false, "fuse": false, "ext4": false}
+	for fstype, want := range cases {
+		if got := isLithMount(procMount{Fstype: fstype}); got != want {
+			t.Errorf("isLithMount(%q) = %v, want %v", fstype, got, want)
+		}
+	}
+}
+
+// TestUmountUnverifiedPidNotSignalled: a record pid that is NOT among the mount's
+// holders must never be signalled; umount falls through to fusermount (H2).
+func TestUmountUnverifiedPidNotSignalled(t *testing.T) {
+	withHooks(t)
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	_, _ = writeMountRecord(mountRecord{PID: 111, Mountpoint: "/mnt/x", Bucket: "b"})
+	mounted := true
+	procMountsReader = func() []procMount {
+		if mounted {
+			return []procMount{{Target: "/mnt/x", Fstype: "fuse.lith"}}
+		}
+		return nil
+	}
+	fuserHolders = func(string) []int { return []int{999} } // some other pid holds it
+	var signalled []int
+	signalMount = func(pid int, _ syscall.Signal) error { signalled = append(signalled, pid); return nil }
+	var fusermountCalled bool
+	fusermountUnmount = func(_ string, _ bool) error { fusermountCalled = true; mounted = false; return nil }
+
+	var out bytes.Buffer
+	if err := umountOne(&out, "/mnt/x", 200*time.Millisecond, true); err != nil {
+		t.Fatalf("umountOne: %v", err)
+	}
+	if containsInt(signalled, 111) {
+		t.Fatalf("forged pid 111 was signalled: %v", signalled)
+	}
+	if !fusermountCalled {
+		t.Fatal("expected fallthrough to fusermount")
 	}
 }
 
