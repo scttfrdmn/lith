@@ -35,9 +35,10 @@ type mem2Q struct {
 }
 
 type entry struct {
-	key   string
-	data  []byte
-	owner *list.List // in or main (nil for ghost entries)
+	key    string
+	data   []byte
+	filled uint16     // sparse-fill extent bitmap (#118); fullExtents for a whole chunk
+	owner  *list.List // in or main (nil for ghost entries)
 }
 
 func newMem2Q(capacity int64) *mem2Q {
@@ -61,13 +62,13 @@ func newMem2Q(capacity int64) *mem2Q {
 // PutUnread inserts a block and flags it unread atomically, so there is no
 // window in which a just-prefetched chunk can be evicted as if already read
 // (which would re-fetch without tripping the thrash metric). See #55.
-func (c *mem2Q) PutUnread(key string, data []byte) {
+func (c *mem2Q) PutUnread(key string, data []byte, filled uint16) {
 	if c.capacity == 0 || int64(len(data)) > c.capacity {
 		return
 	}
 	c.mu.Lock()
 	if _, ok := c.table[key]; !ok {
-		e := &entry{key: key}
+		e := &entry{key: key, filled: filled}
 		e.data = data
 		if gel, isGhost := c.ghost[key]; isGhost {
 			c.out.Remove(gel)
@@ -138,27 +139,27 @@ func (c *mem2Q) Unpin(key string) {
 
 // Get returns the cached block and whether it was present. A hit in main moves
 // it to the front (LRU); a hit in the "in" FIFO leaves it in place.
-func (c *mem2Q) Get(key string) ([]byte, bool) {
+func (c *mem2Q) Get(key string) ([]byte, uint16, bool) {
 	if c.capacity == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.table[key]
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	e := el.Value.(*entry)
 	if e.owner == c.main {
 		c.main.MoveToFront(el)
 	}
-	return e.data, true
+	return e.data, e.filled, true
 }
 
 // Put inserts a block. A key currently on the ghost list is admitted straight
 // to main; otherwise it enters the in FIFO. Re-inserting a present key is a
 // no-op.
-func (c *mem2Q) Put(key string, data []byte) {
+func (c *mem2Q) Put(key string, data []byte, filled uint16) {
 	if c.capacity == 0 || int64(len(data)) > c.capacity {
 		return
 	}
@@ -167,7 +168,47 @@ func (c *mem2Q) Put(key string, data []byte) {
 	if _, ok := c.table[key]; ok {
 		return
 	}
-	e := &entry{key: key, data: data}
+	e := &entry{key: key, data: data, filled: filled}
+	if gel, isGhost := c.ghost[key]; isGhost {
+		c.out.Remove(gel)
+		delete(c.ghost, key)
+		e.owner = c.main
+		c.table[key] = c.main.PushFront(e)
+	} else {
+		e.owner = c.in
+		c.table[key] = c.in.PushFront(e)
+		c.inSize += int64(len(data))
+	}
+	c.size += int64(len(data))
+	c.evict()
+}
+
+// Merge upserts a chunk carrying newly filled extents (#118). If the key is
+// present, its buffer is replaced with data (same full-chunk length, so cache
+// size is unchanged) and its extent bitmap gains filled; the caller has already
+// produced the merged buffer (copy-on-merge), so a reader holding the old buffer
+// keeps seeing consistent, immutable bytes. If absent, it is inserted like Put.
+func (c *mem2Q) Merge(key string, data []byte, filled uint16) {
+	if c.capacity == 0 || int64(len(data)) > c.capacity {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.table[key]; ok {
+		e := el.Value.(*entry)
+		c.size += int64(len(data)) - int64(len(e.data))
+		if e.owner == c.in {
+			c.inSize += int64(len(data)) - int64(len(e.data))
+		}
+		e.data = data
+		e.filled |= filled
+		if e.owner == c.main {
+			c.main.MoveToFront(el)
+		}
+		c.evict()
+		return
+	}
+	e := &entry{key: key, data: data, filled: filled}
 	if gel, isGhost := c.ghost[key]; isGhost {
 		c.out.Remove(gel)
 		delete(c.ghost, key)

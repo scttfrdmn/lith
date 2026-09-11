@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sparse chunk fills ([#118](https://github.com/scttfrdmn/lith/issues/118)).**
+  The 1 MiB cache chunk gains a 64 KiB-granularity filled-extent bitmap. A
+  format plan's byte-exact range (e.g. a Parquet column projection) and a
+  non-sequential point read now fetch only the extents they cover, not the whole
+  enclosing chunk; sequential/streaming reads still fill whole chunks. The disk
+  tier persists the bitmap (partial chunks are valid). New metrics
+  `lith_fill_partial_total` and `lith_fill_bytes_total{kind=plan|demand|whole}`.
+
+### Changed
+
+- **`lith_distinct_bytes_read` now counts filled 64 KiB extents, not 1 MiB
+  chunks** (it was chunk-rounded). Values are finer-grained (and smaller) than
+  before for sub-chunk access ([#118](https://github.com/scttfrdmn/lith/issues/118)).
+- The disk block-cache format bumped to **v2** (per-chunk extent bitmap); it is a
+  private cache — older ones are ignored and rebuilt.
+
 ## [0.2.2] - 2026-09-10
 
 Security release: two internal audit passes, fully remediated. Defensive hardening

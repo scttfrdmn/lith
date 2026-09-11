@@ -81,8 +81,8 @@ func (f *rawFS) maybeFooterReadahead(relPath string, h *fileHandle, size int64) 
 	if tailStart < 0 {
 		tailStart = 0
 	}
-	f.prefetchByteRange(h.key, tailStart, size, size)
-	f.prefetchByteRange(h.key, 0, 8, size)
+	f.prefetchByteExact(h.key, tailStart, size, size)
+	f.prefetchByteExact(h.key, 0, 8, size)
 	h.footerKind = kind
 	if kind == footer.FormatParquet {
 		h.footerProj = newFooterProjection()
@@ -266,7 +266,11 @@ func (f *rawFS) footerPrefetch(h *fileHandle, ranges []footer.Range, format stri
 	if len(ranges) == 0 {
 		return
 	}
-	coalesced := coalesceFooter(ranges, f.blockSize)
+	// Coalesce only within a 64 KiB extent: merging across the big unprojected
+	// columns that sit between a row group's projected chunks would refetch the
+	// gaps and defeat the byte-exact plan (#118). The blockstore fills exactly
+	// the extents each range covers.
+	coalesced := coalesceFooter(ranges, blockstore.ExtentSize)
 	for _, r := range coalesced {
 		if h.footerProj != nil {
 			if h.footerProj.dispatched[r.Start] {
@@ -274,10 +278,35 @@ func (f *rawFS) footerPrefetch(h *fileHandle, ranges []footer.Range, format stri
 			}
 			h.footerProj.dispatched[r.Start] = true
 		}
-		if f.prefetchByteRange(h.key, r.Start, r.End, h.size) {
+		if f.prefetchByteExact(h.key, r.Start, r.End, h.size) {
 			f.met.FormatPlanRanges(format)
 		}
 	}
+}
+
+// prefetchByteExact reserves prefetch budget for [off,end) and fills exactly the
+// 64 KiB extents it covers, byte-exact, via the blockstore (#118) — not the
+// whole blocks prefetchByteRange would pull. Returns false if the budget is
+// exhausted.
+func (f *rawFS) prefetchByteExact(key blockstore.Key, off, end, objSize int64) bool {
+	if off < 0 {
+		off = 0
+	}
+	if end > objSize {
+		end = objSize
+	}
+	if end <= off {
+		return true
+	}
+	span := end - off
+	if !f.reserve(span) {
+		return false
+	}
+	go func() {
+		defer f.release(span)
+		f.store.FillRange(f.ctx, key, off, end, objSize)
+	}()
+	return true
 }
 
 // coalesceFooter sorts ranges by Start and merges those within slack bytes of

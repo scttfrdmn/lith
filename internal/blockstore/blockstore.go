@@ -28,7 +28,7 @@ const ChunkSize int64 = 1 << 20 // 1 MiB
 
 // diskFormat namespaces the on-disk cache layout; bumping it makes caches from
 // an older layout (e.g. session 2's block-indexed files) be ignored.
-const diskFormat = "chunkv1"
+const diskFormat = "chunkv2" // v2: each file is [2-byte LE filled-extent bitmap][chunk bytes] (#118)
 
 // ErrStale is returned when a fetched object's ETag does not match the index;
 // the FUSE layer maps it to EIO and the key is recorded in the stale set.
@@ -86,11 +86,18 @@ type Config struct {
 	Recorder       Recorder
 }
 
-// chunkState is an in-flight (or just-completed) chunk fetch.
+// chunkState is an in-flight (or just-completed) chunk fetch. With sparse fills
+// (#118) a fetch may fill only some extents; filled is the bitmap the completed
+// fetch produced, so a joiner can tell whether its wanted extents are covered or
+// it must fetch the remainder. base{Data,Filled} carry any partial chunk the
+// owner is extending (copy-on-merge).
 type chunkState struct {
-	done chan struct{}
-	data []byte
-	err  error
+	done       chan struct{}
+	data       []byte
+	filled     uint16
+	err        error
+	baseData   []byte
+	baseFilled uint16
 }
 
 // BlockStore is a read-only, chunk-granular tiered cache.
@@ -115,6 +122,7 @@ type BlockStore struct {
 	// installed Recorder implements chunkTimelineRecorder. When nil the read
 	// path takes no extra clock reads or counter updates.
 	timeline  chunkTimelineRecorder
+	fill      fillRecorder // optional sparse-fill metrics sink (#118); nil when unimplemented
 	inflightN atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
 	mu       sync.Mutex
@@ -137,6 +145,7 @@ type BlockStore struct {
 type diskWriteReq struct {
 	cacheKey string
 	data     []byte
+	filled   uint16
 }
 
 // New builds a BlockStore over src.
@@ -193,6 +202,9 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	}
 	if r, ok := cfg.Recorder.(chunkTimelineRecorder); ok {
 		bs.timeline = r
+	}
+	if r, ok := cfg.Recorder.(fillRecorder); ok {
+		bs.fill = r
 	}
 	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
@@ -270,18 +282,20 @@ func (bs *BlockStore) cacheKey(k Key, chunkIdx int64) string {
 	return fmt.Sprintf("%s|%s|%016x|%d", bs.bucket, k.Key, k.ETagHash, chunkIdx)
 }
 
-// lookup returns a cached chunk without recording metrics; tier is "mem",
-// "disk", or "" (miss). A disk hit is promoted to memory.
-func (bs *BlockStore) lookup(k Key, ci int64) ([]byte, string) {
+// lookup returns a cached chunk with its filled-extent bitmap (#118) without
+// recording metrics; tier is "mem", "disk", or "" (miss). A disk hit is promoted
+// to memory. A chunk may be partially filled: the caller checks coverage of the
+// extents it needs against filled.
+func (bs *BlockStore) lookup(k Key, ci int64) (data []byte, filled uint16, tier string) {
 	ck := bs.cacheKey(k, ci)
-	if d, ok := bs.mem.Get(ck); ok {
-		return d, "mem"
+	if d, f, ok := bs.mem.Get(ck); ok {
+		return d, f, "mem"
 	}
-	if d, ok := bs.disk.Get(ck); ok {
-		bs.mem.Put(ck, d)
-		return d, "disk"
+	if d, f, ok := bs.disk.Get(ck); ok {
+		bs.mem.Put(ck, d, f)
+		return d, f, "disk"
 	}
-	return nil, ""
+	return nil, 0, ""
 }
 
 // enqueueDiskWrite hands a chunk to the write-behind pool. A prefetch fill
@@ -289,13 +303,13 @@ func (bs *BlockStore) lookup(k Key, ci int64) ([]byte, string) {
 // keeping the pipeline bounded; a demand fill never blocks (it drops the disk
 // write on a full queue rather than delay the reader). The chunk is pinned in
 // memory until its write lands so it is not evicted and re-fetched.
-func (bs *BlockStore) enqueueDiskWrite(ck string, data []byte, blocking bool) {
+func (bs *BlockStore) enqueueDiskWrite(ck string, data []byte, filled uint16, blocking bool) {
 	if bs.diskWrites == nil {
 		return
 	}
 	bs.mem.Pin(ck)
 	bs.pendingWrites.Add(1)
-	req := diskWriteReq{cacheKey: ck, data: data}
+	req := diskWriteReq{cacheKey: ck, data: data, filled: filled}
 	if blocking {
 		select {
 		case bs.diskWrites <- req:
@@ -316,54 +330,66 @@ func (bs *BlockStore) enqueueDiskWrite(ck string, data []byte, blocking bool) {
 
 // writeOne persists a single chunk and releases its pin.
 func (bs *BlockStore) writeOne(req diskWriteReq) {
-	bs.disk.Put(req.cacheKey, req.data)
+	bs.disk.Put(req.cacheKey, req.data, req.filled)
 	bs.mem.Unpin(req.cacheKey)
 	bs.pendingWrites.Add(-1)
 }
 
-// claim registers chunk ci as in-flight. It returns the chunk's state and
-// whether this caller owns the fetch (mine); if the chunk is already cached in
-// memory it returns cachedData with cached=true; if a fetch is already in
-// flight it returns that state with mine=false (the caller should join it).
-func (bs *BlockStore) claim(k Key, ci int64) (cs *chunkState, mine bool, cachedData []byte, cached bool) {
+// claim registers chunk ci as in-flight for the extents in want (#118).
+// Singleflight is keyed per chunk: at most one fetch per chunk is in flight, and
+// a fill for some extents joins/extends it rather than racing it. It returns:
+//   - cached=true with cachedData/cachedFilled when the memory tier already
+//     covers want (all wanted extents filled);
+//   - mine=false + an existing chunkState to join when a fetch is already in
+//     flight (the joiner waits, then re-checks coverage — the in-flight fill may
+//     cover fewer extents than the joiner needs, in which case it re-claims);
+//   - mine=true + a fresh chunkState carrying any partial chunk as base{Data,
+//     Filled} for the owner to extend (copy-on-merge).
+func (bs *BlockStore) claim(k Key, ci int64, want uint16) (cs *chunkState, mine bool, cachedData []byte, cachedFilled uint16, cached bool) {
 	ck := bs.cacheKey(k, ci)
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
-	if d, ok := bs.mem.Get(ck); ok {
-		return nil, false, d, true
+	base, baseFilled, _ := bs.memGetLocked(ck)
+	if base != nil && covers(baseFilled, want) {
+		return nil, false, base, baseFilled, true
 	}
 	if existing, ok := bs.inflight[ck]; ok {
-		return existing, false, nil, false
+		return existing, false, nil, 0, false
 	}
-	cs = &chunkState{done: make(chan struct{})}
+	cs = &chunkState{done: make(chan struct{}), baseData: base, baseFilled: baseFilled}
 	bs.inflight[ck] = cs
 	if bs.timeline != nil {
 		bs.inflightN.Add(1)
 	}
-	return cs, true, nil, false
+	return cs, true, nil, 0, false
+}
+
+// memGetLocked reads the memory tier only (no disk promotion), for use under
+// bs.mu inside claim.
+func (bs *BlockStore) memGetLocked(ck string) ([]byte, uint16, bool) {
+	return bs.mem.Get(ck)
 }
 
 // complete wakes the chunk's waiters (with its bytes) and clears its in-flight
 // entry, then hands the disk write to the write-behind pool. Waiters are woken
 // before the (possibly blocking) disk enqueue so a joining demand read is never
 // delayed by disk backpressure. blocking is true for prefetch fills.
-func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err error, blocking bool) {
+func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, filled uint16, err error, blocking bool) {
 	ck := bs.cacheKey(k, ci)
 	if err == nil {
-		// blocking == prefetch fill: insert the chunk already flagged unread
-		// (evicted last, atomically) — it holds a budget reservation until a
-		// demand read consumes it or it is evicted (#55). Demand fills insert
-		// normally.
+		// Merge accumulates newly filled extents into any partial chunk already
+		// cached (#118); the merged buffer is complete and immutable. blocking ==
+		// prefetch fill: also flag it unread (evicted last) so it holds a budget
+		// reservation until a demand read consumes it or it is evicted (#55).
+		bs.mem.Merge(ck, data, filled)
 		if blocking {
-			bs.mem.PutUnread(ck, data)
-		} else {
-			bs.mem.Put(ck, data)
+			bs.mem.MarkUnread(ck)
 		}
 	} else if blocking {
 		// Prefetch fill failed: drop its prefetched marker.
 		bs.prefetched.LoadAndDelete(ck)
 	}
-	cs.data, cs.err = data, err
+	cs.data, cs.filled, cs.err = data, filled, err
 	close(cs.done)
 	bs.mu.Lock()
 	delete(bs.inflight, ck)
@@ -372,27 +398,34 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, err
 		bs.inflightN.Add(-1)
 	}
 	if err == nil {
-		bs.enqueueDiskWrite(ck, data, blocking)
+		bs.enqueueDiskWrite(ck, data, filled, blocking)
 	}
 }
 
-// ensureChunks guarantees chunks [c0, c1] are available, coalescing maximal
-// contiguous runs of not-cached, not-in-flight chunks into one GET (bounded by
-// maxChunks) and joining chunks already in flight. When out is non-nil it is
-// populated with each chunk's bytes, so a demand read assembles from the
-// fetched data directly rather than a second cache lookup (which the async
-// write-behind disk tier cannot guarantee is present yet).
-func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize int64, isPrefetch bool, out map[int64][]byte) error {
+// ensureChunks guarantees chunks [c0, c1] hold the extents wantOf gives each,
+// coalescing maximal contiguous runs of not-covered, not-in-flight chunks into
+// one byte-exact range GET (bounded by maxChunks) and joining chunks already in
+// flight. wantOf lets a whole-chunk consumer (Prefetch) ask for full chunks and
+// a demand read (GetRange) ask for only the extents it touches (#118). When out
+// is non-nil it is populated with each chunk's bytes, so a demand read assembles
+// from the fetched data directly rather than a second cache lookup (which the
+// async write-behind disk tier cannot guarantee is present yet).
+func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize int64, isPrefetch bool, out map[int64][]byte, wantOf func(ci int64) uint16, kind fillKind) error {
 	i := c0
 	for i <= c1 {
-		if d, tier := bs.lookup(k, i); tier != "" {
+		want := wantOf(i) & maskForLen(chunkLenOf(i, objSize))
+		if want == 0 {
+			i++
+			continue
+		}
+		if d, f, tier := bs.lookup(k, i); tier != "" && covers(f, want) {
 			if out != nil {
 				out[i] = d
 			}
 			i++
 			continue
 		}
-		cs, mine, cachedData, cached := bs.claim(k, i)
+		cs, mine, cachedData, _, cached := bs.claim(k, i, want)
 		if cached {
 			if out != nil {
 				out[i] = cachedData
@@ -414,8 +447,17 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			if bs.timeline != nil && !isPrefetch {
 				bs.emitChunk(k, i, "join", pf, time.Since(t0), t0)
 			}
+			data := cs.data
+			// The in-flight fill we joined may have covered fewer extents than we
+			// need; top this chunk up (#118).
+			if !covers(cs.filled, want) {
+				var err error
+				if data, err = bs.fetchExtents(ctx, k, i, want, objSize, isPrefetch, kind); err != nil {
+					return err
+				}
+			}
 			if out != nil {
-				out[i] = cs.data
+				out[i] = data
 			}
 			i++
 			continue
@@ -425,21 +467,28 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 		if !isPrefetch {
 			bs.record(func(r Recorder) { r.UncoveredMiss() })
 		}
-		// Extend the run over contiguous chunks we also own.
+		// Extend the run over contiguous chunks we also own and want, coalescing
+		// their wanted extents into one GET.
 		owned := []*chunkState{cs}
+		wants := []uint16{want}
 		j := i
 		for j+1 <= c1 && int64(len(owned)) < bs.maxChunks {
-			if _, tier := bs.lookup(k, j+1); tier != "" {
+			wantNext := wantOf(j+1) & maskForLen(chunkLenOf(j+1, objSize))
+			if wantNext == 0 {
 				break
 			}
-			cs2, mine2, _, cached2 := bs.claim(k, j+1)
+			if _, f, tier := bs.lookup(k, j+1); tier != "" && covers(f, wantNext) {
+				break
+			}
+			cs2, mine2, _, _, cached2 := bs.claim(k, j+1, wantNext)
 			if cached2 || !mine2 {
 				break
 			}
 			owned = append(owned, cs2)
+			wants = append(wants, wantNext)
 			j++
 		}
-		if err := bs.fillRun(ctx, k, i, j, objSize, isPrefetch, owned); err != nil {
+		if err := bs.fillRun(ctx, k, i, j, objSize, isPrefetch, owned, wants, kind); err != nil {
 			return err
 		}
 		if out != nil {
@@ -452,9 +501,19 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 	return nil
 }
 
-// fillRun fetches chunks [first, last] in one streamed range GET, verifies the
-// ETag, and completes each chunk's waiters as its bytes arrive.
-func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize int64, isPrefetch bool, owned []*chunkState) error {
+// fullWant is a wantOf that asks for every extent of each chunk (whole-chunk
+// streaming/prefetch).
+func (bs *BlockStore) fullWant(objSize int64) func(int64) uint16 {
+	return func(ci int64) uint16 { return maskForLen(chunkLenOf(ci, objSize)) }
+}
+
+// fillRun fetches the wanted extents of chunks [first, last] in one streamed
+// byte-exact range GET (from the first wanted extent of the first chunk through
+// the last wanted extent of the last chunk), verifies the ETag, and completes
+// each chunk's waiters with its merged buffer. For a full-chunk run this is the
+// original whole-block fill; for a partial run it fetches only the extents the
+// reads touch (#118).
+func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize int64, isPrefetch bool, owned []*chunkState, wants []uint16, kind fillKind) error {
 	// Acquire concurrency (prefetch takes a sub-limited slot first so it cannot
 	// consume all demand capacity). Time the wait so the bimodality
 	// investigation (#49) can see whether prefetch fills are starving on the
@@ -478,15 +537,27 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 		return ctx.Err()
 	}
 
-	off := first * ChunkSize
-	end := (last + 1) * ChunkSize
-	if end > objSize {
-		end = objSize
+	// The byte span covering every chunk's wanted extents: first wanted extent of
+	// the first chunk through the last wanted extent of the last chunk. For a
+	// full-chunk run this is [first*ChunkSize, end-of-last]; for a partial run it
+	// is only the touched extents. The run is contiguous (whole interior chunks
+	// for a contiguous read / full masks), so the per-chunk wanted byte ranges
+	// concatenate with no gaps and the body streams straight into each buffer.
+	lo0, _ := extentByteRange(wants[0], chunkLenOf(first, objSize))
+	off := first*ChunkSize + lo0
+	var length int64
+	for idx := range owned {
+		cl := chunkLenOf(first+int64(idx), objSize)
+		l, h := extentByteRange(wants[idx], cl)
+		length += h - l
 	}
-	length := end - off
+	if length <= 0 {
+		for idx := range owned {
+			bs.complete(k, first+int64(idx), owned[idx], nil, 0, nil, isPrefetch)
+		}
+		return nil
+	}
 
-	// Bound total bytes in flight (bandwidth-delay product) on top of the
-	// request-count cap.
 	if got := bs.budget.acquire(length); got > 0 {
 		defer bs.budget.release(got)
 	}
@@ -508,93 +579,64 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 
 	for idx := range owned {
 		ci := first + int64(idx)
-		want := ChunkSize
-		if ci*ChunkSize+want > objSize {
-			want = objSize - ci*ChunkSize
-		}
-		if want < 0 {
-			want = 0
-		}
-		buf := make([]byte, want)
-		// want is the exact byte count for this chunk, so a correct body fills
-		// buf and io.ReadFull returns nil. Any error — including a short read
-		// (io.ErrUnexpectedEOF) or zero bytes (io.EOF) — means the transfer was
-		// truncated (dropped/partial/hostile). A short read is a truncation, not
-		// success: never cache a zero-padded buffer as authoritative. Fail this
-		// and every remaining chunk in the run. (For a trailing want == 0 chunk,
-		// io.ReadFull on an empty buffer returns nil, so this stays correct.)
-		if _, rerr := io.ReadFull(body, buf); rerr != nil {
+		cl := chunkLenOf(ci, objSize)
+		lo, hi := extentByteRange(wants[idx], cl)
+		// Seed with any partial chunk we're extending (copy-on-merge), then read
+		// the wanted extents. A short read is a truncation, never a zero-padded
+		// "success" (H1): fail this and every remaining chunk in the run.
+		buf := cloneChunk(owned[idx].baseData, cl)
+		if _, rerr := io.ReadFull(body, buf[lo:hi]); rerr != nil {
 			for r := idx; r < len(owned); r++ {
-				bs.complete(k, first+int64(r), owned[r], nil, rerr, isPrefetch)
+				bs.complete(k, first+int64(r), owned[r], nil, 0, rerr, isPrefetch)
 			}
 			return rerr
 		}
-		bs.complete(k, ci, owned[idx], buf, nil, isPrefetch)
+		bs.complete(k, ci, owned[idx], buf, owned[idx].baseFilled|wants[idx], nil, isPrefetch)
 	}
+	bs.recordFill(kind, length)
 	return nil
 }
 
-// Chunk returns the bytes of a single chunk (the whole chunk, short for the
-// last one), for a demand read fully contained in that chunk. It returns the
-// cached/fetched buffer directly — no copy and, on a cache hit, no allocation —
-// so the FUSE layer can hand a sub-slice straight to the kernel. The buffer is
-// immutable; the Go runtime keeps it alive while the reply references it.
-func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize int64) ([]byte, error) {
+// Chunk returns a chunk buffer for a demand read of [readLo, readHi) within
+// chunk ci (byte offsets relative to the chunk). It guarantees the extents that
+// read covers are filled and returns the whole-chunk buffer so the FUSE layer
+// can hand a sub-slice straight to the kernel (no copy, no allocation on a hit).
+// When sequential is set (streaming), the whole chunk is filled — streaming is
+// unchanged; otherwise only the read's 64 KiB extents are fetched (#118), so a
+// point read of a plan-prefetched column is served without pulling the rest of
+// the 1 MiB chunk. The buffer is immutable; the runtime keeps it alive while the
+// reply references it.
+func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize, readLo, readHi int64, sequential bool) ([]byte, error) {
+	want := extentMask(readLo, readHi)
+	if sequential {
+		want = maskForLen(chunkLenOf(ci, objSize))
+	}
 	var t0 time.Time
+	hit := false
 	if bs.timeline != nil {
 		t0 = time.Now()
+		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, want) {
+			hit = true
+		}
 	}
-	if d, tier := bs.lookup(k, ci); tier != "" {
-		switch tier {
-		case "mem":
-			bs.record(func(r Recorder) { r.MemHit() })
-		case "disk":
-			bs.record(func(r Recorder) { r.DiskHit() })
-		}
-		ck := bs.cacheKey(k, ci)
-		_, pf := bs.prefetched.Load(ck)
-		bs.notePrefetchHit(ck)
-		if bs.timeline != nil {
-			bs.emitChunk(k, ci, "hit", pf, 0, t0)
-		}
-		return d, nil
-	}
-	bs.record(func(r Recorder) { r.Miss() })
-	cs, mine, cachedData, cached := bs.claim(k, ci)
-	if cached {
-		if bs.timeline != nil {
-			bs.emitChunk(k, ci, "hit", false, 0, t0)
-		}
-		return cachedData, nil
-	}
-	if !mine {
-		_, pf := bs.prefetched.Load(bs.cacheKey(k, ci))
-		<-cs.done
-		// A demand read that joined an in-flight prefetch fill still consumes the
-		// chunk: credit the hit and release its budget reservation (#55).
-		if cs.err == nil {
-			bs.notePrefetchHit(bs.cacheKey(k, ci))
-		}
-		if bs.timeline != nil {
-			bs.emitChunk(k, ci, "join", pf, time.Since(t0), t0)
-		}
-		return cs.data, cs.err
-	}
-	bs.record(func(r Recorder) { r.UncoveredMiss() })
-	owned := []*chunkState{cs}
-	if err := bs.fillRun(ctx, k, ci, ci, objSize, false, owned); err != nil {
+	d, err := bs.fetchExtents(ctx, k, ci, want, objSize, false, fillDemand)
+	if err != nil {
 		return nil, err
 	}
 	if bs.timeline != nil {
-		bs.emitChunk(k, ci, "uncovered", false, time.Since(t0), t0)
+		if hit {
+			bs.emitChunk(k, ci, "hit", false, 0, t0)
+		} else {
+			bs.emitChunk(k, ci, "uncovered", false, time.Since(t0), t0)
+		}
 	}
-	return owned[0].data, nil
+	return d, nil
 }
 
 // failRun completes every owned chunk in a run with err.
 func (bs *BlockStore) failRun(k Key, first int64, owned []*chunkState, err error) {
 	for idx := range owned {
-		bs.complete(k, first+int64(idx), owned[idx], nil, err, false)
+		bs.complete(k, first+int64(idx), owned[idx], nil, 0, err, false)
 	}
 }
 
@@ -612,40 +654,33 @@ func (bs *BlockStore) GetRange(ctx context.Context, k Key, off, length, objSize 
 	c0 := off / ChunkSize
 	c1 := (end - 1) / ChunkSize
 
-	// Record hit/miss per chunk and credit prefetch accuracy.
-	for ci := c0; ci <= c1; ci++ {
-		if _, tier := bs.lookup(k, ci); tier != "" {
-			switch tier {
-			case "mem":
-				bs.record(func(r Recorder) { r.MemHit() })
-			case "disk":
-				bs.record(func(r Recorder) { r.DiskHit() })
-			}
-			bs.notePrefetchHit(bs.cacheKey(k, ci))
-		} else {
-			bs.record(func(r Recorder) { r.Miss() })
+	// Extent-aware demand assembly (#118): each chunk wants only the extents it
+	// contributes to [off,end), so a read served from plan-prefetched extents
+	// adds no S3 bytes and a straddling read pulls only its own bytes — while
+	// contiguous not-cached chunks still coalesce into one byte-exact GET.
+	wantOf := func(ci int64) uint16 {
+		start := ci * ChunkSize
+		lo := int64(0)
+		if off > start {
+			lo = off - start
 		}
+		return extentMask(lo, end-start)
 	}
-
 	chunks := make(map[int64][]byte, c1-c0+1)
-	if err := bs.ensureChunks(ctx, k, c0, c1, objSize, false, chunks); err != nil {
+	if err := bs.ensureChunks(ctx, k, c0, c1, objSize, false, chunks, wantOf, fillDemand); err != nil {
 		return nil, err
 	}
-
 	out := make([]byte, 0, end-off)
 	for ci := c0; ci <= c1; ci++ {
-		data, ok := chunks[ci]
-		if !ok {
-			return nil, fmt.Errorf("blockstore: chunk %d missing after fill", ci)
-		}
+		data := chunks[ci]
 		lo := int64(0)
 		start := ci * ChunkSize
 		if off > start {
 			lo = off - start
 		}
-		hi := int64(len(data))
-		if start+hi > end {
-			hi = end - start
+		hi := end - start
+		if hi > int64(len(data)) {
+			hi = int64(len(data))
 		}
 		if lo < hi {
 			out = append(out, data[lo:hi]...)
@@ -672,7 +707,7 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	// derives from the prefetch budget and the live handle count (#55), so this
 	// path does not gate.
 	for ci := c0; ci <= c1; ci++ {
-		if _, tier := bs.lookup(k, ci); tier != "" {
+		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, maskForLen(chunkLenOf(ci, objSize))) {
 			continue
 		}
 		ck := bs.cacheKey(k, ci)
@@ -683,7 +718,7 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 			}
 		}
 	}
-	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil)
+	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil, bs.fullWant(objSize), fillWhole)
 }
 
 // PrefetchBudgetBytes is the mount-wide byte budget for prefetch not yet
@@ -809,4 +844,22 @@ func (bs *BlockStore) recordPrefetchEvicted() {
 	if r, ok := bs.rec.(prefetchEvictRecorder); ok {
 		r.PrefetchEvictedUnread()
 	}
+}
+
+// fillRecorder is an optional Recorder extension for the sparse-fill metrics
+// (#118): a partial fill (fewer than all extents of a chunk) and the bytes
+// fetched by each fill kind.
+type fillRecorder interface {
+	FillPartial()
+	FillBytes(kind string, n int64)
+}
+
+func (bs *BlockStore) recordFill(kind fillKind, n int64) {
+	if bs.fill == nil {
+		return
+	}
+	if kind != fillWhole {
+		bs.fill.FillPartial()
+	}
+	bs.fill.FillBytes(kind.label(), n)
 }

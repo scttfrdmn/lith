@@ -27,8 +27,8 @@ func TestReadRecordsReadMetrics(t *testing.T) {
 	if n, sum := met.ReadSizeStats(); n != 2 || sum != 8192 {
 		t.Fatalf("read-size stats = %d/%d, want 2/8192", n, sum)
 	}
-	// Two reads in two different 1 MiB chunks -> 2 MiB distinct.
-	if got := met.DistinctBytesRead(); got != 2<<20 {
-		t.Fatalf("distinct bytes = %d, want %d", got, 2<<20)
+	// Two reads in two different 64 KiB extents -> 128 KiB distinct (#118).
+	if got := met.DistinctBytesRead(); got != 2*64<<10 {
+		t.Fatalf("distinct bytes = %d, want %d", got, 2*64<<10)
 	}
 }
