@@ -381,7 +381,14 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// a fill block, a projection coalesces to ≈ whole-file reads — cheaper to just
 	// stream via the readahead window (like base) than to run the byte-precise
 	// extent/plan path. Small gap (bandwidth-scarce) → stay byte-precise.
-	if footerHandled && f.store.CoalesceGap() >= f.store.BlockSize() {
+	if footerHandled && f.cfg.DisableFooterTier2 {
+		// Tier 2 off (v0.3.0 default): byte-precise projection fetch is
+		// experimental and slower than streaming on every tested box (#108), so a
+		// footer handle streams like a plain one (full readahead, whole-chunk
+		// reads). Otherwise it would suppress readahead and demand-fill 64 KiB
+		// extents on a sequential scan (~100x slower). Only tier 1 stays.
+		h.footerStream = true
+	} else if footerHandled && f.store.CoalesceGap() >= f.store.BlockSize() {
 		h.footerStream = true
 		slog.Info("footer streaming regime (coalesce gap ≥ block, session-30 safety)",
 			"path", n.path, "coalesce_gap", f.store.CoalesceGap(), "block_size", f.store.BlockSize())

@@ -217,6 +217,36 @@ func TestFooterParquetMalformedTier1(t *testing.T) {
 	}
 }
 
+// TestFooterTier2OffStreams: with tier 2 disabled (the v0.3.0 default), a footer
+// handle must stream like a plain handle — footerStream set at open, no projection
+// plan fires even after the projection would be confirmed, and reads are whole-chunk
+// (not byte-precise). Guards the readahead-suppression coupling: tier-2 detection must
+// not disable streaming when the byte-precise path is off (else a sequential scan
+// demand-fills 64 KiB extents, ~100× slower than base — see #108, session 32).
+func TestFooterTier2OffStreams(t *testing.T) {
+	srv := fake.New()
+	srv.Put("s.parquet", buildParquetObject(4, 2), time.Unix(1_700_000_000, 0))
+	met := metrics.New()
+	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met, DisableFooterTier2: true})
+
+	h, fh := openHandle(t, raw, "s.parquet")
+	if !h.footerStream {
+		t.Fatal("tier 2 off: footer handle should stream (footerStream=true) so readahead stays on")
+	}
+	readAt := func(off int64) {
+		buf := make([]byte, 4096)
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+	}
+	// Read into two distinct row groups — enough to confirm a projection if tier 2
+	// were on. With it off, no plan must fire.
+	readAt(parquetColStart(0, 0))
+	readAt(parquetColStart(1, 0))
+	waitStableGets(srv)
+	if got := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`); got != "" {
+		t.Fatalf("tier 2 off but a projection plan dispatched ranges: %s", got)
+	}
+}
+
 // TestFooterZipDirectoryReadahead: reading an entry parses the central directory
 // and prefetches that entry plus the next few (directory-order readahead), so a
 // follow-on read of the next entry is a cache hit.
