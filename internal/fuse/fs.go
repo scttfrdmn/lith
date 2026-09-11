@@ -371,7 +371,11 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 		footerHandled = f.maybeFooterReadahead(n.path, h, fi.Size)
 	}
 
-	if fi.Size > f.partsThreshold() {
+	// A footer-family handle is projection/seek-driven, not a sequential scan: its
+	// tier-1 footer prefetch and tier-2 byte-exact projection plan (#108/#118)
+	// replace the whole-block readahead window, which would otherwise sweep every
+	// column of the file and defeat the byte-exact fetch. Skip the window for it.
+	if fi.Size > f.partsThreshold() && h.footerKind == footer.FormatNone {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -455,8 +459,10 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 
 	// Drive the prefetcher off the block this read falls in — unless a whole-file
 	// parts fetch is in flight for this handle, which already covers every block
-	// (see Open: readahead would only contend with the parts fetch).
-	if !h.partsDispatched.Load() {
+	// (see Open: readahead would only contend with the parts fetch), or this is a
+	// footer-family handle whose byte-exact projection plan replaces the window
+	// (a whole-block window would re-fetch the columns the plan skips; #118).
+	if !h.partsDispatched.Load() && h.footerKind == footer.FormatNone {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			pb := pb
