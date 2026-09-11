@@ -381,14 +381,22 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 // gauge) and the high-water mark (#31).
 func (bs *BlockStore) fillInflightInc() {
 	n := bs.fillInflight.Add(1)
+	newPeak := false
 	for {
 		p := bs.fillPeak.Load()
-		if n <= p || bs.fillPeak.CompareAndSwap(p, n) {
+		if n <= p {
+			break
+		}
+		if bs.fillPeak.CompareAndSwap(p, n) {
+			newPeak = true
 			break
 		}
 	}
 	if bs.fill != nil {
 		bs.fill.FillInflight(1)
+		if newPeak {
+			bs.fill.FillInflightPeak(float64(n))
+		}
 	}
 }
 

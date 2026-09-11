@@ -893,6 +893,7 @@ type fillRecorder interface {
 	FillGapBytes(n int64)
 	FillBatchSize(n int)
 	FillInflight(delta float64)
+	FillInflightPeak(n float64)
 }
 
 func (bs *BlockStore) recordFill(kind fillKind, n int64) {
