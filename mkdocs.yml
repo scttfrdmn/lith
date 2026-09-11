@@ -44,5 +44,6 @@ nav:
   - Copy or mount?: copy-or-mount.md
   - Sizing the node: sizing.md
   - Meet a deadline: deadline.md
+  - CargoShip archives: cargoship.md
   - Knobs: knobs.md
   - What lith is not: not.md
