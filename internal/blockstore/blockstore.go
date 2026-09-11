@@ -132,11 +132,14 @@ type BlockStore struct {
 	// Coalesce-gap derivation (#124/session 30). gapOverride > 0 pins the gap;
 	// otherwise it is nicBPS × the rolling TTFB median, clamped. ttfb is guarded
 	// by ttfbMu: the first ttfbMax fill first-byte latencies (seeded by ttfbSeed).
-	gapOverride int64
-	nicBPS      int64
-	ttfbMu      sync.Mutex
-	ttfbSeed    time.Duration
-	ttfbSamples []time.Duration
+	gapOverride  int64
+	nicBPS       int64
+	prefetchConc int          // usable prefetch concurrency, for the concurrency-aware gap (#31)
+	fillInflight atomic.Int64 // fill-batch runs currently fetching (#31)
+	fillPeak     atomic.Int64 // high-water mark of fillInflight (for tests)
+	ttfbMu       sync.Mutex
+	ttfbSeed     time.Duration
+	ttfbSamples  []time.Duration
 
 	// Demand batching (#124/session 30): concurrent footer demand misses on one
 	// object are collected for one scheduling tick and dispatched as a single
@@ -225,6 +228,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		pfBudgetBytes: pfBudgetCap,
 		gapOverride:   cfg.CoalesceGap,
 		nicBPS:        cfg.NICBytesPerSec,
+		prefetchConc:  prefetchConc,
 		ttfbSeed:      cfg.TTFB,
 		rec:           cfg.Recorder,
 		inflight:      make(map[string]*chunkState),
@@ -888,6 +892,7 @@ type fillRecorder interface {
 	FillRun()
 	FillGapBytes(n int64)
 	FillBatchSize(n int)
+	FillInflight(delta float64)
 }
 
 func (bs *BlockStore) recordFill(kind fillKind, n int64) {

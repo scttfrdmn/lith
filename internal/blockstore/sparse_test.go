@@ -216,57 +216,54 @@ func TestFillBatchRace(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDeriveCoalesceGap (#124/session 30): the device-derived gap is
-// bandwidth × TTFB, clamped to [256 KiB, 64 MiB].
+// TestDeriveCoalesceGap (#31): the gap is bandwidth × TTFB / C, clamped to
+// [256 KiB, 64 MiB] — a round-trip amortized across C concurrent requests.
 func TestDeriveCoalesceGap(t *testing.T) {
 	cases := []struct {
 		bps  int64
 		ttfb time.Duration
-		want int64
+		c    int
+		want int64 // 0 = "≈, check band"
+		band [2]int64
 	}{
-		{1_900_000_000, 40 * time.Millisecond, 64 << 20}, // ~76 MB → clamp 64 MiB
-		{117_000_000, 40 * time.Millisecond, 4_680_000},  // ~4.68 MB
-		{0, 40 * time.Millisecond, 256 << 10},            // unknown bw → floor
-		{1_000_000_000, 0, 256 << 10},                    // unknown ttfb → floor
-		{100_000, 40 * time.Millisecond, 256 << 10},      // tiny → floor
+		{1_900_000_000, 40 * time.Millisecond, 128, 0, [2]int64{560_000, 640_000}},     // ~594 KB
+		{117_000_000, 40 * time.Millisecond, 64, 256 << 10, [2]int64{}},                // ~73 KB → floor
+		{1_900_000_000, 40 * time.Millisecond, 2, 0, [2]int64{37_000_000, 39_000_000}}, // C=2 → ~38 MB
+		{1_900_000_000, 40 * time.Millisecond, 1, 64 << 20, [2]int64{}},                // C=1 → 76 MB → ceil
+		{0, 40 * time.Millisecond, 128, 256 << 10, [2]int64{}},                         // unknown bw → floor
+		{1_000_000_000, 0, 128, 256 << 10, [2]int64{}},                                 // unknown ttfb → floor
+		{1_000_000_000, 40 * time.Millisecond, 0, 256 << 10, [2]int64{}},               // C=0 → floor
 	}
 	for _, c := range cases {
-		got := deriveCoalesceGap(c.bps, c.ttfb)
-		// allow small rounding on the mid case
-		if c.want == 4_680_000 {
-			if got < 4_600_000 || got > 4_800_000 {
-				t.Errorf("derive(%d,%v)=%d, want ~4.68 MB", c.bps, c.ttfb, got)
+		got := deriveCoalesceGap(c.bps, c.ttfb, c.c)
+		if c.want != 0 {
+			if got != c.want {
+				t.Errorf("derive(%d,%v,%d)=%d, want %d", c.bps, c.ttfb, c.c, got, c.want)
 			}
 			continue
 		}
-		if got != c.want {
-			t.Errorf("derive(%d,%v)=%d, want %d", c.bps, c.ttfb, got, c.want)
+		if got < c.band[0] || got > c.band[1] {
+			t.Errorf("derive(%d,%v,%d)=%d, want in %v", c.bps, c.ttfb, c.c, got, c.band)
 		}
 	}
 }
 
-// TestCoalesceGapUsesDevice: with no override, CoalesceGap() derives from the
-// configured NIC baseline and TTFB seed; a fill measures TTFB into the rolling
-// median. Override pins it.
+// TestCoalesceGapUsesDevice (#31): CoalesceGap() is the full-concurrency gap
+// (NIC × TTFB / prefetchConc). Override pins it.
 func TestCoalesceGapUsesDevice(t *testing.T) {
 	srv := fake.New()
-	makeObj(srv, "obj", 8)
-	k := keyFor(t, srv, "obj")
-	size := int64(8) * mib
-	// 1.9 GB/s × 40 ms → clamp 64 MiB.
-	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20,
+	// prefetchConc defaults to S3Concurrency; set it to 128 for a known divisor.
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, S3Concurrency: 128,
 		NICBytesPerSec: 1_900_000_000, TTFB: 40 * time.Millisecond})
-	if got := bs.CoalesceGap(); got != 64<<20 {
-		t.Fatalf("derived gap = %d, want 64 MiB", got)
+	// 1.9 GB/s × 40 ms / 128 ≈ 594 KB (byte-precise, not a whole-file 64 MiB).
+	if got := bs.CoalesceGap(); got < 560_000 || got > 640_000 {
+		t.Fatalf("derived gap = %d, want ~594 KB", got)
 	}
-	// Override wins.
 	bs2 := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20,
 		NICBytesPerSec: 1_900_000_000, TTFB: 40 * time.Millisecond, CoalesceGap: 1 << 20})
 	if got := bs2.CoalesceGap(); got != 1<<20 {
 		t.Fatalf("override gap = %d, want 1 MiB", got)
 	}
-	_ = k
-	_ = size
 }
 
 // TestFillBatchGapControlsGETs (#124/session 30): a projection spanning the file
@@ -323,5 +320,30 @@ func TestGatherDemandBatchesBurst(t *testing.T) {
 	// straggler that registered after the leader's tick under a loaded scheduler.
 	if srv.GetCalls > 2 {
 		t.Fatalf("GetCalls=%d, want ≤2 (burst coalesced into one batch)", srv.GetCalls)
+	}
+}
+
+// TestFillBatchParallelDispatch (#31): a many-run batch dispatches its runs
+// concurrently (no per-run serialization) — the in-flight high-water mark reaches
+// the pool/run bound, not 1.
+func TestFillBatchParallelDispatch(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 64)
+	k := keyFor(t, srv, "obj")
+	size := int64(64) * mib
+	// Pool 128, tiny override gap so 64 ranges stay 64 separate runs.
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20,
+		S3Concurrency: 128, CoalesceGap: 64 << 10})
+	srv.GetDelay = 60 * time.Millisecond // widen the window so runs overlap
+	var ranges []Range
+	for i := int64(0); i < 64; i++ {
+		ranges = append(ranges, Range{i * mib, i*mib + 100<<10})
+	}
+	bs.FillBatch(context.Background(), k, ranges, size)
+	if peak := bs.FillInflightPeak(); peak < 48 {
+		t.Fatalf("fill inflight peak = %d, want ≥ ~64 (parallel dispatch of a 64-run batch)", peak)
+	}
+	if srv.GetCalls != 64 {
+		t.Fatalf("GetCalls = %d, want 64 (one per run at this gap)", srv.GetCalls)
 	}
 }

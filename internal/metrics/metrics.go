@@ -48,6 +48,7 @@ type Metrics struct {
 	fillRuns    prometheus.Counter     // coalesced fill-batch range GETs (#124)
 	fillGap     prometheus.Counter     // bytes fetched only to close coalesce gaps (#124)
 	fillBatchSz prometheus.Histogram   // ranges per fill batch (#124/session 30)
+	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
 	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
 	readN       atomic.Int64           // read count, for bench mean
 	readSum     atomic.Int64           // summed read bytes, for bench mean
@@ -146,6 +147,9 @@ func New() *Metrics {
 			Help:    "Number of ranges coalesced per fill batch (#124/session 30).",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1 .. 2048
 		}),
+		fillInfl: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lith_fill_inflight", Help: "Fill-batch range GETs currently in flight (#31).",
+		}),
 		readSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "lith_read_size_bytes",
 			Help:    "FUSE read request sizes in bytes (#65).",
@@ -157,7 +161,7 @@ func New() *Metrics {
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
-		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz)
+		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -393,6 +397,13 @@ func (m *Metrics) FillGapBytes(n int64) {
 func (m *Metrics) FillBatchSize(n int) {
 	if m != nil && n > 0 {
 		m.fillBatchSz.Observe(float64(n))
+	}
+}
+
+// FillInflight adjusts the in-flight fill-run gauge (#31). Nil-safe.
+func (m *Metrics) FillInflight(delta float64) {
+	if m != nil {
+		m.fillInfl.Add(delta)
 	}
 }
 

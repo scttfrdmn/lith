@@ -383,6 +383,8 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// extent/plan path. Small gap (bandwidth-scarce) → stay byte-precise.
 	if footerHandled && f.store.CoalesceGap() >= f.store.BlockSize() {
 		h.footerStream = true
+		slog.Info("footer streaming regime (coalesce gap ≥ block, session-30 safety)",
+			"path", n.path, "coalesce_gap", f.store.CoalesceGap(), "block_size", f.store.BlockSize())
 	}
 
 	// A byte-precise footer handle is projection-driven, not a sequential scan:

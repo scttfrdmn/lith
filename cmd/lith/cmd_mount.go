@@ -265,11 +265,18 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 	defer bs.Close()
+	effConc := f.prefetchConc
+	if effConc <= 0 {
+		effConc = f.s3Concurrency
+	}
 	if coalesceGap > 0 {
 		log.Info("coalesce gap", "bytes", bs.CoalesceGap(), "source", "--coalesce-gap")
 	} else {
+		// The gap is NIC_baseline × TTFB / C, C = usable prefetch concurrency (#31);
+		// the value logged is at full concurrency (FillBatch caps C at a batch's run
+		// count). If it is ≥ a fill block, footer projections stream instead.
 		log.Info("coalesce gap", "bytes", bs.CoalesceGap(), "source", "device-derived",
-			"nic_bytes_per_s", nicBytesPerSec, "ttfb_seed", ttfbSeed)
+			"nic_bytes_per_s", nicBytesPerSec, "ttfb_seed", ttfbSeed, "concurrency", effConc)
 	}
 	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 

@@ -6,26 +6,28 @@ import (
 	"context"
 	"io"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/zeebo/xxh3"
 )
 
-// Coalesce-gap derivation (#124/session 30): a round-trip's worth of streaming
-// (NIC bandwidth × first-byte latency), clamped. On a fat pipe this is tens of
-// MiB (merge freely, streaming beats round-trips); on a small box it is a few
-// MiB (stay byte-precise, where bandwidth is scarce).
+// Coalesce-gap derivation (#124/session 30–31). A round-trip's worth of
+// streaming is NIC bandwidth × first-byte latency, but with C requests in flight
+// the *marginal* round-trip costs TTFB/C — so the gap is NIC × TTFB / C, clamped.
+// With enough concurrency the gap is small (byte-precise: keep the pipe full with
+// many small GETs); with little concurrency it grows toward streaming.
 const (
 	gapFloor = 256 << 10
 	gapCeil  = 64 << 20
 	ttfbMax  = 8 // rolling window of measured first-byte latencies
 )
 
-func deriveCoalesceGap(bytesPerSec int64, ttfb time.Duration) int64 {
-	if bytesPerSec <= 0 || ttfb <= 0 {
+func deriveCoalesceGap(bytesPerSec int64, ttfb time.Duration, c int) int64 {
+	if bytesPerSec <= 0 || ttfb <= 0 || c <= 0 {
 		return gapFloor
 	}
-	g := int64(float64(bytesPerSec) * ttfb.Seconds())
+	g := int64(float64(bytesPerSec) * ttfb.Seconds() / float64(c))
 	if g < gapFloor {
 		return gapFloor
 	}
@@ -35,14 +37,22 @@ func deriveCoalesceGap(bytesPerSec int64, ttfb time.Duration) int64 {
 	return g
 }
 
-// CoalesceGap returns the gap FillBatch currently merges within: the explicit
-// override if set, else the device-derived value from the NIC baseline and the
-// rolling median first-byte latency.
-func (bs *BlockStore) CoalesceGap() int64 {
+// gapForC is the coalesce gap at concurrency c: the override if set, else the
+// device-derived NIC × TTFB / c.
+func (bs *BlockStore) gapForC(c int) int64 {
 	if bs.gapOverride > 0 {
 		return bs.gapOverride
 	}
-	return deriveCoalesceGap(bs.nicBPS, bs.currentTTFB())
+	return deriveCoalesceGap(bs.nicBPS, bs.currentTTFB(), c)
+}
+
+// CoalesceGap is the representative gap for the FUSE regime switch: the most
+// byte-precise gap the device would use, i.e. at full prefetch concurrency. If
+// even that is ≥ a fill block, a projection cannot be kept precise and the handle
+// streams (session 30 safety). FillBatch computes its own gap from the batch's
+// run count (see coalesceGapForBatch).
+func (bs *BlockStore) CoalesceGap() int64 {
+	return bs.gapForC(bs.prefetchConc)
 }
 
 // currentTTFB is the rolling median of measured fill first-byte latencies, or the
@@ -313,31 +323,84 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 		planBytes += u.hi - u.lo
 	}
 
-	// Gap-tolerant coalesce into runs; each run is one GET.
-	gap := bs.CoalesceGap()
-	runs := []span{aligned[0]}
-	for _, a := range aligned[1:] {
-		last := &runs[len(runs)-1]
-		if a.lo <= last.hi+gap {
-			if a.hi > last.hi {
-				last.hi = a.hi
+	// Concurrency-aware gap (#31): a round-trip costs TTFB/C, so divide by the
+	// usable concurrency C = min(prefetch pool, runs the batch splits into at the
+	// serial gap). Coalesce first at the serial (C=1) gap only to count runs, then
+	// at the /C gap.
+	coalesce := func(gap int64) []span {
+		runs := []span{aligned[0]}
+		for _, a := range aligned[1:] {
+			last := &runs[len(runs)-1]
+			if a.lo <= last.hi+gap {
+				if a.hi > last.hi {
+					last.hi = a.hi
+				}
+				continue
 			}
-			continue
+			runs = append(runs, a)
 		}
-		runs = append(runs, a)
+		return runs
 	}
+	nSerial := len(coalesce(bs.gapForC(1)))
+	c := bs.prefetchConc
+	if nSerial < c {
+		c = nSerial
+	}
+	if c < 1 {
+		c = 1
+	}
+	runs := coalesce(bs.gapForC(c))
 
+	// Dispatch every run concurrently — no per-run serialization; each run's GET
+	// bounds itself on the prefetch pool inside fillRun (#31).
 	var mergedBytes int64
 	for _, run := range runs {
 		mergedBytes += run.hi - run.lo
-		bs.fillCoalescedRun(ctx, k, run.lo, run.hi, objSize)
 	}
+	var wg sync.WaitGroup
+	for _, run := range runs {
+		run := run
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bs.fillInflightInc()
+			defer bs.fillInflightDec()
+			bs.fillCoalescedRun(ctx, k, run.lo, run.hi, objSize)
+		}()
+	}
+	wg.Wait()
+
 	gapBytes := mergedBytes - planBytes
 	if gapBytes < 0 {
 		gapBytes = 0
 	}
 	bs.recordBatch(planBytes, gapBytes, int64(len(runs)), len(aligned))
 }
+
+// fillInflightInc/Dec track concurrent fill-batch runs (the lith_fill_inflight
+// gauge) and the high-water mark (#31).
+func (bs *BlockStore) fillInflightInc() {
+	n := bs.fillInflight.Add(1)
+	for {
+		p := bs.fillPeak.Load()
+		if n <= p || bs.fillPeak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	if bs.fill != nil {
+		bs.fill.FillInflight(1)
+	}
+}
+
+func (bs *BlockStore) fillInflightDec() {
+	bs.fillInflight.Add(-1)
+	if bs.fill != nil {
+		bs.fill.FillInflight(-1)
+	}
+}
+
+// FillInflightPeak is the high-water mark of concurrent fill-batch runs (tests).
+func (bs *BlockStore) FillInflightPeak() int64 { return bs.fillPeak.Load() }
 
 // demandBatchTick is how long a demand batch collects concurrent misses before
 // dispatching one coalesced FillBatch (#124/session 30).
