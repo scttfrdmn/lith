@@ -22,3 +22,15 @@ small columns from a large, many-row-group Parquet whose bulk is other columns.
   filter and a projected column (mirrors CC's `url_host_tld == 'edu'`).
 - 8 files used for the 8-concurrent runs: `part-00000` … `part-00007`
   (634.9, 704.6, 701.5, 705.9, 623.9, 633.1, 692.2, 667.9 MB).
+
+## In-region staging (session 29, #124 measurement)
+
+CC `cc-index`/`nyc-tlc` now deny direct S3 (CDN-only), so R4 is measured on a
+**staged in-region copy** of the Overture places partition:
+
+- Source: `s3://overturemaps-us-west-2/release/2026-08-19.0/theme=places/type=place/`
+  (8 files `part-00000`…`part-00007`).
+- Dest (us-east-1, writable from the spored role): `s3://scttfrdmn-lith-bench/lith-bench/overture-places/`.
+- Copied with `s5cmd` (download anon us-west-2 → upload us-east-1): **5,363,950,212 bytes** (5.36 GB), one-time cross-region egress ≈ $0.11; upload same-region (free).
+- **7-day bucket lifecycle → expires ~2026-09-18.** The copy step (session-29 driver `bench/footer/`) is rerunnable to restage.
+- All session-29 R4 numbers are **in-region** (box us-east-1 ↔ bucket us-east-1). Session-27/28 cross-region rows stay in `apps.csv` marked as such.
