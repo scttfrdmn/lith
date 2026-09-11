@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+	"github.com/scttfrdmn/lith/internal/cargoship"
 	"github.com/zeebo/xxh3"
 )
 
@@ -57,10 +59,23 @@ type Recorder interface {
 	UncoveredMiss()
 }
 
-// Key identifies an object plus the ETag hash recorded in the index.
+// Key identifies an object plus the ETag hash recorded in the index. For a
+// CargoShip-backed virtual file, Key names the packed `.tar.zst` chunk object,
+// ETagHash is that object's ETag, and Cargo carries the chunk's frame table so
+// a read of the chunk's uncompressed byte space maps to zstd frame range GETs
+// (#94). Cargo is nil for an ordinary object (a plain key → range GET).
 type Key struct {
 	Key      string
 	ETagHash uint64
+	Cargo    *CargoChunk
+}
+
+// CargoChunk is the frame table of one packed `.tar.zst` chunk plus its total
+// uncompressed tar-stream size. It travels on a Key so the block store can
+// decode a chunk's uncompressed byte range from the covering zstd frames.
+type CargoChunk struct {
+	Frames      []cargoship.Frame
+	UncompTotal int64
 }
 
 // Config configures a BlockStore.
@@ -152,7 +167,10 @@ type BlockStore struct {
 	// installed Recorder implements chunkTimelineRecorder. When nil the read
 	// path takes no extra clock reads or counter updates.
 	timeline  chunkTimelineRecorder
-	fill      fillRecorder // optional sparse-fill metrics sink (#118); nil when unimplemented
+	fill      fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
+	backing   backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
+	zdec      *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
+	zdecOnce  sync.Once
 	inflightN atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
 	mu       sync.Mutex
@@ -241,6 +259,9 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	if r, ok := cfg.Recorder.(fillRecorder); ok {
 		bs.fill = r
 	}
+	if r, ok := cfg.Recorder.(backingRecorder); ok {
+		bs.backing = r
+	}
 	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
 		writers := cfg.DiskWriters
@@ -294,6 +315,9 @@ func (bs *BlockStore) Close() {
 			bs.Flush() // drain pending writes (durable cache) while workers run
 			close(bs.stop)
 			bs.writersWG.Wait()
+		}
+		if bs.zdec != nil {
+			bs.zdec.Close()
 		}
 	})
 }
@@ -597,15 +621,11 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 		defer bs.budget.release(got)
 	}
 
-	bs.record(func(r Recorder) { r.StartInflight() })
-	t0 := time.Now()
-	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)
-	bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
+	body, etag, err := bs.fetchReader(ctx, k, off, length)
 	if err != nil {
 		bs.failRun(k, first, owned, err)
 		return err
 	}
-	bs.recordTTFB(time.Since(t0))
 	defer func() { _ = body.Close() }()
 
 	if xxh3.HashString(etag) != k.ETagHash {
