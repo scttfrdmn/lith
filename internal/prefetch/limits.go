@@ -2,7 +2,10 @@
 
 package prefetch
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // Limits is the single policy object the prefetch/fill path queries for "how
 // much may I have outstanding, and what should I fetch next". It replaces the
@@ -56,6 +59,11 @@ type DeviceLimits struct {
 	NICBDPBytes   int64 // bytes in flight to fill the NIC (bandwidth-delay product)
 	MemCacheBytes int64 // memory-tier capacity
 	DiskWriteBPS  int64 // disk-tier sustained write bytes/s, 0 if no disk tier
+	// NICBytesPerSec is the NIC baseline bandwidth and TTFB the measured first-byte
+	// latency; their product (clamped) is the device-derived coalesce gap
+	// (#124/session 30). Zero means unknown.
+	NICBytesPerSec int64
+	TTFB           time.Duration
 }
 
 // Policy is the concrete Limits. The budget is a lock-free reserved-byte

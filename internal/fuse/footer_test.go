@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -124,50 +125,52 @@ func scrapeMetric(m *metrics.Metrics, substr string) string {
 	return strings.Join(out, "\n")
 }
 
-// TestFooterParquetProjectionNoSpeculation: reading a column parses the footer,
-// learns the projection, and prefetches the current row group's projection
-// columns — but NEVER a row group the app has not touched (predicate-safe).
-func TestFooterParquetProjectionNoSpeculation(t *testing.T) {
+// TestFooterParquetFullProjectionPlan (#124/session 30): the plan fires ONCE the
+// projection is confirmed — the same columns read in two row groups — and then
+// plans A,C for all remaining row groups (RG2..n) in one batch. Nothing is
+// planned after only one row group, and the touched row groups (0,1) are not
+// planned (they are demand-served).
+func TestFooterParquetFullProjectionPlan(t *testing.T) {
 	srv := fake.New()
-	obj := buildParquetObject(4, 2)
+	obj := buildParquetObject(4, 2) // 4 row groups, 2 columns
 	srv.Put("t.parquet", obj, time.Unix(1_700_000_000, 0))
 	met := metrics.New()
 	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met})
 
 	h, fh := openHandle(t, raw, "t.parquet")
-	if h.footerKind.String() != "parquet" {
-		t.Fatalf("footerKind = %v, want parquet", h.footerKind)
-	}
 	readAt := func(off int64) {
 		buf := make([]byte, 4096)
 		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
 	}
-	// Read row group 0's two columns.
+	planRanges := func() int {
+		s := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`)
+		if s == "" {
+			return 0
+		}
+		n := 0
+		_, _ = fmt.Sscanf(s[strings.LastIndex(s, " ")+1:], "%d", &n)
+		return n
+	}
+	// Read row group 0's two columns — one row group only: no plan yet.
 	readAt(parquetColStart(0, 0))
 	readAt(parquetColStart(0, 1))
 	waitStableGets(srv)
-	if h.footerMeta == nil || len(h.footerMeta.RowGroups) != 4 {
-		t.Fatalf("footer not parsed into 4 row groups: %+v", h.footerMeta)
+	if h.footerProj == nil || h.footerProj.planned {
+		t.Fatal("plan fired after only one row group")
 	}
-	// The plan must not have dispatched anything at/after row group 1's offset.
-	rg1 := parquetColStart(1, 0)
-	for start := range h.footerProj.dispatched {
-		if start >= rg1 {
-			t.Fatalf("plan speculated into an untouched row group: dispatched start %d >= rg1 %d", start, rg1)
-		}
+	if got := planRanges(); got != 0 {
+		t.Fatalf("plan dispatched %d ranges after one row group, want 0", got)
 	}
-	if got := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`); got == "" {
-		t.Fatal("no parquet plan ranges recorded")
-	}
-
-	// Now touch row group 1; its projection is planned, still nothing for RG2/RG3.
+	// Read row group 1's two columns — projection confirmed → plan fires once for
+	// RG2,RG3 (2 cols × 2 row groups = 4 ranges).
 	readAt(parquetColStart(1, 0))
+	readAt(parquetColStart(1, 1))
 	waitStableGets(srv)
-	rg2 := parquetColStart(2, 0)
-	for start := range h.footerProj.dispatched {
-		if start >= rg2 {
-			t.Fatalf("plan reached row group 2+ (start %d) after touching only RG0,RG1", start)
-		}
+	if !h.footerProj.planned {
+		t.Fatal("plan did not fire after the projection was confirmed in two row groups")
+	}
+	if got := planRanges(); got != 4 {
+		t.Fatalf("plan dispatched %d ranges, want 4 (A,C for RG2,RG3 — nothing in touched RG0,RG1)", got)
 	}
 }
 
@@ -211,6 +214,36 @@ func TestFooterParquetMalformedTier1(t *testing.T) {
 	}
 	if got := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`); got != "" {
 		t.Fatalf("malformed parquet planned ranges: %s", got)
+	}
+}
+
+// TestFooterTier2OffStreams: with tier 2 disabled (the v0.3.0 default), a footer
+// handle must stream like a plain handle — footerStream set at open, no projection
+// plan fires even after the projection would be confirmed, and reads are whole-chunk
+// (not byte-precise). Guards the readahead-suppression coupling: tier-2 detection must
+// not disable streaming when the byte-precise path is off (else a sequential scan
+// demand-fills 64 KiB extents, ~100× slower than base — see #108, session 32).
+func TestFooterTier2OffStreams(t *testing.T) {
+	srv := fake.New()
+	srv.Put("s.parquet", buildParquetObject(4, 2), time.Unix(1_700_000_000, 0))
+	met := metrics.New()
+	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met, DisableFooterTier2: true})
+
+	h, fh := openHandle(t, raw, "s.parquet")
+	if !h.footerStream {
+		t.Fatal("tier 2 off: footer handle should stream (footerStream=true) so readahead stays on")
+	}
+	readAt := func(off int64) {
+		buf := make([]byte, 4096)
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+	}
+	// Read into two distinct row groups — enough to confirm a projection if tier 2
+	// were on. With it off, no plan must fire.
+	readAt(parquetColStart(0, 0))
+	readAt(parquetColStart(1, 0))
+	waitStableGets(srv)
+	if got := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`); got != "" {
+		t.Fatalf("tier 2 off but a projection plan dispatched ranges: %s", got)
 	}
 }
 

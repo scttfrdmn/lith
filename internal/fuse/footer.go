@@ -53,14 +53,20 @@ func newFooterState() *footerState {
 }
 
 // footerProjection tracks, per handle, the Parquet columns the app has demanded
-// and the plan ranges already dispatched (so re-reads don't re-prefetch).
+// and the row groups it has touched. Once the projection is confirmed — the same
+// column set read in two distinct row groups — the plan fires once, prefetching
+// the projected column chunks of ALL remaining row groups in a single coalesced
+// batch (#124/session 30). The current and already-touched row groups stay
+// demand-served.
 type footerProjection struct {
-	cols       map[string]bool
-	dispatched map[int64]bool // range Start -> dispatched
+	cols    map[string]bool
+	rgsSeen map[int]bool
+	maxRG   int  // highest row group the app has read; -1 = none yet
+	planned bool // the one-shot full-projection plan has fired
 }
 
 func newFooterProjection() *footerProjection {
-	return &footerProjection{cols: map[string]bool{}, dispatched: map[int64]bool{}}
+	return &footerProjection{cols: map[string]bool{}, rgsSeen: map[int]bool{}, maxRG: -1}
 }
 
 // maybeFooterReadahead applies tier 1 at open and arms tier 2. Returns true when
@@ -81,8 +87,8 @@ func (f *rawFS) maybeFooterReadahead(relPath string, h *fileHandle, size int64) 
 	if tailStart < 0 {
 		tailStart = 0
 	}
-	f.prefetchByteRange(h.key, tailStart, size, size)
-	f.prefetchByteRange(h.key, 0, 8, size)
+	f.prefetchByteExact(h.key, tailStart, size, size)
+	f.prefetchByteExact(h.key, 0, 8, size)
 	h.footerKind = kind
 	if kind == footer.FormatParquet {
 		h.footerProj = newFooterProjection()
@@ -123,18 +129,33 @@ func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
 			return
 		}
 	}
+	p := h.footerProj
+	if p.planned {
+		return // one-shot plan already fired; remaining reads are demand-served
+	}
 	rg, col, ok := h.footerMeta.Locate(off)
 	if !ok {
 		return // the footer itself or a gap between chunks
 	}
-	if !h.footerProj.cols[col] {
-		h.footerProj.cols[col] = true
+	p.cols[col] = true
+	p.rgsSeen[rg] = true
+	if rg > p.maxRG {
+		p.maxRG = rg
 	}
-	cols := make([]string, 0, len(h.footerProj.cols))
-	for c := range h.footerProj.cols {
+	// Fire only once the projection is confirmed — the app has read into two
+	// distinct row groups, so the column set is stable (#124/session 30). Then
+	// plan the projection for ALL remaining row groups (beyond the highest touched)
+	// in ONE coalesced batch; the current and touched row groups stay demand-served.
+	if len(p.rgsSeen) < 2 {
+		return
+	}
+	p.planned = true
+	cols := make([]string, 0, len(p.cols))
+	for c := range p.cols {
 		cols = append(cols, c)
 	}
-	f.footerPrefetch(h, h.footerMeta.ProjectionChunks(cols, rg, rg+1), "parquet")
+	nRG := len(h.footerMeta.RowGroups)
+	f.footerPrefetch(h, h.footerMeta.ProjectionChunks(cols, p.maxRG+1, nRG), "parquet")
 }
 
 // footerZipRead prefetches the entry a read falls in (local header + data) and,
@@ -259,47 +280,53 @@ func (f *rawFS) footerZipEntries(key blockstore.Key, size int64) []footer.ZipEnt
 	return entries
 }
 
-// footerPrefetch coalesces adjacent ranges and dispatches each as a budget-
-// bounded prefetch, deduped per handle so re-reads don't re-issue. Each
-// dispatched range counts against the plan-ranges metric (#108).
+// footerPrefetch dispatches projection/entry ranges as one budget-bounded,
+// gap-tolerant coalesced batch (#124): the blockstore merges them across chunk
+// boundaries into a few range GETs (device-derived gap) rather than one tiny GET
+// per column chunk.
 func (f *rawFS) footerPrefetch(h *fileHandle, ranges []footer.Range, format string) {
 	if len(ranges) == 0 {
 		return
 	}
-	coalesced := coalesceFooter(ranges, f.blockSize)
-	for _, r := range coalesced {
-		if h.footerProj != nil {
-			if h.footerProj.dispatched[r.Start] {
-				continue
-			}
-			h.footerProj.dispatched[r.Start] = true
-		}
-		if f.prefetchByteRange(h.key, r.Start, r.End, h.size) {
-			f.met.FormatPlanRanges(format)
-		}
+	batch := make([]blockstore.Range, 0, len(ranges))
+	var total int64
+	for _, r := range ranges {
+		batch = append(batch, blockstore.Range{Start: r.Start, End: r.End})
+		total += r.End - r.Start
+		f.met.FormatPlanRanges(format)
 	}
+	if len(batch) == 0 || !f.reserve(total) {
+		return
+	}
+	go func() {
+		defer f.release(total)
+		f.store.FillBatch(f.ctx, h.key, batch, h.size)
+	}()
 }
 
-// coalesceFooter sorts ranges by Start and merges those within slack bytes of
-// each other, so a row group's adjacent column chunks become one range GET.
-func coalesceFooter(rs []footer.Range, slack int64) []footer.Range {
-	if len(rs) == 0 {
-		return nil
+// prefetchByteExact reserves prefetch budget for [off,end) and fills exactly the
+// 64 KiB extents it covers, byte-exact, via the blockstore (#118) — not the
+// whole blocks prefetchByteRange would pull. Returns false if the budget is
+// exhausted.
+func (f *rawFS) prefetchByteExact(key blockstore.Key, off, end, objSize int64) bool {
+	if off < 0 {
+		off = 0
 	}
-	cp := append([]footer.Range(nil), rs...)
-	sort.Slice(cp, func(i, j int) bool { return cp[i].Start < cp[j].Start })
-	out := []footer.Range{cp[0]}
-	for _, r := range cp[1:] {
-		last := &out[len(out)-1]
-		if r.Start <= last.End+slack {
-			if r.End > last.End {
-				last.End = r.End
-			}
-			continue
-		}
-		out = append(out, r)
+	if end > objSize {
+		end = objSize
 	}
-	return out
+	if end <= off {
+		return true
+	}
+	span := end - off
+	if !f.reserve(span) {
+		return false
+	}
+	go func() {
+		defer f.release(span)
+		f.store.FillRange(f.ctx, key, off, end, objSize)
+	}()
+	return true
 }
 
 func min64(a, b int64) int64 {

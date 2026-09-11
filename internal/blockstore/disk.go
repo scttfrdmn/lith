@@ -71,25 +71,32 @@ func (d *diskTier) path(cacheKey string) string {
 	return filepath.Join(d.root, h[0:2], h[2:4], h)
 }
 
-// Get returns the cached block and whether it was present, touching the file's
-// mtime on a hit so the LRU sweep treats it as recently used.
-func (d *diskTier) Get(cacheKey string) ([]byte, bool) {
+// Get returns the cached block, its filled-extent bitmap, and whether it was
+// present, touching the file's mtime on a hit so the LRU sweep treats it as
+// recently used. The on-disk layout is [2-byte LE filled][chunk bytes] (#118);
+// a partial chunk is valid and served per-extent.
+func (d *diskTier) Get(cacheKey string) ([]byte, uint16, bool) {
 	if d == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	p := d.path(cacheKey)
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return nil, false
+	raw, err := os.ReadFile(p)
+	if err != nil || len(raw) < 2 {
+		return nil, 0, false
 	}
+	filled := uint16(raw[0]) | uint16(raw[1])<<8
 	now := time.Now()
 	_ = os.Chtimes(p, now, now)
-	return data, true
+	// Copy the chunk bytes out of raw so the returned slice does not alias the
+	// 2-byte header (and can be reallocated independently).
+	data := append([]byte(nil), raw[2:]...)
+	return data, filled, true
 }
 
-// Put writes a block to disk atomically and evicts if over capacity.
-func (d *diskTier) Put(cacheKey string, data []byte) {
-	if d == nil || int64(len(data)) > d.capacity {
+// Put writes a block to disk atomically (prefixed with its 2-byte filled bitmap)
+// and evicts if over capacity.
+func (d *diskTier) Put(cacheKey string, data []byte, filled uint16) {
+	if d == nil || int64(len(data))+2 > d.capacity {
 		return
 	}
 	if d.putDelay > 0 {
@@ -104,6 +111,12 @@ func (d *diskTier) Put(cacheKey string, data []byte) {
 		return
 	}
 	tmpName := tmp.Name()
+	hdr := [2]byte{byte(filled), byte(filled >> 8)}
+	if _, err := tmp.Write(hdr[:]); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -119,7 +132,7 @@ func (d *diskTier) Put(cacheKey string, data []byte) {
 	}
 
 	d.mu.Lock()
-	d.size += int64(len(data))
+	d.size += int64(len(data)) + 2
 	over := d.size > d.capacity
 	d.mu.Unlock()
 	if over {

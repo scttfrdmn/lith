@@ -43,10 +43,17 @@ type Metrics struct {
 	formatIdxPfB  prometheus.Counter
 	formatRanges  *prometheus.CounterVec // format
 
-	readSize prometheus.Histogram // FUSE read request sizes (#65)
-	readN    atomic.Int64         // read count, for bench mean
-	readSum  atomic.Int64         // summed read bytes, for bench mean
-	distinct *distinctReads       // per-object chunk bitmaps (#65)
+	fillPartial prometheus.Counter     // partial (sub-chunk) fills (#118)
+	fillBytes   *prometheus.CounterVec // fill bytes by kind=plan|demand|whole|gap (#118/#124)
+	fillRuns    prometheus.Counter     // coalesced fill-batch range GETs (#124)
+	fillGap     prometheus.Counter     // bytes fetched only to close coalesce gaps (#124)
+	fillBatchSz prometheus.Histogram   // ranges per fill batch (#124/session 30)
+	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
+	fillInflPk  prometheus.Gauge       // high-water mark of fill-batch runs in flight (#31)
+	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
+	readN       atomic.Int64           // read count, for bench mean
+	readSum     atomic.Int64           // summed read bytes, for bench mean
+	distinct    *distinctReads         // per-object chunk bitmaps (#65)
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -124,6 +131,29 @@ func New() *Metrics {
 		formatRanges: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_format_plan_ranges_total", Help: "Data byte ranges prefetched by an index-resolved plan, by format (#107 tier 2).",
 		}, []string{"format"}),
+		fillPartial: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_fill_partial_total", Help: "Sub-chunk (sparse) fills — fewer than all extents of a 1 MiB chunk (#118).",
+		}),
+		fillBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection), demand (read of an unfilled extent), whole (streaming/prefetch), gap (fetched only to close a sub-coalesce-gap hole) (#118/#124).",
+		}, []string{"kind"}),
+		fillRuns: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_fill_runs_total", Help: "Coalesced fill-batch range GETs (#124).",
+		}),
+		fillGap: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_fill_gap_bytes_total", Help: "Bytes fetched only to close sub-coalesce-gap holes between plan ranges (#124).",
+		}),
+		fillBatchSz: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "lith_fill_batch_size",
+			Help:    "Number of ranges coalesced per fill batch (#124/session 30).",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1 .. 2048
+		}),
+		fillInfl: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lith_fill_inflight", Help: "Fill-batch range GETs currently in flight (#31).",
+		}),
+		fillInflPk: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lith_fill_inflight_peak", Help: "High-water mark of fill-batch range GETs in flight since mount (#31).",
+		}),
 		readSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "lith_read_size_bytes",
 			Help:    "FUSE read request sizes in bytes (#65).",
@@ -134,11 +164,12 @@ func New() *Metrics {
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
-		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize)
+		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
+		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
-		Help: "Distinct object bytes read through the mount, from per-object chunk bitmaps. " +
-			"Granularity is 1 MiB; objects larger than 1 TiB use a coarser 64 MiB granularity to bound the bitmap. " +
+		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
+			"Granularity is 64 KiB (one sparse-fill extent, #118); objects larger than 1 TiB use a coarser 64 MiB granularity to bound the bitmap. " +
 			"Tracking is capped at 2^20 distinct objects (beyond that new objects are not counted).",
 	}, func() float64 { return float64(m.distinct.totalBytes()) }))
 	return m
@@ -338,6 +369,57 @@ func (m *Metrics) ObserveFUSE(op string, seconds float64) {
 	}
 }
 
+// FillPartial records a sub-chunk (sparse) fill (#118). Nil-safe.
+func (m *Metrics) FillPartial() {
+	if m != nil {
+		m.fillPartial.Inc()
+	}
+}
+
+// FillBytes records bytes fetched by a fill of the given kind (#118). Nil-safe.
+func (m *Metrics) FillBytes(kind string, n int64) {
+	if m != nil && n > 0 {
+		m.fillBytes.WithLabelValues(kind).Add(float64(n))
+	}
+}
+
+// FillRun records one coalesced fill-batch range GET (#124). Nil-safe.
+func (m *Metrics) FillRun() {
+	if m != nil {
+		m.fillRuns.Inc()
+	}
+}
+
+// FillGapBytes records bytes fetched only to close a coalesce gap (#124). Nil-safe.
+func (m *Metrics) FillGapBytes(n int64) {
+	if m != nil && n > 0 {
+		m.fillGap.Add(float64(n))
+	}
+}
+
+// FillBatchSize records the number of ranges in a fill batch (#124). Nil-safe.
+func (m *Metrics) FillBatchSize(n int) {
+	if m != nil && n > 0 {
+		m.fillBatchSz.Observe(float64(n))
+	}
+}
+
+// FillInflight adjusts the in-flight fill-run gauge (#31). Nil-safe.
+func (m *Metrics) FillInflight(delta float64) {
+	if m != nil {
+		m.fillInfl.Add(delta)
+	}
+}
+
+// FillInflightPeak raises the in-flight fill-run high-water gauge to n (#31).
+// The peak only grows over a mount, so Set with a new maximum is monotonic.
+// Nil-safe.
+func (m *Metrics) FillInflightPeak(n float64) {
+	if m != nil {
+		m.fillInflPk.Set(n)
+	}
+}
+
 // ObserveReadSize records one FUSE read request size (#65). Nil-safe.
 func (m *Metrics) ObserveReadSize(n int64) {
 	if m == nil || n < 0 {
@@ -377,7 +459,7 @@ func (m *Metrics) ReadSizeStats() (count, sumBytes int64) {
 // --- distinct-bytes-read tracking (#65) ---
 
 const (
-	distinctFineGran    = 1 << 20 // 1 MiB chunk granularity
+	distinctFineGran    = 64 << 10 // 64 KiB extent granularity (#118; was 1 MiB chunk-rounded)
 	distinctCoarseGran  = 64 << 20
 	distinctCoarseAbove = 1 << 40 // objects larger than 1 TiB use the coarse granularity
 	distinctMaxObjs     = 1 << 20 // defensive cap on tracked objects

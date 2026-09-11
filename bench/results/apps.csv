@@ -15,3 +15,6 @@ v0.3,R2 samtools view -c 1000x1Mb,14 GB CRAM,46.4,44.5,,0.588,bgzf ties base 0.5
 v0.3,R4 pyarrow projection single (4xl),650 MB Parquet,2.4,0.2,10.5,0.605,pyarrow-native 10.5s/0.129 GB byte-exact; lith 4x faster (78 GETs vs hundreds) 4.7x more bytes
 v0.3,R4 pyarrow projection 8-concurrent (4xl),8x650 MB Parquet,7.8,,11.2,5.12,pyarrow-native 11.2s/1.0 GB; lith wins wall not bytes
 v0.3,R4 pyarrow projection single (c8g.large),650 MB Parquet,10.0,,11.5,0.614,small box bandwidth-bound: byte over-fetch erases most of the wall edge (~tie)
+# v0.3 sparse chunk fills (#118). R4 = Overture places projection (id,confidence,basic_category; ~1% filter). CC/nyc-tlc S3 now CDN-only (inaccessible); no writable in-region bucket -> measured cross-region us-west-2<-us-east-1 (bytes/GETs region-independent = the criterion; wall cross-region). mount_s3 col = pyarrow-native S3.
+v0.3,R4 pyarrow projection single (#118),650 MB Parquet,19.0,0.2,10.2,0.273,base(pre-#118) 605 MB/2.6s; post #118 273 MB (2.2x byte cut) but 2076 GETs; pyarrow 130 MB. Criterion NOT met (#124)
+v0.3,R4 pyarrow projection 8-concurrent (#118),8x650 MB Parquet,74,,10.6,2.04,base 5115 MB/9.8s; post 2040 MB/15494 GETs; pyarrow 1008 MB. GET explosion regresses cross-region wall (#124)

@@ -148,7 +148,14 @@ type fileHandle struct {
 	// names a footer-family container; the parse (footerMeta/footerZip) is lazy
 	// on first read and shared across handles via footerState. footerParsed marks
 	// that a parse was attempted (nil result = tier 1 only).
-	footerKind    footer.Format
+	footerKind footer.Format
+	// footerStream: on a fat pipe the device-derived coalesce gap is large, so a
+	// projection would coalesce to ≈ whole-file reads anyway — in-region, bytes
+	// are free and round-trips aren't (session 30). Such a handle streams like a
+	// plain file (readahead window on, whole-chunk reads, no extent/plan/batch),
+	// matching base. When the gap is small (bandwidth-scarce), it stays byte-
+	// precise. Decided once at open from the current gap vs the block size.
+	footerStream  bool
 	footerMu      sync.Mutex // guards the footer tier-2 state below (Read is concurrent per handle)
 	footerParsed  bool
 	footerMeta    *footer.ParquetMeta
@@ -370,8 +377,28 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	if !bgzfHandled {
 		footerHandled = f.maybeFooterReadahead(n.path, h, fi.Size)
 	}
+	// Big-pipe regime (session 30): if the device-derived coalesce gap is at least
+	// a fill block, a projection coalesces to ≈ whole-file reads — cheaper to just
+	// stream via the readahead window (like base) than to run the byte-precise
+	// extent/plan path. Small gap (bandwidth-scarce) → stay byte-precise.
+	if footerHandled && f.cfg.DisableFooterTier2 {
+		// Tier 2 off (v0.3.0 default): byte-precise projection fetch is
+		// experimental and slower than streaming on every tested box (#108), so a
+		// footer handle streams like a plain one (full readahead, whole-chunk
+		// reads). Otherwise it would suppress readahead and demand-fill 64 KiB
+		// extents on a sequential scan (~100x slower). Only tier 1 stays.
+		h.footerStream = true
+	} else if footerHandled && f.store.CoalesceGap() >= f.store.BlockSize() {
+		h.footerStream = true
+		slog.Info("footer streaming regime (coalesce gap ≥ block, session-30 safety)",
+			"path", n.path, "coalesce_gap", f.store.CoalesceGap(), "block_size", f.store.BlockSize())
+	}
 
-	if fi.Size > f.partsThreshold() {
+	// A byte-precise footer handle is projection-driven, not a sequential scan:
+	// its tier-2 plan replaces the whole-block readahead window, which would
+	// otherwise sweep every column. A streaming footer handle keeps the window
+	// (it wants the whole file), like every non-footer handle.
+	if fi.Size > f.partsThreshold() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -420,8 +447,15 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	}
 	// footer tier 2 (#108): prefetch this row group's projection columns
 	// (Parquet) or this/next zip entries so follow-on reads are cache hits.
-	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 {
+	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 && !h.footerStream {
 		f.footerReadExtend(h, off)
+		// Batch a burst of concurrent demand misses on this object into one
+		// coalesced fetch (#124/session 30) — a front-loading reader (pyarrow
+		// pre_buffer) issues many reads at once; without this each is its own tiny
+		// GET. Skipped when the extents are already cached (no tick on a warm read).
+		if end > off && !f.store.Covered(h.key, off, end-off, h.size) {
+			f.store.GatherDemand(f.ctx, h.key, off, end-off, h.size)
+		}
 	}
 
 	var res fuse.ReadResult
@@ -429,12 +463,17 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// Read lies within one chunk: return a sub-slice of the (immutable)
 		// chunk buffer directly — no copy, no allocation on a cache hit.
 		ci := off / blockstore.ChunkSize
-		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size)
+		lo := off - ci*blockstore.ChunkSize
+		hi := lo + (end - off)
+		// A byte-precise footer handle reads a projection: fetch only the read's
+		// 64 KiB extents so a point read of a plan-prefetched column adds no S3
+		// bytes (#118). Every other handle — plain, or a streaming footer handle on
+		// a fat pipe — streams whole chunks.
+		sequential := h.footerKind == footer.FormatNone || h.footerStream
+		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size, lo, hi, sequential)
 		if err != nil {
 			return nil, fuse.EIO
 		}
-		lo := off - ci*blockstore.ChunkSize
-		hi := lo + (end - off)
 		if hi > int64(len(chunk)) {
 			hi = int64(len(chunk))
 		}
@@ -451,8 +490,10 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 
 	// Drive the prefetcher off the block this read falls in — unless a whole-file
 	// parts fetch is in flight for this handle, which already covers every block
-	// (see Open: readahead would only contend with the parts fetch).
-	if !h.partsDispatched.Load() {
+	// (see Open: readahead would only contend with the parts fetch), or this is a
+	// footer-family handle whose byte-exact projection plan replaces the window
+	// (a whole-block window would re-fetch the columns the plan skips; #118).
+	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			pb := pb
