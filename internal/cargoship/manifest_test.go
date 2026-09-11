@@ -167,3 +167,28 @@ func FuzzParse(f *testing.F) {
 		_, _ = m.Resolve()
 	})
 }
+
+// TestResolveKeepsCompleteStagingSnapshot: CargoShip may record intermediate
+// staging snapshots of a chunk under one s3_key (smaller compressed_size); the
+// resolver must keep the complete entry (largest compressed_size) and drop the
+// partials.
+func TestResolveKeepsCompleteStagingSnapshot(t *testing.T) {
+	m := &Manifest{
+		Version: "2.1", Prefix: "p",
+		Chunks: []rawChunkEntry{
+			{ID: 0, S3Key: "c0.tar.zst", CompressedSize: 100, Frames: []rawFrameEntry{{CompressedOffset: 0, CompressedSize: 100, UncompressedOffset: 0, UncompressedSize: 200}}},
+			{ID: 0, S3Key: "c0.tar.zst", CompressedSize: 300, Frames: []rawFrameEntry{{CompressedOffset: 0, CompressedSize: 150, UncompressedOffset: 0, UncompressedSize: 300}, {CompressedOffset: 150, CompressedSize: 150, UncompressedOffset: 300, UncompressedSize: 300}}},
+		},
+		Files: []rawFileEntry{{Path: "p/f", Size: 50, ChunkID: 0, S3Key: "c0.tar.zst", ArchiveOffset: 0}},
+	}
+	arch, err := m.Resolve()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(arch.Chunks) != 1 {
+		t.Fatalf("chunks=%d, want 1 (partial snapshot dropped)", len(arch.Chunks))
+	}
+	if len(arch.Chunks[0].Frames) != 2 || arch.Chunks[0].UncompTotal != 600 {
+		t.Fatalf("kept the wrong entry: frames=%d total=%d", len(arch.Chunks[0].Frames), arch.Chunks[0].UncompTotal)
+	}
+}

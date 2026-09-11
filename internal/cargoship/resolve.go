@@ -60,9 +60,29 @@ type Archive struct {
 func (m *Manifest) Resolve() (*Archive, error) {
 	// Chunks, indexed by their S3 key. Chunk IDs are only unique within a shard
 	// (each shard restarts at 0), so the object key is the stable identity.
-	chunks := make([]Chunk, len(m.Chunks))
-	keyToIdx := make(map[string]int, len(m.Chunks))
+	// CargoShip may record intermediate staging snapshots of a chunk under one
+	// key (partial writes with a smaller compressed_size); the complete entry is
+	// the one whose compressed_size matches the final object — the maximum. Keep
+	// that one and drop the partial snapshots.
+	best := make(map[string]int) // s3_key -> index into m.Chunks of the winning entry
+	var keyOrder []string
 	for i, rc := range m.Chunks {
+		if rc.S3Key == "" {
+			return nil, fmt.Errorf("cargoship: chunk %d has no s3_key", i)
+		}
+		if j, seen := best[rc.S3Key]; seen {
+			if rc.CompressedSize > m.Chunks[j].CompressedSize {
+				best[rc.S3Key] = i
+			}
+			continue
+		}
+		best[rc.S3Key] = i
+		keyOrder = append(keyOrder, rc.S3Key)
+	}
+	chunks := make([]Chunk, len(keyOrder))
+	keyToIdx := make(map[string]int, len(keyOrder))
+	for idx, key := range keyOrder {
+		rc := m.Chunks[best[key]]
 		frames := make([]Frame, len(rc.Frames))
 		for fi, rf := range rc.Frames {
 			fr := Frame{
@@ -72,7 +92,7 @@ func (m *Manifest) Resolve() (*Archive, error) {
 			if rf.Checksum != "" {
 				sum, err := hex.DecodeString(rf.Checksum)
 				if err != nil || len(sum) != 32 {
-					return nil, fmt.Errorf("cargoship: chunk %d frame %d has a malformed checksum", rc.ID, fi)
+					return nil, fmt.Errorf("cargoship: chunk %q frame %d has a malformed checksum", rc.S3Key, fi)
 				}
 				copy(fr.Sum[:], sum)
 				fr.HasSum = true
@@ -84,14 +104,8 @@ func (m *Manifest) Resolve() (*Archive, error) {
 		for _, fr := range frames {
 			total += fr.UncompLen
 		}
-		chunks[i] = Chunk{Key: resolveChunkKey(m.Prefix, rc.S3Key), UncompTotal: total, Frames: frames}
-		if rc.S3Key == "" {
-			return nil, fmt.Errorf("cargoship: chunk %d has no s3_key", i)
-		}
-		if _, dup := keyToIdx[rc.S3Key]; dup {
-			return nil, fmt.Errorf("cargoship: duplicate chunk s3_key %q", rc.S3Key)
-		}
-		keyToIdx[rc.S3Key] = i
+		chunks[idx] = Chunk{Key: resolveChunkKey(m.Prefix, rc.S3Key), UncompTotal: total, Frames: frames}
+		keyToIdx[rc.S3Key] = idx
 	}
 
 	// Group file entries by virtual path so split parts assemble into one file.
