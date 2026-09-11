@@ -89,7 +89,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between two format-plan/demand fill ranges merged into one range GET (#124); 0 = derive from the NIC baseline × measured first-byte latency, clamped to [256KiB, 64MiB]")
 	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
-	fl.BoolVar(&f.footerTier2, "footer-tier2", true, "prefetch the index-resolved projection (Parquet column chunks) / entries (zip) for footer-family files (#108); false leaves only the generic tier-1 footer+head prefetch")
+	fl.BoolVar(&f.footerTier2, "footer-tier2", false, "experimental — byte-precise Parquet projection fetch; measured slower than default streaming on all tested instance classes as of v0.3.0 (see #108). Prefetches the index-resolved projection (Parquet column chunks) / entries (zip) for footer-family files; off leaves only the generic tier-1 footer+head prefetch")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
