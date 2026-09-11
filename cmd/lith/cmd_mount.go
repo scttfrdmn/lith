@@ -34,6 +34,7 @@ type mountFlags struct {
 	maxRange         string
 	smallFile        string
 	partsMax         string
+	coalesceGap      string
 	bgzfWholeFileMax string
 	footerTier2      bool
 	s3Concurrency    int
@@ -86,6 +87,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
+	fl.StringVar(&f.coalesceGap, "coalesce-gap", "256KiB", "largest gap between two format-plan/demand fill ranges that is merged into one range GET (#124); trades a little over-fetch for far fewer GETs on a scattered projection")
 	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
 	fl.BoolVar(&f.footerTier2, "footer-tier2", true, "prefetch the index-resolved projection (Parquet column chunks) / entries (zip) for footer-family files (#108); false leaves only the generic tier-1 footer+head prefetch")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
@@ -149,6 +151,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		}
 	}
 	smallFile, err := parseSize(f.smallFile)
+	if err != nil {
+		return err
+	}
+	coalesceGap, err := parseSize(f.coalesceGap)
 	if err != nil {
 		return err
 	}
@@ -243,6 +249,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		S3Concurrency:       f.s3Concurrency,
 		PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget:      prefetchBudget,
+		CoalesceGap:         coalesceGap,
 		DiskWriters:         f.diskWriters,
 		InflightBytes:       inflight,
 		Recorder:            rec, // nil-safe; timeline recorder when --timeline-csv

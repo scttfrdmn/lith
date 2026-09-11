@@ -5,6 +5,7 @@ package blockstore
 import (
 	"context"
 	"io"
+	"sort"
 
 	"github.com/zeebo/xxh3"
 )
@@ -24,6 +25,7 @@ const (
 	fillWhole  fillKind = iota // a whole-chunk fill (streaming/prefetch/sequential demand)
 	fillDemand                 // a demand read of an unfilled extent (non-sequential)
 	fillPlan                   // a format plan's byte-exact projection range
+	fillSilent                 // a fill whose bytes FillBatch accounts itself (no per-run recordFill)
 )
 
 func (fk fillKind) label() string {
@@ -194,4 +196,101 @@ func (bs *BlockStore) FillRange(ctx context.Context, k Key, off, end, objSize in
 			return // best-effort, like Prefetch
 		}
 	}
+}
+
+// FillBatch fills the extents covering a batch of byte ranges (#124), coalescing
+// them across chunk boundaries into range GETs: each range is extent-aligned
+// (64 KiB), then sorted and merged whenever the gap to the next is below
+// coalesceGap — bytes inside a closed gap are fetched and marked filled (counted
+// as kind=gap so the rounding cost is visible). Each merged run is one coalesced
+// GET (via ensureChunks, which fetches a run of owned chunks in one request and
+// joins any in-flight chunk). A format tier-2 plan calls this so a projection is
+// a few large GETs, not many tiny ones. Best-effort, prefetch priority.
+func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objSize int64) {
+	type span struct{ lo, hi int64 }
+	aligned := make([]span, 0, len(ranges))
+	for _, rg := range ranges {
+		lo, hi := rg.Start, rg.End
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > objSize {
+			hi = objSize
+		}
+		if hi <= lo {
+			continue
+		}
+		alo := lo / ExtentSize * ExtentSize
+		ahi := (hi + ExtentSize - 1) / ExtentSize * ExtentSize
+		if ahi > objSize {
+			ahi = objSize
+		}
+		aligned = append(aligned, span{alo, ahi})
+	}
+	if len(aligned) == 0 {
+		return
+	}
+	sort.Slice(aligned, func(i, j int) bool { return aligned[i].lo < aligned[j].lo })
+
+	// Union of the requested (extent-aligned) ranges — the plan bytes, before any
+	// gap-closing. Overlaps are merged so double-counted extents count once.
+	var planBytes int64
+	{
+		u := aligned[0]
+		for _, a := range aligned[1:] {
+			if a.lo <= u.hi { // overlap/adjacent
+				if a.hi > u.hi {
+					u.hi = a.hi
+				}
+				continue
+			}
+			planBytes += u.hi - u.lo
+			u = a
+		}
+		planBytes += u.hi - u.lo
+	}
+
+	// Gap-tolerant coalesce into runs; each run is one GET.
+	runs := []span{aligned[0]}
+	for _, a := range aligned[1:] {
+		last := &runs[len(runs)-1]
+		if a.lo <= last.hi+bs.coalesceGap {
+			if a.hi > last.hi {
+				last.hi = a.hi
+			}
+			continue
+		}
+		runs = append(runs, a)
+	}
+
+	var mergedBytes int64
+	for _, run := range runs {
+		mergedBytes += run.hi - run.lo
+		bs.fillCoalescedRun(ctx, k, run.lo, run.hi, objSize)
+	}
+	gapBytes := mergedBytes - planBytes
+	if gapBytes < 0 {
+		gapBytes = 0
+	}
+	bs.recordBatch(planBytes, gapBytes, int64(len(runs)))
+}
+
+// fillCoalescedRun fetches the extents covering the contiguous byte run [lo, hi)
+// in one coalesced GET (ensureChunks coalesces the owned chunks of the run and
+// joins any already in flight). Silent kind: FillBatch does the byte accounting.
+func (bs *BlockStore) fillCoalescedRun(ctx context.Context, k Key, lo, hi, objSize int64) {
+	if hi <= lo {
+		return
+	}
+	c0 := lo / ChunkSize
+	c1 := (hi - 1) / ChunkSize
+	wantOf := func(ci int64) uint16 {
+		start := ci * ChunkSize
+		l := int64(0)
+		if lo > start {
+			l = lo - start
+		}
+		return extentMask(l, hi-start)
+	}
+	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil, wantOf, fillSilent)
 }

@@ -52,15 +52,17 @@ func newFooterState() *footerState {
 	}
 }
 
-// footerProjection tracks, per handle, the Parquet columns the app has demanded
-// and the plan ranges already dispatched (so re-reads don't re-prefetch).
+// footerProjection tracks, per handle, the Parquet columns the app has demanded,
+// the highest row group it has touched, and the plan ranges already dispatched
+// (so re-reads don't re-prefetch).
 type footerProjection struct {
 	cols       map[string]bool
 	dispatched map[int64]bool // range Start -> dispatched
+	maxRG      int            // highest row group the app has read; -1 = none yet
 }
 
 func newFooterProjection() *footerProjection {
-	return &footerProjection{cols: map[string]bool{}, dispatched: map[int64]bool{}}
+	return &footerProjection{cols: map[string]bool{}, dispatched: map[int64]bool{}, maxRG: -1}
 }
 
 // maybeFooterReadahead applies tier 1 at open and arms tier 2. Returns true when
@@ -127,14 +129,21 @@ func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
 	if !ok {
 		return // the footer itself or a gap between chunks
 	}
-	if !h.footerProj.cols[col] {
-		h.footerProj.cols[col] = true
+	h.footerProj.cols[col] = true
+	if rg > h.footerProj.maxRG {
+		h.footerProj.maxRG = rg
 	}
+	// Plan the projection only for row groups the app has NOT touched — the row
+	// groups beyond the highest one read so far (#124). The current row group is
+	// served by demand-precise fills, so the plan never re-fetches what the app is
+	// already reading. On a dense scan this front-runs the projection; row groups
+	// the app never reaches cost nothing until touched.
 	cols := make([]string, 0, len(h.footerProj.cols))
 	for c := range h.footerProj.cols {
 		cols = append(cols, c)
 	}
-	f.footerPrefetch(h, h.footerMeta.ProjectionChunks(cols, rg, rg+1), "parquet")
+	nRG := len(h.footerMeta.RowGroups)
+	f.footerPrefetch(h, h.footerMeta.ProjectionChunks(cols, h.footerProj.maxRG+1, nRG), "parquet")
 }
 
 // footerZipRead prefetches the entry a read falls in (local header + data) and,
@@ -259,29 +268,34 @@ func (f *rawFS) footerZipEntries(key blockstore.Key, size int64) []footer.ZipEnt
 	return entries
 }
 
-// footerPrefetch coalesces adjacent ranges and dispatches each as a budget-
-// bounded prefetch, deduped per handle so re-reads don't re-issue. Each
-// dispatched range counts against the plan-ranges metric (#108).
+// footerPrefetch dispatches the plan's projection ranges as one budget-bounded,
+// gap-tolerant coalesced batch (#124): the blockstore merges them across chunk
+// boundaries into a few range GETs rather than one tiny GET per column chunk.
+// Ranges already dispatched for this handle are skipped.
 func (f *rawFS) footerPrefetch(h *fileHandle, ranges []footer.Range, format string) {
 	if len(ranges) == 0 {
 		return
 	}
-	// Coalesce only within a 64 KiB extent: merging across the big unprojected
-	// columns that sit between a row group's projected chunks would refetch the
-	// gaps and defeat the byte-exact plan (#118). The blockstore fills exactly
-	// the extents each range covers.
-	coalesced := coalesceFooter(ranges, blockstore.ExtentSize)
-	for _, r := range coalesced {
+	batch := make([]blockstore.Range, 0, len(ranges))
+	var total int64
+	for _, r := range ranges {
 		if h.footerProj != nil {
 			if h.footerProj.dispatched[r.Start] {
 				continue
 			}
 			h.footerProj.dispatched[r.Start] = true
 		}
-		if f.prefetchByteExact(h.key, r.Start, r.End, h.size) {
-			f.met.FormatPlanRanges(format)
-		}
+		batch = append(batch, blockstore.Range{Start: r.Start, End: r.End})
+		total += r.End - r.Start
+		f.met.FormatPlanRanges(format)
 	}
+	if len(batch) == 0 || !f.reserve(total) {
+		return
+	}
+	go func() {
+		defer f.release(total)
+		f.store.FillBatch(f.ctx, h.key, batch, h.size)
+	}()
 }
 
 // prefetchByteExact reserves prefetch budget for [off,end) and fills exactly the
@@ -307,28 +321,6 @@ func (f *rawFS) prefetchByteExact(key blockstore.Key, off, end, objSize int64) b
 		f.store.FillRange(f.ctx, key, off, end, objSize)
 	}()
 	return true
-}
-
-// coalesceFooter sorts ranges by Start and merges those within slack bytes of
-// each other, so a row group's adjacent column chunks become one range GET.
-func coalesceFooter(rs []footer.Range, slack int64) []footer.Range {
-	if len(rs) == 0 {
-		return nil
-	}
-	cp := append([]footer.Range(nil), rs...)
-	sort.Slice(cp, func(i, j int) bool { return cp[i].Start < cp[j].Start })
-	out := []footer.Range{cp[0]}
-	for _, r := range cp[1:] {
-		last := &out[len(out)-1]
-		if r.Start <= last.End+slack {
-			if r.End > last.End {
-				last.End = r.End
-			}
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
 }
 
 func min64(a, b int64) int64 {

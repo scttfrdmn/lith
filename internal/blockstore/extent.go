@@ -21,6 +21,10 @@ const (
 	fullExtents uint16 = 0xFFFF
 )
 
+// Range is a half-open byte range [Start, End) of an object, the unit a fill
+// batch (#124) coalesces.
+type Range struct{ Start, End int64 }
+
 // extentMask returns the bitmap of extents overlapping [lo, hi) within a chunk
 // (byte offsets relative to the chunk start). lo/hi are clamped to [0, ChunkSize].
 func extentMask(lo, hi int64) uint16 {

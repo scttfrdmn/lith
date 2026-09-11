@@ -44,7 +44,9 @@ type Metrics struct {
 	formatRanges  *prometheus.CounterVec // format
 
 	fillPartial prometheus.Counter     // partial (sub-chunk) fills (#118)
-	fillBytes   *prometheus.CounterVec // fill bytes by kind=plan|demand|whole (#118)
+	fillBytes   *prometheus.CounterVec // fill bytes by kind=plan|demand|whole|gap (#118/#124)
+	fillRuns    prometheus.Counter     // coalesced fill-batch range GETs (#124)
+	fillGap     prometheus.Counter     // bytes fetched only to close coalesce gaps (#124)
 	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
 	readN       atomic.Int64           // read count, for bench mean
 	readSum     atomic.Int64           // summed read bytes, for bench mean
@@ -130,8 +132,14 @@ func New() *Metrics {
 			Name: "lith_fill_partial_total", Help: "Sub-chunk (sparse) fills — fewer than all extents of a 1 MiB chunk (#118).",
 		}),
 		fillBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection), demand (read of an unfilled extent), whole (streaming/prefetch) (#118).",
+			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection), demand (read of an unfilled extent), whole (streaming/prefetch), gap (fetched only to close a sub-coalesce-gap hole) (#118/#124).",
 		}, []string{"kind"}),
+		fillRuns: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_fill_runs_total", Help: "Coalesced fill-batch range GETs (#124).",
+		}),
+		fillGap: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_fill_gap_bytes_total", Help: "Bytes fetched only to close sub-coalesce-gap holes between plan ranges (#124).",
+		}),
 		readSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "lith_read_size_bytes",
 			Help:    "FUSE read request sizes in bytes (#65).",
@@ -143,7 +151,7 @@ func New() *Metrics {
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
-		m.fillPartial, m.fillBytes)
+		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -358,6 +366,20 @@ func (m *Metrics) FillPartial() {
 func (m *Metrics) FillBytes(kind string, n int64) {
 	if m != nil && n > 0 {
 		m.fillBytes.WithLabelValues(kind).Add(float64(n))
+	}
+}
+
+// FillRun records one coalesced fill-batch range GET (#124). Nil-safe.
+func (m *Metrics) FillRun() {
+	if m != nil {
+		m.fillRuns.Inc()
+	}
+}
+
+// FillGapBytes records bytes fetched only to close a coalesce gap (#124). Nil-safe.
+func (m *Metrics) FillGapBytes(n int64) {
+	if m != nil && n > 0 {
+		m.fillGap.Add(float64(n))
 	}
 }
 

@@ -124,10 +124,11 @@ func scrapeMetric(m *metrics.Metrics, substr string) string {
 	return strings.Join(out, "\n")
 }
 
-// TestFooterParquetProjectionNoSpeculation: reading a column parses the footer,
-// learns the projection, and prefetches the current row group's projection
-// columns — but NEVER a row group the app has not touched (predicate-safe).
-func TestFooterParquetProjectionNoSpeculation(t *testing.T) {
+// TestFooterParquetPlanForwardOnly (#124.1): reading columns A,C from row group 0
+// plans A,C for row groups 1–3 and NOTHING in row group 0 (the current row group
+// is served by demand-precise fills). lith_fill_bytes_total{kind=plan} covers no
+// row-group-0 byte.
+func TestFooterParquetPlanForwardOnly(t *testing.T) {
 	srv := fake.New()
 	obj := buildParquetObject(4, 2)
 	srv.Put("t.parquet", obj, time.Unix(1_700_000_000, 0))
@@ -142,32 +143,25 @@ func TestFooterParquetProjectionNoSpeculation(t *testing.T) {
 		buf := make([]byte, 4096)
 		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
 	}
-	// Read row group 0's two columns.
-	readAt(parquetColStart(0, 0))
-	readAt(parquetColStart(0, 1))
+	readAt(parquetColStart(0, 0)) // RG0 col0
+	readAt(parquetColStart(0, 1)) // RG0 col1
 	waitStableGets(srv)
 	if h.footerMeta == nil || len(h.footerMeta.RowGroups) != 4 {
 		t.Fatalf("footer not parsed into 4 row groups: %+v", h.footerMeta)
 	}
-	// The plan must not have dispatched anything at/after row group 1's offset.
+	// The plan dispatched nothing inside row group 0 (its whole byte span is served
+	// by demand); every dispatched range is at/after row group 1.
 	rg1 := parquetColStart(1, 0)
+	planned := 0
 	for start := range h.footerProj.dispatched {
-		if start >= rg1 {
-			t.Fatalf("plan speculated into an untouched row group: dispatched start %d >= rg1 %d", start, rg1)
+		planned++
+		if start < rg1 {
+			t.Fatalf("plan dispatched a range in row group 0 (start %d < rg1 %d)", start, rg1)
 		}
 	}
-	if got := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`); got == "" {
-		t.Fatal("no parquet plan ranges recorded")
-	}
-
-	// Now touch row group 1; its projection is planned, still nothing for RG2/RG3.
-	readAt(parquetColStart(1, 0))
-	waitStableGets(srv)
-	rg2 := parquetColStart(2, 0)
-	for start := range h.footerProj.dispatched {
-		if start >= rg2 {
-			t.Fatalf("plan reached row group 2+ (start %d) after touching only RG0,RG1", start)
-		}
+	// A,C planned for row groups 1,2,3 → 6 ranges (deduped by Start).
+	if planned != 6 {
+		t.Fatalf("planned %d ranges, want 6 (A,C for RG1,2,3)", planned)
 	}
 }
 

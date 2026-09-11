@@ -137,3 +137,81 @@ func TestConcurrentExtentFillsRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestFillBatchCoalescesAcrossChunks (#124): 6 ranges spanning 3 cache chunks
+// with 100 KiB gaps (< the 256 KiB coalesce gap) merge into one range GET;
+// the gap bytes are counted.
+func TestFillBatchCoalescesAcrossChunks(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 4)
+	k := keyFor(t, srv, "obj")
+	size := int64(4) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
+	const kb = 1024
+	ranges := []Range{
+		{0, 300 * kb}, {400 * kb, 700 * kb}, {800 * kb, 1100 * kb},
+		{1200 * kb, 1500 * kb}, {1600 * kb, 1900 * kb}, {2000 * kb, 2300 * kb},
+	}
+	bs.FillBatch(context.Background(), k, ranges, size)
+	if srv.GetCalls != 1 {
+		t.Fatalf("GetCalls=%d, want 1 (6 ranges / 3 chunks / 100 KiB gaps coalesced)", srv.GetCalls)
+	}
+	// The whole coalesced run [0, 2300 KiB) is fetched (extent-aligned).
+	if srv.GetBytes < 2300*kb {
+		t.Fatalf("fetched %d bytes, want >= the coalesced run", srv.GetBytes)
+	}
+}
+
+// TestFillBatchGapBreaksRun (#124): two ranges 1 MiB apart (> coalesce gap) are
+// two separate GETs.
+func TestFillBatchGapBreaksRun(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 4)
+	k := keyFor(t, srv, "obj")
+	size := int64(4) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
+	bs.FillBatch(context.Background(), k, []Range{{0, 200 << 10}, {1400 << 10, 1600 << 10}}, size)
+	if srv.GetCalls != 2 {
+		t.Fatalf("GetCalls=%d, want 2 (runs 1 MiB apart)", srv.GetCalls)
+	}
+}
+
+// TestFillBatchJoinsInflight (#124): a batch whose extents are already in flight
+// joins the in-flight fill rather than re-fetching.
+func TestFillBatchJoinsInflight(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 4)
+	k := keyFor(t, srv, "obj")
+	size := int64(4) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
+	srv.GetDelay = 60 * time.Millisecond
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size) }()
+	time.Sleep(20 * time.Millisecond)                                    // let the first batch's GET get in flight
+	bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size) // same extents
+	wg.Wait()
+	if srv.GetCalls != 1 {
+		t.Fatalf("GetCalls=%d, want 1 (second batch joined the in-flight fill)", srv.GetCalls)
+	}
+}
+
+// TestFillBatchRace exercises concurrent batches over one object under -race.
+func TestFillBatchRace(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	k := keyFor(t, srv, "obj")
+	size := int64(8) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := int64(i) * (300 << 10)
+			bs.FillBatch(context.Background(), k, []Range{{off, off + 200<<10}}, size)
+			_, _ = bs.GetRange(context.Background(), k, off, 100, size)
+		}(i)
+	}
+	wg.Wait()
+}

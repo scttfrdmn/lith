@@ -83,7 +83,11 @@ type Config struct {
 	// + fetched-unread), so aggregate readahead cannot thrash the memory tier
 	// (#55). <=0 defaults to 50% of MemCache.
 	PrefetchBudget int64
-	Recorder       Recorder
+	// CoalesceGap is the largest gap (bytes) between two plan/demand fill ranges
+	// that FillBatch merges into one range GET (#124), trading a little over-fetch
+	// for far fewer GETs. <=0 defaults to 256 KiB.
+	CoalesceGap int64
+	Recorder    Recorder
 }
 
 // chunkState is an in-flight (or just-completed) chunk fetch. With sparse fills
@@ -116,6 +120,7 @@ type BlockStore struct {
 	// pfBudgetBytes bounds aggregate un-demanded prefetch; the FUSE layer turns
 	// it into a per-handle window = pfBudgetBytes/handles (#55). 0 disables.
 	pfBudgetBytes int64
+	coalesceGap   int64 // FillBatch merges ranges gapped less than this (#124)
 
 	rec Recorder
 	// timeline is the optional per-chunk diagnostic sink (#70); nil unless the
@@ -185,6 +190,10 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	if pfBudgetCap <= 0 {
 		pfBudgetCap = cfg.MemCache / 2
 	}
+	coalesceGap := cfg.CoalesceGap
+	if coalesceGap <= 0 {
+		coalesceGap = 256 << 10
+	}
 	bs := &BlockStore{
 		src:           src,
 		bucket:        cfg.Bucket,
@@ -196,6 +205,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		prefetch:      make(chan struct{}, max(1, prefetchConc)),
 		budget:        newBytesBudget(cfg.InflightBytes),
 		pfBudgetBytes: pfBudgetCap,
+		coalesceGap:   coalesceGap,
 		rec:           cfg.Recorder,
 		inflight:      make(map[string]*chunkState),
 		stale:         make(map[string]struct{}),
@@ -847,19 +857,41 @@ func (bs *BlockStore) recordPrefetchEvicted() {
 }
 
 // fillRecorder is an optional Recorder extension for the sparse-fill metrics
-// (#118): a partial fill (fewer than all extents of a chunk) and the bytes
-// fetched by each fill kind.
+// (#118/#124): partial fills, bytes by fill kind, coalesced-run count, and bytes
+// fetched only to close gaps.
 type fillRecorder interface {
 	FillPartial()
 	FillBytes(kind string, n int64)
+	FillRun()
+	FillGapBytes(n int64)
 }
 
 func (bs *BlockStore) recordFill(kind fillKind, n int64) {
-	if bs.fill == nil {
+	if bs.fill == nil || kind == fillSilent {
 		return
 	}
 	if kind != fillWhole {
 		bs.fill.FillPartial()
 	}
 	bs.fill.FillBytes(kind.label(), n)
+}
+
+// recordBatch records a coalesced fill batch (#124): plan bytes (the requested
+// projection), gap bytes (fetched only to close sub-coalesceGap gaps), and one
+// FillRun per merged range GET.
+func (bs *BlockStore) recordBatch(planBytes, gapBytes, runs int64) {
+	if bs.fill == nil {
+		return
+	}
+	if planBytes > 0 {
+		bs.fill.FillPartial()
+		bs.fill.FillBytes("plan", planBytes)
+	}
+	if gapBytes > 0 {
+		bs.fill.FillBytes("gap", gapBytes)
+		bs.fill.FillGapBytes(gapBytes)
+	}
+	for i := int64(0); i < runs; i++ {
+		bs.fill.FillRun()
+	}
 }
