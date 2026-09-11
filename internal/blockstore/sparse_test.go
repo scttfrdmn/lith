@@ -101,12 +101,15 @@ func TestExtentJoinsWholeChunkOneGet(t *testing.T) {
 	k := keyFor(t, srv, "obj")
 	size := int64(40) * mib
 	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20})
-	srv.GetDelay = 40 * time.Millisecond // widen the in-flight window so the join is deterministic
+	srv.GetDelay = 80 * time.Millisecond // widen the in-flight window so the join is deterministic
 
+	// Start the whole-chunk fill first so it owns the chunk; while its (slow) GET
+	// is in flight, an extent fill of the same chunk joins it — one GET total.
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = bs.Chunk(context.Background(), k, 7, size, 0, 4096, true) }()      // whole chunk
-	go func() { defer wg.Done(); bs.FillRange(context.Background(), k, 7*mib+2<<10, 7*mib+3<<10, size) }() // extent
+	wg.Add(1)
+	go func() { defer wg.Done(); _, _ = bs.Chunk(context.Background(), k, 7, size, 0, 4096, true) }()
+	time.Sleep(20 * time.Millisecond) // let the whole-chunk fill claim + enter its GET
+	bs.FillRange(context.Background(), k, 7*mib+2<<10, 7*mib+3<<10, size)
 	wg.Wait()
 
 	if srv.GetCalls != 1 {
