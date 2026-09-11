@@ -270,13 +270,24 @@ func TestFooterZipDirectoryReadahead(t *testing.T) {
 	if len(h.footerZip) != 4 {
 		t.Fatalf("zip central dir not parsed into 4 entries: %d", len(h.footerZip))
 	}
-	// Directory-order readahead prefetches entry 1 asynchronously (footerPrefetch →
-	// go FillBatch). Wait until it has actually landed before reading entry 1, so a
-	// loaded runner can't race the read ahead of the prefetch goroutine (the async
-	// dispatch can start after waitStableGets' quiet window). If readahead were
-	// broken, entry 1 never becomes covered → this times out and the read below
-	// still records a GET, so the assertion is not weakened.
-	for i := 0; i < 400 && !raw.store.Covered(h.key, offsets[1]+40, 4096, h.size); i++ {
+	// The first read's directory-order readahead prefetches the following entries
+	// (1,2,3) asynchronously (footerPrefetch → go FillBatch). Wait until ALL of them
+	// have landed before snapshotting the GET count: reading entry 1 re-fires the
+	// readahead for entries 2,3, and the post-read waitStableGets waits on it — so a
+	// straggler GET from the first read's prefetch (still in flight on a loaded
+	// runner) would otherwise land after the snapshot and fail the assertion. With
+	// every following entry already covered, both the entry-1 read and its re-fired
+	// readahead are pure cache hits. If readahead were broken, an entry never becomes
+	// covered → this times out and the read below still records GETs (not weakened).
+	covered := func() bool {
+		for j := 1; j < len(offsets); j++ {
+			if !raw.store.Covered(h.key, offsets[j]+40, 4096, h.size) {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < 500 && !covered(); i++ {
 		time.Sleep(2 * time.Millisecond)
 	}
 	before := srv.GetCallCount()
