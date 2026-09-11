@@ -31,7 +31,7 @@ single(){ # label binpath port
       local w0; w0=$(now); "$PY" "$Q" local "$MP/${FILES[0]}" >/dev/null 2>&1; local w1; w1=$(now); warm=$(el "$w0" "$w1"); fi
     um
   done
-  echo "R29S|$label|cold=${c[0]},${c[1]},${c[2]}|warm=$warm|s3_MB=$(mb "$(mval "$m" lith_s3_bytes_total)")|gets=$(mgets "$m")|distinct_MB=$(mb "$(mval "$m" lith_distinct_bytes_read)")|runs=$(mval "$m" lith_fill_runs_total)|plan_MB=$(mb "$(mfill "$m" plan)")|gap_MB=$(mb "$(mfill "$m" gap)")|demand_MB=$(mb "$(mfill "$m" demand)")|whole_MB=$(mb "$(mfill "$m" whole)")"
+  echo "R29S|$label|cold=${c[0]},${c[1]},${c[2]}|warm=$warm|s3_MB=$(mb "$(mval "$m" lith_s3_bytes_total)")|gets=$(mgets "$m")|distinct_MB=$(mb "$(mval "$m" lith_distinct_bytes_read)")|runs=$(mval "$m" lith_fill_runs_total)|infl_peak=$(mval "$m" lith_fill_inflight_peak)|plan_MB=$(mb "$(mfill "$m" plan)")|gap_MB=$(mb "$(mfill "$m" gap)")|demand_MB=$(mb "$(mfill "$m" demand)")|whole_MB=$(mb "$(mfill "$m" whole)")"
 }
 single_py(){ local c=() rxmb
   for r in 1 2 3; do sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
@@ -62,5 +62,6 @@ single_py
 conc "base"        "$BB" 9803
 conc "post(#124)"  "$BP" 9804
 conc_py
+echo "GAP|$(grep 'coalesce gap' /tmp/lith-$(id -u)-mount.log 2>/dev/null | tail -1)"
 echo "===== r29 DONE $(date -u) ====="
-grep -E '^R29' "$LOG"
+grep -E '^R29|^GAP' "$LOG"

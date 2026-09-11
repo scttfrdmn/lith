@@ -324,9 +324,15 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 	}
 
 	// Concurrency-aware gap (#31): a round-trip costs TTFB/C, so divide by the
-	// usable concurrency C = min(prefetch pool, runs the batch splits into at the
-	// serial gap). Coalesce first at the serial (C=1) gap only to count runs, then
-	// at the /C gap.
+	// usable concurrency C = min(prefetch pool, runs available to dispatch in
+	// parallel). Estimate the available parallelism from the most byte-precise
+	// (floor-gap) coalescing — the number of runs the batch *could* split into if
+	// each round-trip were cheap. Using the floor here (not the serial C=1 gap) is
+	// deliberate: a batch that fans out into many byte-precise runs has that much
+	// concurrency available, so C is high and the derived gap stays small (precise);
+	// a batch that is intrinsically few runs has little parallelism, so C is low and
+	// the gap widens toward streaming. (The C=1 gap collapses everything into a
+	// couple of runs and would wrongly starve C — the session-30 residual.)
 	coalesce := func(gap int64) []span {
 		runs := []span{aligned[0]}
 		for _, a := range aligned[1:] {
@@ -341,10 +347,10 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 		}
 		return runs
 	}
-	nSerial := len(coalesce(bs.gapForC(1)))
+	nAvail := len(coalesce(gapFloor))
 	c := bs.prefetchConc
-	if nSerial < c {
-		c = nSerial
+	if nAvail < c {
+		c = nAvail
 	}
 	if c < 1 {
 		c = 1
