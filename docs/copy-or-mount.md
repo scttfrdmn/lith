@@ -59,6 +59,18 @@ read one chunked store repeatedly and can afford the RAM, mount and let the warm
 cache serve reruns (**~22 s** warm); if you read it once, cold, an async
 in-place reader is currently a touch faster. <!-- number: apps.csv @748b33d (v0.2.0), sessions 19/21 -->
 
+**Columnar files (Parquet).** For a projection query in-region, lith streams the
+file and beats a byte-precise native reader (pyarrow) **~4× single-process**; on
+small NICs it ties. This is counterintuitive — the native reader moves fewer
+bytes (only the projected columns) — but on a fat in-region pipe a whole-file
+stream is a handful of coalesced GETs at line rate, while byte-precise fetch pays
+a round-trip per column chunk through a filesystem that sees the reads one at a
+time. lith ships tier 1 (footer + head prefetch on open) on by default and
+streams the rest; a byte-precise projection path exists behind
+`--footer-tier2` but is **experimental and off** (slower on every box measured;
+[#108](https://github.com/scttfrdmn/lith/issues/108),
+[#122](https://github.com/scttfrdmn/lith/issues/122)). <!-- number: apps.csv in-region 4xl, sessions 29-32 -->
+
 ## The crossover, measured
 
 Cost to result, **copy → compute** vs **mount with lith**, across the EBS-only
@@ -127,6 +139,9 @@ widens with:**
   lith; the copy path re-stages every fresh volume.
 - **Fan-out.** N nodes each stage their shard; lith mounts the same index N times
   and moves no bulk data (see [Meet a deadline](deadline.md)).
+- **Round-trips, not bytes.** In-region, round-trips cost time; bytes don't. A
+  reader that saves bytes by fetching a precise slice can still lose to a
+  whole-file stream if it pays more round-trips to do it (see Parquet, above).
 
 ## The rule
 
