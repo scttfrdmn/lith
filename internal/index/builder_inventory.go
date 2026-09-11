@@ -171,6 +171,7 @@ func BuildFromInventory(ctx context.Context, opts InventoryOptions) (*Index, err
 
 	bopts := opts.Options
 	bopts.Prefix = root
+	bopts.Source = "inventory"
 	return Build(all, bopts), nil
 }
 

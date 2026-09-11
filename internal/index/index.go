@@ -7,6 +7,7 @@
 package index
 
 import (
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"sort"
@@ -68,6 +69,11 @@ type Index struct {
 
 	execMode bool // when true, files are 0555 instead of 0444
 
+	// Provenance (format v4): how the index was built and, for a key-list or
+	// manifest build, the sha256 of the raw key file/manifest bytes.
+	source  string   // "list", "keys", "manifest", "inventory"
+	keysSHA [32]byte // all-zero when the source carries no key file
+
 	totalOnce sync.Once
 	totalSize int64
 
@@ -82,6 +88,19 @@ func (ix *Index) Bucket() string { return ix.bucket }
 
 // Prefix returns the mount root within the bucket (may be "").
 func (ix *Index) Prefix() string { return ix.prefix }
+
+// Source reports how the index was built ("list", "keys", "manifest",
+// "inventory"). It defaults to "list" for indexes built before v4.
+func (ix *Index) Source() string { return ix.source }
+
+// KeysSHAHex returns the hex sha256 of the key file/manifest the index was
+// built from, or "" when the source carries no key file.
+func (ix *Index) KeysSHAHex() string {
+	if ix.keysSHA == ([32]byte{}) {
+		return ""
+	}
+	return hex.EncodeToString(ix.keysSHA[:])
+}
 
 // Len returns the number of stored keys (files plus folder markers).
 func (ix *Index) Len() int { return len(ix.offs) - 1 }

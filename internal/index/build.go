@@ -33,6 +33,12 @@ type Options struct {
 	BuildTime time.Time
 	// Logger receives build progress and warnings; nil disables logging.
 	Logger *slog.Logger
+	// Source records how the index was built ("list", "keys", "manifest",
+	// "inventory"); Build stores "list" when empty. Format v4 provenance.
+	Source string
+	// KeysSHA is the sha256 of the raw key file/manifest for a key-list or
+	// manifest build; zero for other sources. Format v4 provenance.
+	KeysSHA [32]byte
 }
 
 // hashKey is the 64-bit hash used to derive inodes from keys and directory
@@ -80,11 +86,17 @@ func Build(entries []Entry, opts Options) *Index {
 	if bt.IsZero() {
 		bt = time.Now()
 	}
+	source := opts.Source
+	if source == "" {
+		source = "list"
+	}
 	ix := &Index{
 		bucket:    opts.Bucket,
 		prefix:    normalizePrefix(opts.Prefix),
 		execMode:  opts.Exec,
 		buildTime: bt.UnixNano(),
+		source:    source,
+		keysSHA:   opts.KeysSHA,
 	}
 
 	// 1. Sanitize.

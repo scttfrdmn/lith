@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +112,53 @@ func TestIndexBuildAndInspect(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("inspect output missing %q in:\n%s", want, s)
 		}
+	}
+}
+
+// TestIndexBuildFromKeys drives `index build --keys FILE` against a LIST-denied
+// fake, then `index inspect` to confirm the provenance (source + keys sha256)
+// is recorded — all network-free via the client seam.
+func TestIndexBuildFromKeys(t *testing.T) {
+	srv := fake.New()
+	srv.DenyList = true // GET/HEAD public, LIST denied
+	now := time.Unix(1_700_000_000, 0)
+	srv.PutString("data/a", "AAA", now)
+	srv.PutString("data/b/c", "CC", now)
+
+	orig := newS3Client
+	newS3Client = func(context.Context, s3client.Config) (s3client.API, error) { return srv, nil }
+	defer func() { newS3Client = orig }()
+
+	dir := t.TempDir()
+	keyFile := dir + "/keys.txt"
+	if err := os.WriteFile(keyFile, []byte("# keys\na\nb/c\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idxPath := dir + "/t.lithidx"
+
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"index", "build", "s3://bkt/data", "--index-file", idxPath, "--keys", keyFile, "--no-sign-request"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("build --keys: %v", err)
+	}
+	if !strings.Contains(out.String(), "2 keys") || !strings.Contains(out.String(), "headed 2, missing 0") {
+		t.Errorf("build output = %q", out.String())
+	}
+
+	root = newRootCmd()
+	out.Reset()
+	root.SetOut(&out)
+	root.SetArgs([]string{"index", "inspect", idxPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "source:            keys") {
+		t.Errorf("inspect missing source line:\n%s", s)
+	}
+	if !strings.Contains(s, "keys-sha256:       ") {
+		t.Errorf("inspect missing keys-sha256 line:\n%s", s)
 	}
 }

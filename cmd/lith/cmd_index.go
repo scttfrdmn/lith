@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,16 +26,20 @@ var newS3Client = func(ctx context.Context, cfg s3client.Config) (s3client.API, 
 
 // indexFlags holds the flags shared by build and refresh.
 type indexFlags struct {
-	indexFile     string
-	noSignRequest bool
-	requesterPays bool
-	endpoint      string
-	pathStyle     bool
-	region        string
-	shards        []string
-	exec          bool
-	pageSize      int32
-	inventory     string // s3://dest-bucket/path/manifest.json, or a local manifest path
+	indexFile        string
+	noSignRequest    bool
+	requesterPays    bool
+	endpoint         string
+	pathStyle        bool
+	region           string
+	shards           []string
+	exec             bool
+	pageSize         int32
+	inventory        string // s3://dest-bucket/path/manifest.json, or a local manifest path
+	keys             string // --keys: local path to an explicit key list
+	keysFromManifest string // --keys-from-manifest: s3:// URL or local path (gz ok)
+	keysAllowMissing bool   // --keys-allow-missing: skip 403/404 keys instead of failing
+	s3Concurrency    int    // --s3-concurrency: HeadObject fan-out for the keys path
 }
 
 func (f *indexFlags) bind(cmd *cobra.Command) {
@@ -48,6 +54,10 @@ func (f *indexFlags) bind(cmd *cobra.Command) {
 	fl.BoolVar(&f.exec, "exec", false, "report files as mode 0555 instead of 0444")
 	fl.Int32Var(&f.pageSize, "page-size", 1000, "ListObjectsV2 page size")
 	fl.StringVar(&f.inventory, "inventory", "", "build from an S3 Inventory manifest.json instead of listing")
+	fl.StringVar(&f.keys, "keys", "", "build from an explicit key list file (for LIST-denied buckets)")
+	fl.StringVar(&f.keysFromManifest, "keys-from-manifest", "", "build from a key manifest (s3:// URL or local path, gz ok)")
+	fl.BoolVar(&f.keysAllowMissing, "keys-allow-missing", false, "skip keys that HEAD reports as 403/404 instead of failing")
+	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "HeadObject concurrency for the --keys build path")
 	_ = cmd.MarkFlagRequired("index-file")
 }
 
@@ -94,13 +104,25 @@ func newIndexBuildCmd(use, short string) *cobra.Command {
 func runIndexBuild(ctx context.Context, out io.Writer, f *indexFlags, bucket, prefix string) error {
 	log := newLogger()
 
+	usingKeys := f.keys != "" || f.keysFromManifest != ""
+	if f.inventory != "" && usingKeys {
+		return fmt.Errorf("--inventory and --keys/--keys-from-manifest are mutually exclusive")
+	}
+	if f.keys != "" && f.keysFromManifest != "" {
+		return fmt.Errorf("--keys and --keys-from-manifest are mutually exclusive")
+	}
+
 	var (
 		ix  *index.Index
+		res index.KeysResult
 		err error
 	)
-	if f.inventory != "" {
+	switch {
+	case f.inventory != "":
 		ix, err = buildFromInventory(ctx, f, bucket, prefix, log)
-	} else {
+	case usingKeys:
+		ix, res, err = buildFromKeys(ctx, f, bucket, prefix, log)
+	default:
 		client, cerr := newS3Client(ctx, f.s3config(bucket))
 		if cerr != nil {
 			return cerr
@@ -119,9 +141,81 @@ func runIndexBuild(ctx context.Context, out io.Writer, f *indexFlags, bucket, pr
 		return fmt.Errorf("write index: %w", err)
 	}
 	dropped, shadowed, collisions := ix.Stats()
-	_, err = fmt.Fprintf(out, "wrote %s: %d keys (dropped %d, shadowed %d, inode collisions %d)\n",
-		f.indexFile, ix.Len(), dropped, shadowed, collisions)
+	if _, err := fmt.Fprintf(out, "wrote %s: %d keys (dropped %d, shadowed %d, inode collisions %d)\n",
+		f.indexFile, ix.Len(), dropped, shadowed, collisions); err != nil {
+		return err
+	}
+	if usingKeys {
+		_, err = fmt.Fprintf(out, "keys source: headed %d, missing %d\n", res.Headed, res.Missing)
+	}
 	return err
+}
+
+// buildFromKeys wires an explicit key-list source. The list is either --keys (a
+// local path) or --keys-from-manifest (an s3:// URL or a local path, optionally
+// gzipped). It reads the raw bytes, records their sha256 as provenance, then
+// transparently gunzips, parses, and HeadObject-s the keys against the target
+// bucket.
+func buildFromKeys(ctx context.Context, f *indexFlags, bucket, prefix string, log *slog.Logger) (*index.Index, index.KeysResult, error) {
+	src := f.keys
+	source := "keys"
+	if src == "" {
+		src = f.keysFromManifest
+		source = "manifest"
+	}
+
+	var raw io.ReadCloser
+	if destBucket, key, perr := parseS3URL(src); perr == nil {
+		client, cerr := newS3Client(ctx, f.s3config(destBucket))
+		if cerr != nil {
+			return nil, index.KeysResult{}, cerr
+		}
+		rc, gerr := client.GetObject(ctx, key, 0, 0)
+		if gerr != nil {
+			return nil, index.KeysResult{}, fmt.Errorf("fetch key list: %w", gerr)
+		}
+		raw = rc
+	} else {
+		file, oerr := os.Open(src)
+		if oerr != nil {
+			return nil, index.KeysResult{}, oerr
+		}
+		raw = file
+	}
+	defer func() { _ = raw.Close() }()
+
+	// Read the raw (possibly-gzipped) bytes so the sha256 provenance covers
+	// exactly what the operator supplied. Bounded to stay memory-safe.
+	const maxRawBytes = 8 << 30
+	data, rerr := io.ReadAll(io.LimitReader(raw, maxRawBytes+1))
+	if rerr != nil {
+		return nil, index.KeysResult{}, fmt.Errorf("read key list: %w", rerr)
+	}
+	if int64(len(data)) > maxRawBytes {
+		return nil, index.KeysResult{}, fmt.Errorf("key list exceeds the size limit (%d bytes)", int64(maxRawBytes))
+	}
+	sum := sha256.Sum256(data)
+
+	dec, derr := index.MaybeGunzip(bytes.NewReader(data))
+	if derr != nil {
+		return nil, index.KeysResult{}, fmt.Errorf("gunzip key list: %w", derr)
+	}
+	keys, perr := index.ParseKeyList(dec)
+	if perr != nil {
+		return nil, index.KeysResult{}, perr
+	}
+
+	client, cerr := newS3Client(ctx, f.s3config(bucket))
+	if cerr != nil {
+		return nil, index.KeysResult{}, cerr
+	}
+	return index.BuildFromKeys(ctx, client, index.KeysOptions{
+		Options:      index.Options{Bucket: bucket, Prefix: prefix, Exec: f.exec, Logger: log, Source: source},
+		Keys:         keys,
+		Concurrency:  f.s3Concurrency,
+		AllowMissing: f.keysAllowMissing,
+		KeysSHA:      sum,
+	})
 }
 
 // buildFromInventory wires an S3 Inventory manifest source. The manifest may be
@@ -207,6 +301,10 @@ func newIndexInspectCmd() *cobra.Command {
 			fmt.Fprintf(&b, "root:              %s\n", root)
 			fmt.Fprintf(&b, "keys:              %d\n", n)
 			fmt.Fprintf(&b, "bytes-per-key:     %.1f\n", bytesPerKey)
+			fmt.Fprintf(&b, "source:            %s\n", ix.Source())
+			if sha := ix.KeysSHAHex(); sha != "" {
+				fmt.Fprintf(&b, "keys-sha256:       %s\n", sha)
+			}
 			fmt.Fprintf(&b, "dropped-keys:      %d\n", dropped)
 			fmt.Fprintf(&b, "shadowed-keys:     %d\n", shadowed)
 			fmt.Fprintf(&b, "inode-collisions:  %d\n", collisions)

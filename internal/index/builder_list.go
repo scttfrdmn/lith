@@ -123,6 +123,7 @@ func BuildFromList(ctx context.Context, api s3client.API, opts ListOptions) (*In
 
 	bopts := opts.Options
 	bopts.Prefix = root
+	bopts.Source = "list"
 	return Build(all, bopts), nil
 }
 
