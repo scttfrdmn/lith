@@ -270,6 +270,15 @@ func TestFooterZipDirectoryReadahead(t *testing.T) {
 	if len(h.footerZip) != 4 {
 		t.Fatalf("zip central dir not parsed into 4 entries: %d", len(h.footerZip))
 	}
+	// Directory-order readahead prefetches entry 1 asynchronously (footerPrefetch →
+	// go FillBatch). Wait until it has actually landed before reading entry 1, so a
+	// loaded runner can't race the read ahead of the prefetch goroutine (the async
+	// dispatch can start after waitStableGets' quiet window). If readahead were
+	// broken, entry 1 never becomes covered → this times out and the read below
+	// still records a GET, so the assertion is not weakened.
+	for i := 0; i < 400 && !raw.store.Covered(h.key, offsets[1]+40, 4096, h.size); i++ {
+		time.Sleep(2 * time.Millisecond)
+	}
 	before := srv.GetCallCount()
 	readAt(offsets[1] + 40) // entry 1 was prefetched by directory-order readahead
 	waitStableGets(srv)
