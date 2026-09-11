@@ -83,11 +83,20 @@ type Config struct {
 	// + fetched-unread), so aggregate readahead cannot thrash the memory tier
 	// (#55). <=0 defaults to 50% of MemCache.
 	PrefetchBudget int64
-	// CoalesceGap is the largest gap (bytes) between two plan/demand fill ranges
-	// that FillBatch merges into one range GET (#124), trading a little over-fetch
-	// for far fewer GETs. <=0 defaults to 256 KiB.
+	// CoalesceGap, when > 0, is an explicit override of the largest gap (bytes)
+	// between two plan/demand fill ranges that FillBatch merges into one range GET
+	// (#124). When 0, the gap is derived from the device: NICBytesPerSec × TTFB,
+	// clamped to [256 KiB, 64 MiB] (#124/session 30) — a round-trip's worth of
+	// streaming, so on a fat pipe lith merges freely and on a small one it stays
+	// byte-precise.
 	CoalesceGap int64
-	Recorder    Recorder
+	// NICBytesPerSec is the NIC baseline bandwidth used to derive the coalesce gap
+	// (0 disables derivation → the 256 KiB floor).
+	NICBytesPerSec int64
+	// TTFB seeds the rolling first-byte-latency median used to derive the gap
+	// before any fill has been measured (e.g. from the index-build HEADs).
+	TTFB     time.Duration
+	Recorder Recorder
 }
 
 // chunkState is an in-flight (or just-completed) chunk fetch. With sparse fills
@@ -120,7 +129,20 @@ type BlockStore struct {
 	// pfBudgetBytes bounds aggregate un-demanded prefetch; the FUSE layer turns
 	// it into a per-handle window = pfBudgetBytes/handles (#55). 0 disables.
 	pfBudgetBytes int64
-	coalesceGap   int64 // FillBatch merges ranges gapped less than this (#124)
+	// Coalesce-gap derivation (#124/session 30). gapOverride > 0 pins the gap;
+	// otherwise it is nicBPS × the rolling TTFB median, clamped. ttfb is guarded
+	// by ttfbMu: the first ttfbMax fill first-byte latencies (seeded by ttfbSeed).
+	gapOverride int64
+	nicBPS      int64
+	ttfbMu      sync.Mutex
+	ttfbSeed    time.Duration
+	ttfbSamples []time.Duration
+
+	// Demand batching (#124/session 30): concurrent footer demand misses on one
+	// object are collected for one scheduling tick and dispatched as a single
+	// coalesced FillBatch, so a front-loaded read burst becomes a few range GETs.
+	dmu    sync.Mutex
+	demand map[string]*demandGather
 
 	rec Recorder
 	// timeline is the optional per-chunk diagnostic sink (#70); nil unless the
@@ -190,10 +212,6 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	if pfBudgetCap <= 0 {
 		pfBudgetCap = cfg.MemCache / 2
 	}
-	coalesceGap := cfg.CoalesceGap
-	if coalesceGap <= 0 {
-		coalesceGap = 256 << 10
-	}
 	bs := &BlockStore{
 		src:           src,
 		bucket:        cfg.Bucket,
@@ -205,10 +223,13 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		prefetch:      make(chan struct{}, max(1, prefetchConc)),
 		budget:        newBytesBudget(cfg.InflightBytes),
 		pfBudgetBytes: pfBudgetCap,
-		coalesceGap:   coalesceGap,
+		gapOverride:   cfg.CoalesceGap,
+		nicBPS:        cfg.NICBytesPerSec,
+		ttfbSeed:      cfg.TTFB,
 		rec:           cfg.Recorder,
 		inflight:      make(map[string]*chunkState),
 		stale:         make(map[string]struct{}),
+		demand:        make(map[string]*demandGather),
 	}
 	if r, ok := cfg.Recorder.(chunkTimelineRecorder); ok {
 		bs.timeline = r
@@ -573,12 +594,14 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 	}
 
 	bs.record(func(r Recorder) { r.StartInflight() })
+	t0 := time.Now()
 	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)
 	bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
 	if err != nil {
 		bs.failRun(k, first, owned, err)
 		return err
 	}
+	bs.recordTTFB(time.Since(t0))
 	defer func() { _ = body.Close() }()
 
 	if xxh3.HashString(etag) != k.ETagHash {
@@ -864,6 +887,7 @@ type fillRecorder interface {
 	FillBytes(kind string, n int64)
 	FillRun()
 	FillGapBytes(n int64)
+	FillBatchSize(n int)
 }
 
 func (bs *BlockStore) recordFill(kind fillKind, n int64) {
@@ -879,10 +903,11 @@ func (bs *BlockStore) recordFill(kind fillKind, n int64) {
 // recordBatch records a coalesced fill batch (#124): plan bytes (the requested
 // projection), gap bytes (fetched only to close sub-coalesceGap gaps), and one
 // FillRun per merged range GET.
-func (bs *BlockStore) recordBatch(planBytes, gapBytes, runs int64) {
+func (bs *BlockStore) recordBatch(planBytes, gapBytes, runs int64, batchSize int) {
 	if bs.fill == nil {
 		return
 	}
+	bs.fill.FillBatchSize(batchSize)
 	if planBytes > 0 {
 		bs.fill.FillPartial()
 		bs.fill.FillBytes("plan", planBytes)

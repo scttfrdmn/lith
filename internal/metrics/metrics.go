@@ -47,6 +47,7 @@ type Metrics struct {
 	fillBytes   *prometheus.CounterVec // fill bytes by kind=plan|demand|whole|gap (#118/#124)
 	fillRuns    prometheus.Counter     // coalesced fill-batch range GETs (#124)
 	fillGap     prometheus.Counter     // bytes fetched only to close coalesce gaps (#124)
+	fillBatchSz prometheus.Histogram   // ranges per fill batch (#124/session 30)
 	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
 	readN       atomic.Int64           // read count, for bench mean
 	readSum     atomic.Int64           // summed read bytes, for bench mean
@@ -140,6 +141,11 @@ func New() *Metrics {
 		fillGap: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_fill_gap_bytes_total", Help: "Bytes fetched only to close sub-coalesce-gap holes between plan ranges (#124).",
 		}),
+		fillBatchSz: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "lith_fill_batch_size",
+			Help:    "Number of ranges coalesced per fill batch (#124/session 30).",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1 .. 2048
+		}),
 		readSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "lith_read_size_bytes",
 			Help:    "FUSE read request sizes in bytes (#65).",
@@ -151,7 +157,7 @@ func New() *Metrics {
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
-		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap)
+		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -380,6 +386,13 @@ func (m *Metrics) FillRun() {
 func (m *Metrics) FillGapBytes(n int64) {
 	if m != nil && n > 0 {
 		m.fillGap.Add(float64(n))
+	}
+}
+
+// FillBatchSize records the number of ranges in a fill batch (#124). Nil-safe.
+func (m *Metrics) FillBatchSize(n int) {
+	if m != nil && n > 0 {
+		m.fillBatchSz.Observe(float64(n))
 	}
 }
 

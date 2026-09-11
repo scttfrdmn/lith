@@ -87,7 +87,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
 	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
-	fl.StringVar(&f.coalesceGap, "coalesce-gap", "256KiB", "largest gap between two format-plan/demand fill ranges that is merged into one range GET (#124); trades a little over-fetch for far fewer GETs on a scattered projection")
+	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between two format-plan/demand fill ranges merged into one range GET (#124); 0 = derive from the NIC baseline × measured first-byte latency, clamped to [256KiB, 64MiB]")
 	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
 	fl.BoolVar(&f.footerTier2, "footer-tier2", true, "prefetch the index-resolved projection (Parquet column chunks) / entries (zip) for footer-family files (#108); false leaves only the generic tier-1 footer+head prefetch")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
@@ -235,6 +235,11 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	}
 	inflight, inflightDesc := computeInflightBytes(f.inflightBytes, nic.BaselineGbps)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
+	// Device-derived coalesce gap inputs (#124/session 30): NIC baseline in
+	// bytes/s and a first-byte-latency seed (refined by the blockstore's rolling
+	// median of measured fills). 40 ms is a typical in-region S3 first byte.
+	nicBytesPerSec := int64(nic.BaselineGbps * 1e9 / 8)
+	ttfbSeed := 40 * time.Millisecond
 	// Default the readahead window to the bandwidth-delay product so a single
 	// reader can fill the NIC on a cold read (#56).
 	f.maxReadahead = effectiveReadahead(f.maxReadahead, inflight, blockSize)
@@ -249,7 +254,9 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		S3Concurrency:       f.s3Concurrency,
 		PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget:      prefetchBudget,
-		CoalesceGap:         coalesceGap,
+		CoalesceGap:         coalesceGap, // 0 → device-derived
+		NICBytesPerSec:      nicBytesPerSec,
+		TTFB:                ttfbSeed,
 		DiskWriters:         f.diskWriters,
 		InflightBytes:       inflight,
 		Recorder:            rec, // nil-safe; timeline recorder when --timeline-csv
@@ -258,6 +265,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 	defer bs.Close()
+	if coalesceGap > 0 {
+		log.Info("coalesce gap", "bytes", bs.CoalesceGap(), "source", "--coalesce-gap")
+	} else {
+		log.Info("coalesce gap", "bytes", bs.CoalesceGap(), "source", "device-derived",
+			"nic_bytes_per_s", nicBytesPerSec, "ttfb_seed", ttfbSeed)
+	}
 	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 
 	// The single prefetch policy object (#64): per-handle readahead, sibling
@@ -266,9 +279,11 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	limits := prefetch.NewPolicy(
 		bs.PrefetchBudgetBytes(),
 		prefetch.DeviceLimits{
-			NICBDPBytes:   inflight,
-			MemCacheBytes: memCache,
-			DiskWriteBPS:  0, // populated once the disk tier reports a sustained rate
+			NICBDPBytes:    inflight,
+			MemCacheBytes:  memCache,
+			DiskWriteBPS:   0, // populated once the disk tier reports a sustained rate
+			NICBytesPerSec: nicBytesPerSec,
+			TTFB:           ttfbSeed,
 		},
 		func(key string, n int) []prefetch.Sibling {
 			sibs := root.Neighborhood(key, n)

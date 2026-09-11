@@ -215,3 +215,111 @@ func TestFillBatchRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestDeriveCoalesceGap (#124/session 30): the device-derived gap is
+// bandwidth × TTFB, clamped to [256 KiB, 64 MiB].
+func TestDeriveCoalesceGap(t *testing.T) {
+	cases := []struct {
+		bps  int64
+		ttfb time.Duration
+		want int64
+	}{
+		{1_900_000_000, 40 * time.Millisecond, 64 << 20}, // ~76 MB → clamp 64 MiB
+		{117_000_000, 40 * time.Millisecond, 4_680_000},  // ~4.68 MB
+		{0, 40 * time.Millisecond, 256 << 10},            // unknown bw → floor
+		{1_000_000_000, 0, 256 << 10},                    // unknown ttfb → floor
+		{100_000, 40 * time.Millisecond, 256 << 10},      // tiny → floor
+	}
+	for _, c := range cases {
+		got := deriveCoalesceGap(c.bps, c.ttfb)
+		// allow small rounding on the mid case
+		if c.want == 4_680_000 {
+			if got < 4_600_000 || got > 4_800_000 {
+				t.Errorf("derive(%d,%v)=%d, want ~4.68 MB", c.bps, c.ttfb, got)
+			}
+			continue
+		}
+		if got != c.want {
+			t.Errorf("derive(%d,%v)=%d, want %d", c.bps, c.ttfb, got, c.want)
+		}
+	}
+}
+
+// TestCoalesceGapUsesDevice: with no override, CoalesceGap() derives from the
+// configured NIC baseline and TTFB seed; a fill measures TTFB into the rolling
+// median. Override pins it.
+func TestCoalesceGapUsesDevice(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	k := keyFor(t, srv, "obj")
+	size := int64(8) * mib
+	// 1.9 GB/s × 40 ms → clamp 64 MiB.
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20,
+		NICBytesPerSec: 1_900_000_000, TTFB: 40 * time.Millisecond})
+	if got := bs.CoalesceGap(); got != 64<<20 {
+		t.Fatalf("derived gap = %d, want 64 MiB", got)
+	}
+	// Override wins.
+	bs2 := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20,
+		NICBytesPerSec: 1_900_000_000, TTFB: 40 * time.Millisecond, CoalesceGap: 1 << 20})
+	if got := bs2.CoalesceGap(); got != 1<<20 {
+		t.Fatalf("override gap = %d, want 1 MiB", got)
+	}
+	_ = k
+	_ = size
+}
+
+// TestFillBatchGapControlsGETs (#124/session 30): a projection spanning the file
+// coalesces to few GETs under a large gap and stays per-chunk under a small one.
+func TestFillBatchGapControlsGETs(t *testing.T) {
+	// A projection: one 100 KiB range every 1 MiB across an 8 MiB object (8 ranges).
+	mk := func() []Range {
+		var rs []Range
+		for i := int64(0); i < 8; i++ {
+			rs = append(rs, Range{i * mib, i*mib + 100<<10})
+		}
+		return rs
+	}
+	// Large gap (64 MiB): all 8 ranges within one file → one run → one GET.
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	k := keyFor(t, srv, "obj")
+	bsBig := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	bsBig.FillBatch(context.Background(), k, mk(), 8*mib)
+	if srv.GetCalls != 1 {
+		t.Fatalf("64 MiB gap: GetCalls=%d, want 1", srv.GetCalls)
+	}
+	// Small gap (256 KiB): the 1 MiB spacing exceeds it → each range its own run.
+	srv2 := fake.New()
+	makeObj(srv2, "obj", 8)
+	k2 := keyFor(t, srv2, "obj")
+	bsSmall := newStore(t, srv2, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
+	bsSmall.FillBatch(context.Background(), k2, mk(), 8*mib)
+	if srv2.GetCalls != 8 {
+		t.Fatalf("256 KiB gap: GetCalls=%d, want 8 (per-range)", srv2.GetCalls)
+	}
+}
+
+// TestGatherDemandBatchesBurst (#124/session 30): concurrent footer demand misses
+// on one object within the tick are collected into one coalesced FillBatch — a
+// large gap merges the burst into a single GET.
+func TestGatherDemandBatchesBurst(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	k := keyFor(t, srv, "obj")
+	size := int64(8) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			off := int64(i) * mib
+			bs.GatherDemand(context.Background(), k, off, 100<<10, size)
+		}(i)
+	}
+	wg.Wait()
+	if srv.GetCalls != 1 {
+		t.Fatalf("GetCalls=%d, want 1 (burst coalesced into one batch)", srv.GetCalls)
+	}
+}

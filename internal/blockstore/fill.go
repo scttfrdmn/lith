@@ -6,9 +6,70 @@ import (
 	"context"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/zeebo/xxh3"
 )
+
+// Coalesce-gap derivation (#124/session 30): a round-trip's worth of streaming
+// (NIC bandwidth × first-byte latency), clamped. On a fat pipe this is tens of
+// MiB (merge freely, streaming beats round-trips); on a small box it is a few
+// MiB (stay byte-precise, where bandwidth is scarce).
+const (
+	gapFloor = 256 << 10
+	gapCeil  = 64 << 20
+	ttfbMax  = 8 // rolling window of measured first-byte latencies
+)
+
+func deriveCoalesceGap(bytesPerSec int64, ttfb time.Duration) int64 {
+	if bytesPerSec <= 0 || ttfb <= 0 {
+		return gapFloor
+	}
+	g := int64(float64(bytesPerSec) * ttfb.Seconds())
+	if g < gapFloor {
+		return gapFloor
+	}
+	if g > gapCeil {
+		return gapCeil
+	}
+	return g
+}
+
+// CoalesceGap returns the gap FillBatch currently merges within: the explicit
+// override if set, else the device-derived value from the NIC baseline and the
+// rolling median first-byte latency.
+func (bs *BlockStore) CoalesceGap() int64 {
+	if bs.gapOverride > 0 {
+		return bs.gapOverride
+	}
+	return deriveCoalesceGap(bs.nicBPS, bs.currentTTFB())
+}
+
+// currentTTFB is the rolling median of measured fill first-byte latencies, or the
+// seed until a fill has been measured.
+func (bs *BlockStore) currentTTFB() time.Duration {
+	bs.ttfbMu.Lock()
+	defer bs.ttfbMu.Unlock()
+	if len(bs.ttfbSamples) == 0 {
+		return bs.ttfbSeed
+	}
+	s := append([]time.Duration(nil), bs.ttfbSamples...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	return s[len(s)/2]
+}
+
+// recordTTFB feeds a fill's first-byte latency into the rolling window.
+func (bs *BlockStore) recordTTFB(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	bs.ttfbMu.Lock()
+	bs.ttfbSamples = append(bs.ttfbSamples, d)
+	if len(bs.ttfbSamples) > ttfbMax {
+		bs.ttfbSamples = bs.ttfbSamples[1:]
+	}
+	bs.ttfbMu.Unlock()
+}
 
 // Sparse chunk fills (#118). fetchExtents is the extent-aware demand/plan fill:
 // it guarantees a chunk holds the extents a caller needs, fetching only the
@@ -134,11 +195,13 @@ func (bs *BlockStore) fillExtentSpan(ctx context.Context, k Key, ci int64, base 
 		defer bs.budget.release(got)
 	}
 	bs.record(func(r Recorder) { r.StartInflight() })
+	t0 := time.Now()
 	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, absOff, length)
 	bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
 	if err != nil {
 		return nil, 0, err
 	}
+	bs.recordTTFB(time.Since(t0))
 	defer func() { _ = body.Close() }()
 	if xxh3.HashString(etag) != k.ETagHash {
 		bs.markStale(k.Key)
@@ -251,10 +314,11 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 	}
 
 	// Gap-tolerant coalesce into runs; each run is one GET.
+	gap := bs.CoalesceGap()
 	runs := []span{aligned[0]}
 	for _, a := range aligned[1:] {
 		last := &runs[len(runs)-1]
-		if a.lo <= last.hi+bs.coalesceGap {
+		if a.lo <= last.hi+gap {
 			if a.hi > last.hi {
 				last.hi = a.hi
 			}
@@ -272,7 +336,75 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 	if gapBytes < 0 {
 		gapBytes = 0
 	}
-	bs.recordBatch(planBytes, gapBytes, int64(len(runs)))
+	bs.recordBatch(planBytes, gapBytes, int64(len(runs)), len(aligned))
+}
+
+// demandBatchTick is how long a demand batch collects concurrent misses before
+// dispatching one coalesced FillBatch (#124/session 30).
+const demandBatchTick = 2 * time.Millisecond
+
+type demandGather struct {
+	ranges []Range
+	ready  chan struct{}
+}
+
+// Covered reports whether every extent the read [off,off+length) touches is
+// already filled in cache — used by the FUSE layer to skip demand batching (and
+// its tick) for a warm read.
+func (bs *BlockStore) Covered(k Key, off, length, objSize int64) bool {
+	if length <= 0 {
+		return true
+	}
+	end := off + length
+	if end > objSize {
+		end = objSize
+	}
+	for ci := off / ChunkSize; ci <= (end-1)/ChunkSize; ci++ {
+		start := ci * ChunkSize
+		lo := int64(0)
+		if off > start {
+			lo = off - start
+		}
+		want := extentMask(lo, end-start) & maskForLen(chunkLenOf(ci, objSize))
+		_, f, tier := bs.lookup(k, ci)
+		if tier == "" || !covers(f, want) {
+			return false
+		}
+	}
+	return true
+}
+
+// GatherDemand collects a footer demand read's range into a per-object batch and,
+// as the batch leader, waits one tick for concurrent misses, then dispatches a
+// single coalesced FillBatch (#124/session 30). Non-leaders wait for the leader's
+// dispatch. On return the read's extents are filled or in flight, so the caller's
+// serve joins one coalesced GET instead of issuing its own tiny GET.
+func (bs *BlockStore) GatherDemand(ctx context.Context, k Key, off, length, objSize int64) {
+	if length <= 0 {
+		return
+	}
+	r := Range{off, off + length}
+	bs.dmu.Lock()
+	g := bs.demand[k.Key]
+	leader := g == nil
+	if leader {
+		g = &demandGather{ready: make(chan struct{})}
+		bs.demand[k.Key] = g
+	}
+	g.ranges = append(g.ranges, r)
+	bs.dmu.Unlock()
+
+	if !leader {
+		<-g.ready
+		return
+	}
+	time.Sleep(demandBatchTick)
+	bs.dmu.Lock()
+	delete(bs.demand, k.Key)
+	rs := g.ranges
+	bs.dmu.Unlock()
+	bs.FillBatch(ctx, k, rs, objSize)
+	close(g.ready)
 }
 
 // fillCoalescedRun fetches the extents covering the contiguous byte run [lo, hi)

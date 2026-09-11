@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -124,44 +125,52 @@ func scrapeMetric(m *metrics.Metrics, substr string) string {
 	return strings.Join(out, "\n")
 }
 
-// TestFooterParquetPlanForwardOnly (#124.1): reading columns A,C from row group 0
-// plans A,C for row groups 1–3 and NOTHING in row group 0 (the current row group
-// is served by demand-precise fills). lith_fill_bytes_total{kind=plan} covers no
-// row-group-0 byte.
-func TestFooterParquetPlanForwardOnly(t *testing.T) {
+// TestFooterParquetFullProjectionPlan (#124/session 30): the plan fires ONCE the
+// projection is confirmed — the same columns read in two row groups — and then
+// plans A,C for all remaining row groups (RG2..n) in one batch. Nothing is
+// planned after only one row group, and the touched row groups (0,1) are not
+// planned (they are demand-served).
+func TestFooterParquetFullProjectionPlan(t *testing.T) {
 	srv := fake.New()
-	obj := buildParquetObject(4, 2)
+	obj := buildParquetObject(4, 2) // 4 row groups, 2 columns
 	srv.Put("t.parquet", obj, time.Unix(1_700_000_000, 0))
 	met := metrics.New()
 	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met})
 
 	h, fh := openHandle(t, raw, "t.parquet")
-	if h.footerKind.String() != "parquet" {
-		t.Fatalf("footerKind = %v, want parquet", h.footerKind)
-	}
 	readAt := func(off int64) {
 		buf := make([]byte, 4096)
 		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
 	}
-	readAt(parquetColStart(0, 0)) // RG0 col0
-	readAt(parquetColStart(0, 1)) // RG0 col1
-	waitStableGets(srv)
-	if h.footerMeta == nil || len(h.footerMeta.RowGroups) != 4 {
-		t.Fatalf("footer not parsed into 4 row groups: %+v", h.footerMeta)
-	}
-	// The plan dispatched nothing inside row group 0 (its whole byte span is served
-	// by demand); every dispatched range is at/after row group 1.
-	rg1 := parquetColStart(1, 0)
-	planned := 0
-	for start := range h.footerProj.dispatched {
-		planned++
-		if start < rg1 {
-			t.Fatalf("plan dispatched a range in row group 0 (start %d < rg1 %d)", start, rg1)
+	planRanges := func() int {
+		s := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`)
+		if s == "" {
+			return 0
 		}
+		n := 0
+		_, _ = fmt.Sscanf(s[strings.LastIndex(s, " ")+1:], "%d", &n)
+		return n
 	}
-	// A,C planned for row groups 1,2,3 → 6 ranges (deduped by Start).
-	if planned != 6 {
-		t.Fatalf("planned %d ranges, want 6 (A,C for RG1,2,3)", planned)
+	// Read row group 0's two columns — one row group only: no plan yet.
+	readAt(parquetColStart(0, 0))
+	readAt(parquetColStart(0, 1))
+	waitStableGets(srv)
+	if h.footerProj == nil || h.footerProj.planned {
+		t.Fatal("plan fired after only one row group")
+	}
+	if got := planRanges(); got != 0 {
+		t.Fatalf("plan dispatched %d ranges after one row group, want 0", got)
+	}
+	// Read row group 1's two columns — projection confirmed → plan fires once for
+	// RG2,RG3 (2 cols × 2 row groups = 4 ranges).
+	readAt(parquetColStart(1, 0))
+	readAt(parquetColStart(1, 1))
+	waitStableGets(srv)
+	if !h.footerProj.planned {
+		t.Fatal("plan did not fire after the projection was confirmed in two row groups")
+	}
+	if got := planRanges(); got != 4 {
+		t.Fatalf("plan dispatched %d ranges, want 4 (A,C for RG2,RG3 — nothing in touched RG0,RG1)", got)
 	}
 }
 
