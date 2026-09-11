@@ -41,8 +41,15 @@ func inBounds(blen, at, size int) bool {
 // bytes recording the key file/manifest the index was built from. Older files
 // are rejected with a message to rebuild.
 
+// v5 appends, after the v4 provenance trailer, an 8-byte backing-blob length
+// followed by that many bytes: empty (0) for an ordinary object-backed index,
+// or a self-contained CargoShip backing table (archive provenance, per-chunk
+// frame tables, and per-entry parts) for a `--cargoship` index. The blob is
+// parsed into heap structs (not mmap-reinterpreted) and every length/offset is
+// bounds-checked, so a truncated or forged blob errors rather than panics.
+
 // FormatVersion is the current on-disk index format version.
-const FormatVersion = 4
+const FormatVersion = 5
 
 const (
 	magic       = "LITHIDX1"
@@ -110,6 +117,11 @@ func (ix *Index) Marshal() []byte {
 	shaAt := off
 	off += 32
 
+	// Backing table (v5): length-prefixed blob, empty for an object-backed index.
+	backBlob := ix.marshalCargoBacking()
+	backAt := off
+	off += 8 + len(backBlob)
+
 	buf := make([]byte, off)
 	copy(buf[0:8], magic)
 	ne.PutUint32(buf[8:], formatVer)
@@ -146,6 +158,8 @@ func (ix *Index) Marshal() []byte {
 	ne.PutUint32(buf[srcLenAt:], uint32(len(ix.source)))
 	copy(buf[srcAt:], ix.source)
 	copy(buf[shaAt:], ix.keysSHA[:])
+	ne.PutUint64(buf[backAt:], uint64(len(backBlob)))
+	copy(buf[backAt+8:], backBlob)
 	return buf
 }
 
@@ -318,6 +332,24 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 		return nil, corruptf(p, "truncated before keys sha256")
 	}
 	copy(ix.keysSHA[:], b[p:p+32])
+	p += 32
+
+	// Backing table (v5): length-prefixed blob, parsed into heap structs.
+	if !inBounds(blen, p, 8) {
+		return nil, corruptf(p, "truncated before backing length")
+	}
+	backLen := int(ne.Uint64(b[p:]))
+	p += 8
+	if backLen < 0 || !inBounds(blen, p, backLen) {
+		return nil, corruptf(p, "backing length %d runs past end of image (%d left)", backLen, blen-p)
+	}
+	if backLen > 0 {
+		cb, err := parseCargoBacking(b[p:p+backLen], n)
+		if err != nil {
+			return nil, err
+		}
+		ix.cargo = cb
+	}
 
 	if copyOut {
 		ix.arena = append([]byte(nil), b[arenaAt:arenaAt+arenaLen]...)

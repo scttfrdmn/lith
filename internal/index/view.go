@@ -22,6 +22,10 @@ type Reader interface {
 	ETagHashOf(path string) uint64
 	Position(path string) (int, bool)
 	Neighborhood(path string, n int) []Sibling
+	// BackingOf returns the CargoShip read-mapping for a virtual file, or ok=false
+	// for an object-backed index. The backing travels with the entry, so a View
+	// over a CargoShip index resolves it unchanged (#90).
+	BackingOf(path string) (Backing, bool)
 }
 
 // static assertions.
@@ -107,10 +111,11 @@ func (v *View) Len() int       { return v.hi - v.lo }
 
 func (v *View) TotalSize() int64 { return v.total }
 
-func (v *View) Stat(path string) (FileInfo, error)   { return v.ix.Stat(v.abs(path)) }
-func (v *View) Lookup(path string) (FileInfo, error) { return v.ix.Stat(v.abs(path)) }
-func (v *View) ETagHashOf(path string) uint64        { return v.ix.ETagHashOf(v.abs(path)) }
-func (v *View) Position(path string) (int, bool)     { return v.ix.Position(v.abs(path)) }
+func (v *View) Stat(path string) (FileInfo, error)    { return v.ix.Stat(v.abs(path)) }
+func (v *View) Lookup(path string) (FileInfo, error)  { return v.ix.Stat(v.abs(path)) }
+func (v *View) ETagHashOf(path string) uint64         { return v.ix.ETagHashOf(v.abs(path)) }
+func (v *View) Position(path string) (int, bool)      { return v.ix.Position(v.abs(path)) }
+func (v *View) BackingOf(path string) (Backing, bool) { return v.ix.BackingOf(v.abs(path)) }
 
 func (v *View) Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, error) {
 	return v.ix.Readdir(v.abs(path), cursor, n)

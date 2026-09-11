@@ -71,8 +71,13 @@ type Index struct {
 
 	// Provenance (format v4): how the index was built and, for a key-list or
 	// manifest build, the sha256 of the raw key file/manifest bytes.
-	source  string   // "list", "keys", "manifest", "inventory"
+	source  string   // "list", "keys", "manifest", "inventory", "cargoship"
 	keysSHA [32]byte // all-zero when the source carries no key file
+
+	// CargoShip backing (format v5): nil for an object-backed index. Holds the
+	// archive provenance, per-chunk frame tables, and per-entry parts so a read
+	// of a virtual file maps to frame range GETs against the packed chunk.
+	cargo *cargoBacking
 
 	totalOnce sync.Once
 	totalSize int64

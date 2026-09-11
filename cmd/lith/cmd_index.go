@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/scttfrdmn/lith/internal/cargoship"
 	"github.com/scttfrdmn/lith/internal/index"
 	"github.com/scttfrdmn/lith/internal/s3client"
 	"github.com/spf13/cobra"
@@ -40,6 +41,7 @@ type indexFlags struct {
 	keysFromManifest string // --keys-from-manifest: s3:// URL or local path (gz ok)
 	keysAllowMissing bool   // --keys-allow-missing: skip 403/404 keys instead of failing
 	s3Concurrency    int    // --s3-concurrency: HeadObject fan-out for the keys path
+	cargoship        bool   // --cargoship: positional arg is a CargoShip 2.1 manifest URL
 }
 
 func (f *indexFlags) bind(cmd *cobra.Command) {
@@ -58,6 +60,7 @@ func (f *indexFlags) bind(cmd *cobra.Command) {
 	fl.StringVar(&f.keysFromManifest, "keys-from-manifest", "", "build from a key manifest (s3:// URL or local path, gz ok)")
 	fl.BoolVar(&f.keysAllowMissing, "keys-allow-missing", false, "skip keys that HEAD reports as 403/404 instead of failing")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "HeadObject concurrency for the --keys build path")
+	fl.BoolVar(&f.cargoship, "cargoship", false, "build from a CargoShip 2.1 archive manifest — the positional arg is the manifest s3:// URL (.gz transparent). The mount presents the archive's original file tree; reads fetch only the covering zstd frame(s)")
 	_ = cmd.MarkFlagRequired("index-file")
 }
 
@@ -111,6 +114,9 @@ func runIndexBuild(ctx context.Context, out io.Writer, f *indexFlags, bucket, pr
 	if f.keys != "" && f.keysFromManifest != "" {
 		return fmt.Errorf("--keys and --keys-from-manifest are mutually exclusive")
 	}
+	if f.cargoship && (usingKeys || f.inventory != "") {
+		return fmt.Errorf("--cargoship is mutually exclusive with --inventory/--keys/--keys-from-manifest")
+	}
 
 	var (
 		ix  *index.Index
@@ -118,6 +124,8 @@ func runIndexBuild(ctx context.Context, out io.Writer, f *indexFlags, bucket, pr
 		err error
 	)
 	switch {
+	case f.cargoship:
+		ix, err = buildFromCargoship(ctx, f, bucket, prefix, log)
 	case f.inventory != "":
 		ix, err = buildFromInventory(ctx, f, bucket, prefix, log)
 	case usingKeys:
@@ -149,6 +157,39 @@ func runIndexBuild(ctx context.Context, out io.Writer, f *indexFlags, bucket, pr
 		_, err = fmt.Fprintf(out, "keys source: headed %d, missing %d\n", res.Headed, res.Missing)
 	}
 	return err
+}
+
+// buildFromCargoship wires a CargoShip 2.1 manifest source. The positional arg
+// is the manifest s3:// URL (manifestKey within bucket); its raw bytes' sha256
+// is recorded as provenance, then the manifest is transparently gunzipped,
+// parsed, its incremental chain walked, and each chunk HEAD-ed for its ETag.
+func buildFromCargoship(ctx context.Context, f *indexFlags, bucket, manifestKey string, log *slog.Logger) (*index.Index, error) {
+	if manifestKey == "" {
+		return nil, fmt.Errorf("--cargoship needs a manifest URL: s3://bucket/prefix/uploads/<id>/manifest.json[.gz]")
+	}
+	client, err := newS3Client(ctx, f.s3config(bucket))
+	if err != nil {
+		return nil, err
+	}
+	rc, gerr := client.GetObject(ctx, manifestKey, 0, 0)
+	if gerr != nil {
+		return nil, fmt.Errorf("fetch cargoship manifest: %w", gerr)
+	}
+	raw, rerr := io.ReadAll(io.LimitReader(rc, cargoship.MaxManifestBytes+1))
+	_ = rc.Close()
+	if rerr != nil {
+		return nil, fmt.Errorf("read cargoship manifest: %w", rerr)
+	}
+	sum := sha256.Sum256(raw)
+	data, derr := index.ReadManifestBytes(bytes.NewReader(raw))
+	if derr != nil {
+		return nil, derr
+	}
+	return index.BuildFromCargoshipManifest(ctx, client, index.CargoshipOptions{
+		Options:       index.Options{Bucket: bucket, Prefix: "", Exec: f.exec, Logger: log},
+		ManifestBytes: data,
+		ManifestSHA:   sum,
+	})
 }
 
 // buildFromKeys wires an explicit key-list source. The list is either --keys (a
@@ -304,6 +345,13 @@ func newIndexInspectCmd() *cobra.Command {
 			fmt.Fprintf(&b, "source:            %s\n", ix.Source())
 			if sha := ix.KeysSHAHex(); sha != "" {
 				fmt.Fprintf(&b, "keys-sha256:       %s\n", sha)
+			}
+			if ix.IsCargoship() {
+				mSHA, uploadID, ver, feat, nChunks, nFrames := ix.CargoProvenance()
+				fmt.Fprintf(&b, "cargoship:         archive %s (format %s, features [%s])\n", uploadID, ver, feat)
+				fmt.Fprintf(&b, "manifest-sha256:   %s\n", mSHA)
+				fmt.Fprintf(&b, "chunks:            %d\n", nChunks)
+				fmt.Fprintf(&b, "frames:            %d\n", nFrames)
 			}
 			fmt.Fprintf(&b, "dropped-keys:      %d\n", dropped)
 			fmt.Fprintf(&b, "shadowed-keys:     %d\n", shadowed)

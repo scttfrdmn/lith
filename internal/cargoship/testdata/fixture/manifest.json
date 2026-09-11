@@ -1,0 +1,154 @@
+{
+  "version": "2.1",
+  "upload_id": "20260911-f7fef25e",
+  "created_at": "2026-09-11T14:08:56.428045-07:00",
+  "completed_at": "2026-09-11T14:08:56.612239-07:00",
+  "source_path": "/tmp/csfix/src",
+  "hostname": "terror",
+  "sync_type": "full",
+  "bucket": "scttfrdmn-lith-bench",
+  "prefix": "lith-bench/cargoship/fixture-fix",
+  "region": "us-east-1",
+  "total_files": 4,
+  "total_bytes": 1290070,
+  "total_chunks": 1,
+  "shard_count": 4,
+  "compression_type": "zstd",
+  "compression_level": 3,
+  "compression_ratio": 1,
+  "checksum_algorithm": "sha256",
+  "format_features": [
+    "frames"
+  ],
+  "files": [
+    {
+      "path": "/tmp/csfix/src/alpha.txt",
+      "size": 390000,
+      "mod_time": "2026-09-11T14:08:56.048567782-07:00",
+      "chunk_id": 0,
+      "shard_id": 0,
+      "s3_key": "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst",
+      "archive_offset": 512,
+      "checksum": "6106cec4d9f9f31c781e47f6d51b5dba48cc4accdcc4e1c0dbc4c02b4f9730b6"
+    },
+    {
+      "path": "/tmp/csfix/src/readme.txt",
+      "size": 70,
+      "mod_time": "2026-09-11T14:08:56.057507909-07:00",
+      "chunk_id": 0,
+      "shard_id": 0,
+      "s3_key": "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst",
+      "archive_offset": 391168,
+      "checksum": "a247d44d1bdb74266dcd329f4eb707e68414d9ad18d1ddb95e5d1eb8781bfff1"
+    },
+    {
+      "path": "/tmp/csfix/src/sub/beta.txt",
+      "size": 510000,
+      "mod_time": "2026-09-11T14:08:56.052919677-07:00",
+      "chunk_id": 0,
+      "shard_id": 0,
+      "s3_key": "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst",
+      "archive_offset": 392192,
+      "checksum": "6270fdccffc6269ed41168b8c2790c61f4e5d8f8b0e4f824d81b78020ab0b316"
+    },
+    {
+      "path": "/tmp/csfix/src/sub/gamma.txt",
+      "size": 390000,
+      "mod_time": "2026-09-11T14:08:56.057289906-07:00",
+      "chunk_id": 0,
+      "shard_id": 0,
+      "s3_key": "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst",
+      "archive_offset": 903168,
+      "checksum": "2a4a0ae14a4c114440885abfa9847b42a76fc196b33a8677424494215e2ee070"
+    }
+  ],
+  "chunks": [
+    {
+      "id": 0,
+      "shard_id": 0,
+      "s3_key": "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst",
+      "file_count": 4,
+      "file_paths": [
+        "/tmp/csfix/src/alpha.txt",
+        "/tmp/csfix/src/readme.txt",
+        "/tmp/csfix/src/sub/beta.txt",
+        "/tmp/csfix/src/sub/gamma.txt"
+      ],
+      "uncompressed_size": 1290070,
+      "compressed_size": 38574,
+      "created_at": "2026-09-11T14:08:56.430024-07:00",
+      "uploaded_at": "2026-09-11T14:08:56.612198-07:00",
+      "checksum": "b5c853c986f4ade1e40335d5ecdb3a754130a3e132b591b8d48fb171e10fb5fe",
+      "frames": [
+        {
+          "compressed_offset": 0,
+          "compressed_size": 12340,
+          "uncompressed_offset": 0,
+          "uncompressed_size": 390656,
+          "checksum": "c7365ab82dd8f5376a789d928fcd8ae844eeb5c9568bfcafe06a0e2c2954af4c"
+        },
+        {
+          "compressed_offset": 12340,
+          "compressed_size": 13851,
+          "uncompressed_offset": 390656,
+          "uncompressed_size": 512000,
+          "checksum": "50a84fc2c3570c70659714a63ccd9eb58113c28b3ee984f3d434acd17b3bebca"
+        },
+        {
+          "compressed_offset": 26191,
+          "compressed_size": 12367,
+          "uncompressed_offset": 902656,
+          "uncompressed_size": 390656,
+          "checksum": "dc6230587649d5ce2aa51bd8e563bfbc648ebc34bca7c70c16d449f2c58fa3c3"
+        },
+        {
+          "compressed_offset": 38558,
+          "compressed_size": 16,
+          "uncompressed_offset": 1293312,
+          "uncompressed_size": 1024,
+          "checksum": "2c1ce468d9f3d941396801f6e3afc8921466650dd05430fe644cd3537713d27f"
+        }
+      ]
+    }
+  ],
+  "shards": [
+    {
+      "id": 0,
+      "prefix": "lith-bench/cargoship/fixture-fix/uploads/20260911-f7fef25e/shard-0",
+      "chunk_count": 1,
+      "file_count": 4,
+      "uncompressed_size": 1290070,
+      "compressed_size": 38574,
+      "chunk_keys": [
+        "uploads/20260911-f7fef25e/shard-0/chunk-0.tar.zst"
+      ]
+    },
+    {
+      "id": 1,
+      "prefix": "lith-bench/cargoship/fixture-fix/uploads/20260911-f7fef25e/shard-1",
+      "chunk_count": 0,
+      "file_count": 0,
+      "uncompressed_size": 0,
+      "compressed_size": 0,
+      "chunk_keys": []
+    },
+    {
+      "id": 2,
+      "prefix": "lith-bench/cargoship/fixture-fix/uploads/20260911-f7fef25e/shard-2",
+      "chunk_count": 0,
+      "file_count": 0,
+      "uncompressed_size": 0,
+      "compressed_size": 0,
+      "chunk_keys": []
+    },
+    {
+      "id": 3,
+      "prefix": "lith-bench/cargoship/fixture-fix/uploads/20260911-f7fef25e/shard-3",
+      "chunk_count": 0,
+      "file_count": 0,
+      "uncompressed_size": 0,
+      "compressed_size": 0,
+      "chunk_keys": []
+    }
+  ]
+}
