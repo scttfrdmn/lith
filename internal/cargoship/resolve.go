@@ -58,9 +58,10 @@ type Archive struct {
 // tables, handling deduplicated and split files. Every part's byte span is
 // bounds-checked against its chunk's uncompressed stream (lith#101).
 func (m *Manifest) Resolve() (*Archive, error) {
-	// Chunks, indexed by their manifest ID.
+	// Chunks, indexed by their S3 key. Chunk IDs are only unique within a shard
+	// (each shard restarts at 0), so the object key is the stable identity.
 	chunks := make([]Chunk, len(m.Chunks))
-	idToIdx := make(map[int]int, len(m.Chunks))
+	keyToIdx := make(map[string]int, len(m.Chunks))
 	for i, rc := range m.Chunks {
 		frames := make([]Frame, len(rc.Frames))
 		for fi, rf := range rc.Frames {
@@ -84,10 +85,13 @@ func (m *Manifest) Resolve() (*Archive, error) {
 			total += fr.UncompLen
 		}
 		chunks[i] = Chunk{Key: resolveChunkKey(m.Prefix, rc.S3Key), UncompTotal: total, Frames: frames}
-		if _, dup := idToIdx[rc.ID]; dup {
-			return nil, fmt.Errorf("cargoship: duplicate chunk id %d", rc.ID)
+		if rc.S3Key == "" {
+			return nil, fmt.Errorf("cargoship: chunk %d has no s3_key", i)
 		}
-		idToIdx[rc.ID] = i
+		if _, dup := keyToIdx[rc.S3Key]; dup {
+			return nil, fmt.Errorf("cargoship: duplicate chunk s3_key %q", rc.S3Key)
+		}
+		keyToIdx[rc.S3Key] = i
 	}
 
 	// Group file entries by virtual path so split parts assemble into one file.
@@ -132,9 +136,9 @@ func (m *Manifest) Resolve() (*Archive, error) {
 			}
 			src = orig
 		}
-		ci, ok := idToIdx[src.ChunkID]
+		ci, ok := keyToIdx[src.S3Key]
 		if !ok {
-			return Part{}, fmt.Errorf("cargoship: file %q references unknown chunk id %d", fe.Path, src.ChunkID)
+			return Part{}, fmt.Errorf("cargoship: file %q references unknown chunk %q", fe.Path, src.S3Key)
 		}
 		length := fe.Length
 		if length == 0 { // full file
