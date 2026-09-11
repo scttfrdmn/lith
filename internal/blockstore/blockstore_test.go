@@ -49,6 +49,10 @@ func newStore(t *testing.T, srv *fake.Server, cfg Config) *BlockStore {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Stop the write-behind workers before the test's TempDir cleanup runs, so a
+	// late disk write cannot race RemoveAll ("directory not empty"). Cleanups run
+	// LIFO, and TempDir is registered first, so this fires before it.
+	t.Cleanup(bs.Close)
 	return bs
 }
 
