@@ -53,6 +53,10 @@ type Server struct {
 	// flight (the run's chunks already claimed) instead of sleeping. Called
 	// without the server lock held; keep it non-blocking.
 	OnGetStart func(key string, off, length int64)
+	// DenyList, when true, makes ListObjectsV2 fail with a 403 (AccessDenied),
+	// modeling a GET-public but LIST-denied bucket (Common Crawl cc-index,
+	// nyc-tlc). HeadObject/GetObject still succeed.
+	DenyList bool
 }
 
 // New returns an empty fake server.
@@ -92,7 +96,11 @@ var _ s3client.API = (*Server)(nil)
 func (s *Server) ListObjectsV2(_ context.Context, prefix, token string, maxKeys int32) (s3client.ListPage, error) {
 	s.mu.Lock()
 	s.ListCalls++
+	deny := s.DenyList
 	s.mu.Unlock()
+	if deny {
+		return s3client.ListPage{}, &AccessDeniedError{Op: "ListObjectsV2"}
+	}
 
 	s.mu.RLock()
 	keys := make([]string, 0, len(s.objs))
@@ -287,10 +295,20 @@ func (r *delayReader) Read(p []byte) (int, error) {
 
 func (r *delayReader) Close() error { return nil }
 
-// NotFoundError is returned for a missing key.
+// NotFoundError is returned for a missing key. HTTPStatusCode reports 404 so
+// callers can classify it exactly as they would a real S3 404 (which lith
+// detects via the aws-sdk/smithy transport error's HTTPStatusCode method).
 type NotFoundError struct{ Key string }
 
-func (e *NotFoundError) Error() string { return "fake s3: key not found: " + e.Key }
+func (e *NotFoundError) Error() string       { return "fake s3: key not found: " + e.Key }
+func (e *NotFoundError) HTTPStatusCode() int { return 404 }
+
+// AccessDeniedError is returned when an operation is denied (e.g. LIST on a
+// LIST-denied bucket). HTTPStatusCode reports 403, matching a real S3 deny.
+type AccessDeniedError struct{ Op string }
+
+func (e *AccessDeniedError) Error() string       { return "fake s3: access denied: " + e.Op }
+func (e *AccessDeniedError) HTTPStatusCode() int { return 403 }
 
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix

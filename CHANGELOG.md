@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith index build --keys <file>` / `--keys-from-manifest <url-or-key>`
+  ([M6](https://github.com/scttfrdmn/lith/issues/106)).** Build an index from an
+  explicit key list, for buckets that are GET-public but deny `ListObjectsV2`
+  (Common Crawl `cc-index`, `nyc-tlc`). One key per line (`#` comments; optional
+  `\t<size>\t<mtime>` columns); keys lacking size/mtime are `HeadObject`-ed with
+  bounded concurrency (`--s3-concurrency`, `--no-sign-request` honored). A 403/404
+  is counted and listed, failing the build unless `--keys-allow-missing`. A
+  manifest is fetched (`.gz` transparently) then parsed the same way. The index
+  records its build source and the key-file sha256; `lith index inspect` prints them.
+
+### Changed
+
+- On-disk index format bumped to **v4** (adds a build-provenance trailer: source +
+  key-file sha256). It is a private format — older index files are rejected with
+  the rebuild message, as on every prior bump.
+
 ## [0.2.2] - 2026-09-10
 
 Security release: two internal audit passes, fully remediated. Defensive hardening

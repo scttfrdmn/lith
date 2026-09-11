@@ -34,11 +34,15 @@ func inBounds(blen, at, size int) bool {
 //
 // v2 adds the directory table (sorted dir paths, per-directory inodes and
 // mtimes). v3 widens the arena offset arrays (offs/dirOffs) from uint32 to
-// uint64 so the pathname arena is not capped at ~4 GiB. Older files are
-// rejected with a message to rebuild.
+// uint64 so the pathname arena is not capped at ~4 GiB. v4 appends a provenance
+// trailer at the very end of the image (after the dir arrays, so the
+// mmap-reinterpreted arrays are undisturbed): a length-prefixed `source` string
+// (e.g. "list", "keys", "manifest", "inventory") followed by 32 raw sha256
+// bytes recording the key file/manifest the index was built from. Older files
+// are rejected with a message to rebuild.
 
 // FormatVersion is the current on-disk index format version.
-const FormatVersion = 3
+const FormatVersion = 4
 
 const (
 	magic       = "LITHIDX1"
@@ -97,6 +101,15 @@ func (ix *Index) Marshal() []byte {
 	dirInosAt := off
 	off += m * 8
 
+	// Provenance trailer (v4): srcLen(4) + source bytes + 32 raw sha bytes. It
+	// lives after the dir arrays so the mmap-reinterpreted arrays are undisturbed.
+	srcLenAt := off
+	off += 4
+	srcAt := off
+	off += len(ix.source)
+	shaAt := off
+	off += 32
+
 	buf := make([]byte, off)
 	copy(buf[0:8], magic)
 	ne.PutUint32(buf[8:], formatVer)
@@ -129,6 +142,10 @@ func (ix *Index) Marshal() []byte {
 	copyU64(buf[dirOffsAt:], ix.dirOffs)
 	copyI64(buf[dirMtimesAt:], ix.dirMtimes)
 	copyU64(buf[dirInosAt:], ix.dirInos)
+
+	ne.PutUint32(buf[srcLenAt:], uint32(len(ix.source)))
+	copy(buf[srcAt:], ix.source)
+	copy(buf[shaAt:], ix.keysSHA[:])
 	return buf
 }
 
@@ -283,6 +300,24 @@ func parse(b []byte, copyOut bool) (*Index, error) {
 	if !inBounds(blen, dirInosAt, m*8) {
 		return nil, corruptf(dirInosAt, "dir inos array runs past end of image")
 	}
+	p = dirInosAt + m*8
+
+	// Provenance trailer (v4): length-prefixed source string + 32 sha bytes.
+	// Read defensively so a truncated or forged trailer errors (never panics).
+	if !inBounds(blen, p, 4) {
+		return nil, corruptf(p, "truncated before source length")
+	}
+	srcLen := int(ne.Uint32(b[p:]))
+	p += 4
+	if !inBounds(blen, p, srcLen) {
+		return nil, corruptf(p, "source length %d runs past end of image (%d left)", srcLen, blen-p)
+	}
+	ix.source = string(b[p : p+srcLen])
+	p += srcLen
+	if !inBounds(blen, p, 32) {
+		return nil, corruptf(p, "truncated before keys sha256")
+	}
+	copy(ix.keysSHA[:], b[p:p+32])
 
 	if copyOut {
 		ix.arena = append([]byte(nil), b[arenaAt:arenaAt+arenaLen]...)
