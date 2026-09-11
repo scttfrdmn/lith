@@ -148,7 +148,14 @@ type fileHandle struct {
 	// names a footer-family container; the parse (footerMeta/footerZip) is lazy
 	// on first read and shared across handles via footerState. footerParsed marks
 	// that a parse was attempted (nil result = tier 1 only).
-	footerKind    footer.Format
+	footerKind footer.Format
+	// footerStream: on a fat pipe the device-derived coalesce gap is large, so a
+	// projection would coalesce to ≈ whole-file reads anyway — in-region, bytes
+	// are free and round-trips aren't (session 30). Such a handle streams like a
+	// plain file (readahead window on, whole-chunk reads, no extent/plan/batch),
+	// matching base. When the gap is small (bandwidth-scarce), it stays byte-
+	// precise. Decided once at open from the current gap vs the block size.
+	footerStream  bool
 	footerMu      sync.Mutex // guards the footer tier-2 state below (Read is concurrent per handle)
 	footerParsed  bool
 	footerMeta    *footer.ParquetMeta
@@ -370,12 +377,19 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	if !bgzfHandled {
 		footerHandled = f.maybeFooterReadahead(n.path, h, fi.Size)
 	}
+	// Big-pipe regime (session 30): if the device-derived coalesce gap is at least
+	// a fill block, a projection coalesces to ≈ whole-file reads — cheaper to just
+	// stream via the readahead window (like base) than to run the byte-precise
+	// extent/plan path. Small gap (bandwidth-scarce) → stay byte-precise.
+	if footerHandled && f.store.CoalesceGap() >= f.store.BlockSize() {
+		h.footerStream = true
+	}
 
-	// A footer-family handle is projection/seek-driven, not a sequential scan: its
-	// tier-1 footer prefetch and tier-2 byte-exact projection plan (#108/#118)
-	// replace the whole-block readahead window, which would otherwise sweep every
-	// column of the file and defeat the byte-exact fetch. Skip the window for it.
-	if fi.Size > f.partsThreshold() && h.footerKind == footer.FormatNone {
+	// A byte-precise footer handle is projection-driven, not a sequential scan:
+	// its tier-2 plan replaces the whole-block readahead window, which would
+	// otherwise sweep every column. A streaming footer handle keeps the window
+	// (it wants the whole file), like every non-footer handle.
+	if fi.Size > f.partsThreshold() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
 			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
@@ -424,7 +438,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	}
 	// footer tier 2 (#108): prefetch this row group's projection columns
 	// (Parquet) or this/next zip entries so follow-on reads are cache hits.
-	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 {
+	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 && !h.footerStream {
 		f.footerReadExtend(h, off)
 		// Batch a burst of concurrent demand misses on this object into one
 		// coalesced fetch (#124/session 30) — a front-loading reader (pyarrow
@@ -442,10 +456,11 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		ci := off / blockstore.ChunkSize
 		lo := off - ci*blockstore.ChunkSize
 		hi := lo + (end - off)
-		// A footer-family handle reads a projection: fetch only the read's 64 KiB
-		// extents so a point read of a plan-prefetched column adds no S3 bytes
-		// (#118). Every other handle streams whole chunks — unchanged.
-		sequential := h.footerKind == footer.FormatNone
+		// A byte-precise footer handle reads a projection: fetch only the read's
+		// 64 KiB extents so a point read of a plan-prefetched column adds no S3
+		// bytes (#118). Every other handle — plain, or a streaming footer handle on
+		// a fat pipe — streams whole chunks.
+		sequential := h.footerKind == footer.FormatNone || h.footerStream
 		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size, lo, hi, sequential)
 		if err != nil {
 			return nil, fuse.EIO
@@ -469,7 +484,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// (see Open: readahead would only contend with the parts fetch), or this is a
 	// footer-family handle whose byte-exact projection plan replaces the window
 	// (a whole-block window would re-fetch the columns the plan skips; #118).
-	if !h.partsDispatched.Load() && h.footerKind == footer.FormatNone {
+	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			pb := pb
