@@ -136,7 +136,7 @@ func Parse(b []byte) (*Manifest, error) {
 			return nil, fmt.Errorf("cargoship manifest: chunk %d has negative size", ci)
 		}
 		if len(c.Frames) == 0 {
-			return nil, fmt.Errorf("cargoship manifest: chunk %d has no frames", ci)
+			return nil, fmt.Errorf("cargoship manifest: chunk %d (%s) has no frame index — lith reads fully-framed 2.1 archives only; CargoShip stores already-compressed or small content in plain (unframed) .tar chunks, whose direct-range/header-walk read path is not implemented yet. Pack a compressible tree, or wait for plain-.tar support", ci, c.S3Key)
 		}
 		var wantU int64
 		for fi := range c.Frames {
