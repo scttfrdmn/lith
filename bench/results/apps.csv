@@ -11,3 +11,7 @@ v0.2,BIG xarray ONE-MONTH (large-object selectivity),1.4 TB Zarr store,7.3,0.8,3
 # v0.3 bgzf-family access plan (#107). R1/R2/S1 wall-clock unchanged (samtools/tabix decode-bound: samtools ~90-99% one core, lith ~2%). bgzf's effect is byte-selectivity, not latency. gb = S3 bytes pulled (lith metric).
 v0.3,R2single samtools view -c 20:30M-31M (point query),14 GB CRAM,0.28,0.06,,0.051,base adaptive readahead pulls 0.143 GB; bgzf tier-2 slice-precise pulls 0.051 (2.8x fewer bytes)
 v0.3,R2 samtools view -c 1000x1Mb,14 GB CRAM,46.4,44.5,,0.588,bgzf ties base 0.586 GB (was 2.41 GB / 4x before the per-slice seek-extend fix)
+# v0.3 footer family (#108). R4 = pyarrow projection (id,confidence,basic_category; ~1% filter) on Overture places (CC substituted: denies ListObjectsV2). Cross-region us-west-2<-us-east-1. mount_s3 col = pyarrow-native S3 (the in-place competitor). lith fetches whole file (1 MiB chunk granularity rounds up scattered column chunks) vs pyarrow byte-exact; lith wins wall via few coalesced GETs, not bytes (#118).
+v0.3,R4 pyarrow projection single (4xl),650 MB Parquet,2.4,0.2,10.5,0.605,pyarrow-native 10.5s/0.129 GB byte-exact; lith 4x faster (78 GETs vs hundreds) 4.7x more bytes
+v0.3,R4 pyarrow projection 8-concurrent (4xl),8x650 MB Parquet,7.8,,11.2,5.12,pyarrow-native 11.2s/1.0 GB; lith wins wall not bytes
+v0.3,R4 pyarrow projection single (c8g.large),650 MB Parquet,10.0,,11.5,0.614,small box bandwidth-bound: byte over-fetch erases most of the wall edge (~tie)

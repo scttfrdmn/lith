@@ -38,6 +38,10 @@ jobs:
           go test -run '^$' -fuzz 'FuzzParseTBI$' -fuzztime 20s ./internal/format/bgzf/
           go test -run '^$' -fuzz 'FuzzParseCRAI$' -fuzztime 20s ./internal/format/bgzf/
           go test -run '^$' -fuzz 'FuzzParseBAI$' -fuzztime 20s ./internal/format/bgzf/
+      - name: fuzz the footer parsers (60s; committed corpora also run above)
+        run: |
+          go test -run '^$' -fuzz 'FuzzParseParquetFooter$' -fuzztime 30s ./internal/format/footer/
+          go test -run '^$' -fuzz 'FuzzParseZipCentralDir$' -fuzztime 30s ./internal/format/footer/
 
   build:
     name: build ${{ matrix.goarch }}
