@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.330.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.111.0
 	github.com/hanwen/go-fuse/v2 v2.11.0
+	github.com/klauspost/compress v1.19.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/spf13/cobra v1.8.1
 	github.com/zeebo/xxh3 v1.0.2

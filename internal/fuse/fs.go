@@ -162,6 +162,22 @@ type fileHandle struct {
 	footerProj    *footerProjection
 	footerZip     []footer.ZipEntry
 	footerLastZip int
+
+	// CargoShip virtual-file backing (#94). Non-nil when the index is
+	// CargoShip-backed: the file's bytes live in one or more packed `.tar.zst`
+	// chunks, and a read maps to frame range GETs on those chunks. A cargo handle
+	// bypasses the bgzf/footer/sibling readahead paths entirely.
+	cargo []cargoPart
+}
+
+// cargoPart is one contiguous run of a virtual file's bytes in a packed chunk,
+// with the chunk resolved to a Cargo-backed block-store Key.
+type cargoPart struct {
+	key         blockstore.Key
+	archiveOff  int64 // start of this part's bytes in the chunk's uncompressed tar stream
+	fileOff     int64 // start offset of this part within the virtual file
+	length      int64
+	uncompTotal int64 // chunk uncompressed total (objSize for the block store)
 }
 
 type rawFS struct {
@@ -352,6 +368,33 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	f.handles[fh] = h
 	f.mu.Unlock()
 
+	// CargoShip-backed file (#94): its bytes live in packed `.tar.zst` chunks.
+	// Resolve the read-mapping and stream the covering chunk region; a cargo
+	// handle uses none of the object-key readahead paths below.
+	if b, ok := f.ix.BackingOf("/" + n.path); ok {
+		for _, p := range b.Parts {
+			h.cargo = append(h.cargo, cargoPart{
+				key: blockstore.Key{Key: p.ChunkKey, ETagHash: p.ChunkETagHash,
+					Cargo: &blockstore.CargoChunk{Frames: p.Frames, UncompTotal: p.ChunkUncompTotal}},
+				archiveOff: p.ArchiveOffset, fileOff: p.FileOffset, length: p.Length, uncompTotal: p.ChunkUncompTotal,
+			})
+		}
+		if len(h.cargo) > 0 {
+			// Prefetch the first part's chunk region so a directory-order walk (files
+			// packed in tree order) streams the chunk sequentially — the many-small-
+			// objects win. Readahead operates on the chunk's uncompressed stream.
+			p := h.cargo[0]
+			base := p.archiveOff / f.blockSize
+			for _, blk := range h.pf.open(f.perHandleWindow()) {
+				b := base + blk
+				go f.store.Prefetch(f.ctx, p.key, b, p.uncompTotal)
+			}
+			out.Fh = fh
+			out.OpenFlags = fuse.FOPEN_KEEP_CACHE
+			return fuse.OK
+		}
+	}
+
 	// Dispatch the initial readahead window at open so the frontier leads from
 	// the start (#38) — but only for files larger than the parts threshold. A
 	// file at or below it is fetched whole as parallel parts on first read (#69),
@@ -428,17 +471,31 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		return nil, fuse.EBADF
 	}
 
-	f.maybePartsFetch(h)
-
 	off := int64(input.Offset)
 	length := int64(len(buf))
-	// Record the read size and the distinct object bytes this read touches (#65).
 	f.met.ObserveReadSize(length)
-	f.met.MarkDistinctRead(h.key.Key, off, length, h.size)
 	end := off + length
 	if end > h.size {
 		end = h.size
 	}
+
+	// CargoShip-backed read (#94): map the file range to its part(s) in the packed
+	// chunk(s) and serve from the frame-decode path; drive readahead on the chunk's
+	// uncompressed stream so a directory-order walk streams sequentially.
+	if h.cargo != nil {
+		if off >= end {
+			return fuse.ReadResultData(nil), fuse.OK
+		}
+		data, err := f.readCargo(h, off, end)
+		if err != nil {
+			return nil, fuse.EIO
+		}
+		return fuse.ReadResultData(data), fuse.OK
+	}
+
+	f.maybePartsFetch(h)
+	// Record the distinct object bytes this read touches (#65).
+	f.met.MarkDistinctRead(h.key.Key, off, length, h.size)
 
 	// bgzf tier 2 (#107): extend a seek to the enclosing index range so the
 	// tool's follow-on reads in that container/chunk are cache hits.
