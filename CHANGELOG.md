@@ -18,12 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is counted and listed, failing the build unless `--keys-allow-missing`. A
   manifest is fetched (`.gz` transparently) then parsed the same way. The index
   records its build source and the key-file sha256; `lith index inspect` prints them.
+- **Sparse chunk fills ([#118](https://github.com/scttfrdmn/lith/issues/118)).**
+  The 1 MiB cache chunk gains a 64 KiB-granularity filled-extent bitmap. A
+  format plan's byte-exact range (e.g. a Parquet column projection) and a
+  non-sequential point read now fetch only the extents they cover, not the whole
+  enclosing chunk; sequential/streaming reads still fill whole chunks. Fill
+  batches coalesce extents across chunks into range GETs, tolerating gaps under
+  `--coalesce-gap` (default 256 KiB), so a projection is a few large GETs, not
+  many tiny ones. The disk tier persists the bitmap (partial chunks are valid).
+  New metrics `lith_fill_partial_total`, `lith_fill_runs_total`,
+  `lith_fill_bytes_total{kind=plan|demand|whole|gap}`, `lith_fill_gap_bytes_total`.
 
 ### Changed
 
-- On-disk index format bumped to **v4** (adds a build-provenance trailer: source +
-  key-file sha256). It is a private format — older index files are rejected with
-  the rebuild message, as on every prior bump.
+- **`lith_distinct_bytes_read` now counts filled 64 KiB extents, not 1 MiB
+  chunks** (it was chunk-rounded). Values are finer-grained (and smaller) than
+  before for sub-chunk access ([#118](https://github.com/scttfrdmn/lith/issues/118)).
+- On-disk index format bumped to **v4** (build-provenance trailer: source +
+  key-file sha256); the disk block-cache format bumped to **v2** (per-chunk extent
+  bitmap). Both are private — older files are ignored/rejected and rebuilt.
 
 ## [0.2.2] - 2026-09-10
 

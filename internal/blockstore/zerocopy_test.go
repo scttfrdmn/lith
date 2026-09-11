@@ -20,14 +20,14 @@ func TestChunkZeroCopy(t *testing.T) {
 	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, MemCache: 64 << 20})
 
 	ctx := context.Background()
-	a, err := bs.Chunk(ctx, k, 5, size) // fill + cache
+	a, err := bs.Chunk(ctx, k, 5, size, 0, ChunkSize, true) // fill + cache
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a[0] != 5 || int64(len(a)) != mib {
 		t.Fatalf("chunk 5: byte=%d len=%d", a[0], len(a))
 	}
-	b, _ := bs.Chunk(ctx, k, 5, size) // cache hit
+	b, _ := bs.Chunk(ctx, k, 5, size, 0, ChunkSize, true) // cache hit
 	if &a[0] != &b[0] {
 		t.Error("Chunk copied the data; the returned slice should alias the cached buffer")
 	}
@@ -38,7 +38,7 @@ func TestChunkZeroCopy(t *testing.T) {
 	runtime.ReadMemStats(&m0)
 	const n = 2000
 	for i := 0; i < n; i++ {
-		_, _ = bs.Chunk(ctx, k, 5, size)
+		_, _ = bs.Chunk(ctx, k, 5, size, 0, ChunkSize, true)
 	}
 	runtime.ReadMemStats(&m1)
 	perCall := (m1.TotalAlloc - m0.TotalAlloc) / n
@@ -59,12 +59,12 @@ func TestChunkSurvivesEviction(t *testing.T) {
 	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, MemCache: 4 << 20})
 
 	ctx := context.Background()
-	held, err := bs.Chunk(ctx, k, 3, size)
+	held, err := bs.Chunk(ctx, k, 3, size, 0, ChunkSize, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for ci := int64(0); ci < 40; ci++ { // evict chunk 3 from the 4 MiB mem tier
-		_, _ = bs.Chunk(ctx, k, ci, size)
+		_, _ = bs.Chunk(ctx, k, ci, size, 0, ChunkSize, true)
 	}
 	runtime.GC()
 	for i, bv := range held {

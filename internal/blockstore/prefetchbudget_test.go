@@ -83,7 +83,7 @@ func TestPrefetchBudgetNoThrash(t *testing.T) {
 				}
 				// Demand-read the current block's chunks.
 				for ci := b * blk; ci < (b+1)*blk; ci++ {
-					if _, err := bs.Chunk(ctx, k, ci, objSize); err != nil {
+					if _, err := bs.Chunk(ctx, k, ci, objSize, 0, ChunkSize, true); err != nil {
 						t.Errorf("Chunk %d: %v", ci, err)
 						return
 					}

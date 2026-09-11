@@ -429,12 +429,16 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// Read lies within one chunk: return a sub-slice of the (immutable)
 		// chunk buffer directly — no copy, no allocation on a cache hit.
 		ci := off / blockstore.ChunkSize
-		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size)
+		lo := off - ci*blockstore.ChunkSize
+		hi := lo + (end - off)
+		// A footer-family handle reads a projection: fetch only the read's 64 KiB
+		// extents so a point read of a plan-prefetched column adds no S3 bytes
+		// (#118). Every other handle streams whole chunks — unchanged.
+		sequential := h.footerKind == footer.FormatNone
+		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size, lo, hi, sequential)
 		if err != nil {
 			return nil, fuse.EIO
 		}
-		lo := off - ci*blockstore.ChunkSize
-		hi := lo + (end - off)
 		if hi > int64(len(chunk)) {
 			hi = int64(len(chunk))
 		}

@@ -138,8 +138,9 @@ func TestMidFillUnblock(t *testing.T) {
 	}
 }
 
-// TestRandomReadFetchesOneChunk: a small demand read fetches ≤ 1 MiB (#37).
-func TestRandomReadFetchesOneChunk(t *testing.T) {
+// TestRandomReadFetchesOneExtent: a small demand read fetches just its 64 KiB
+// extent, not the whole 1 MiB chunk (sparse fills, #118; was one chunk pre-#118).
+func TestRandomReadFetchesOneExtent(t *testing.T) {
 	srv := fake.New()
 	makeObj(srv, "obj", 40)
 	k := keyFor(t, srv, "obj")
@@ -149,8 +150,8 @@ func TestRandomReadFetchesOneChunk(t *testing.T) {
 	if _, err := bs.GetRange(context.Background(), k, 12*mib+123, 4096, size); err != nil {
 		t.Fatal(err)
 	}
-	if srv.GetBytes != mib {
-		t.Errorf("random 4KiB read fetched %d bytes, want %d (one chunk)", srv.GetBytes, mib)
+	if srv.GetBytes != ExtentSize {
+		t.Errorf("random 4KiB read fetched %d bytes, want %d (one 64 KiB extent)", srv.GetBytes, ExtentSize)
 	}
 	if srv.GetCalls != 1 {
 		t.Errorf("GetCalls=%d, want 1", srv.GetCalls)
@@ -204,7 +205,7 @@ func TestETagMismatchStale(t *testing.T) {
 	if s := bs.StaleKeys(); len(s) != 1 || s[0] != "obj" {
 		t.Errorf("StaleKeys = %v, want [obj]", s)
 	}
-	if _, tier := bs.lookup(k, 0); tier != "" {
+	if _, _, tier := bs.lookup(k, 0); tier != "" {
 		t.Error("a stale chunk must not be cached")
 	}
 }
