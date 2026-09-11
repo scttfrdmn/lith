@@ -65,7 +65,7 @@ func TestTruncatedChunkNotCachedAsZeros(t *testing.T) {
 	}
 
 	// (b) The truncated chunk must not have been cached: nothing in any tier.
-	if _, tier := bs.lookup(k, ci); tier != "" {
+	if _, _, tier := bs.lookup(k, ci); tier != "" {
 		t.Fatalf("truncated chunk was cached in tier %q; it must not be served as authoritative", tier)
 	}
 
