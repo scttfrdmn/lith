@@ -204,14 +204,10 @@ func (bs *BlockStore) fillExtentSpan(ctx context.Context, k Key, ci int64, base 
 	if got := bs.budget.acquire(length); got > 0 {
 		defer bs.budget.release(got)
 	}
-	bs.record(func(r Recorder) { r.StartInflight() })
-	t0 := time.Now()
-	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, absOff, length)
-	bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
+	body, etag, err := bs.fetchReader(ctx, k, absOff, length)
 	if err != nil {
 		return nil, 0, err
 	}
-	bs.recordTTFB(time.Since(t0))
 	defer func() { _ = body.Close() }()
 	if xxh3.HashString(etag) != k.ETagHash {
 		bs.markStale(k.Key)
