@@ -44,6 +44,14 @@ over a network. It cannot beat:
   the bytes arrive faster than the app consumes them, and wall-clock is set by
   the CPU — where a local copy on the same box ties, and lith wins only by not
   having staged first.
+- **FUSE read visibility.** lith sees reads one at a time, as the kernel delivers
+  them; it cannot see a whole query's access pattern the way a library reading its
+  own file can. A reader that knows its own projection can front-load every range
+  at once — lith can only *plan* ahead where the format lets it (a Parquet footer,
+  a bgzf index), and elsewhere reacts read-by-read. This is why, in-region, lith
+  streams a columnar file rather than fetching a precise projection: a whole-file
+  stream at line rate beats byte-precise fetch that pays a round-trip per chunk it
+  discovers one read at a time (see [Copy or mount?](copy-or-mount.md)).
 
 When lith "matches or beats a copy," it is bounded by these; the win comes from
 removing staging and moving only the bytes you touch, not from outrunning
