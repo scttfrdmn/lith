@@ -7,8 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-10
+
+The **format-aware plan** release. lith learns the on-disk shape of the formats it
+serves — Zarr chunk grids, bgzf coordinate indexes, columnar footers — and reads
+along the app's access pattern instead of blindly. The measurement rule holds: I/O
+metrics (bytes, GETs) are primary; wall-clock is reported under I/O-bound configs.
+
 ### Added
 
+- **Zarr grid-plane prefetch — Format tier 2 ([#70](https://github.com/scttfrdmn/lith/issues/70)/[#109](https://github.com/scttfrdmn/lith/issues/109)).**
+  A chunked-store read now prefetches the whole grid-plane selection an access
+  implies, not just the next chunks in key order — closing the 2-D boundary gap
+  where uncovered chunks each paid a cold GET on the app's bounded pool. On the
+  1.4 TB `chrtout.zarr` the I/O tail is closed; the remaining difference from an
+  async in-place reader is the app's compute floor (a documented tie).
+- **bgzf family — index-aware readahead, tiers 1+2 ([#107](https://github.com/scttfrdmn/lith/issues/107)).**
+  A BAM/CRAM/VCF.gz/BCF data file with a coordinate-index sibling
+  (`.bai`/`.tbi`/`.csi`/`.crai`) gets header prefetch + random protection at open
+  (tier 1); at or below `--bgzf-whole-file-max` (512 MiB) it is fetched whole
+  through the parts path when the index opens, and above it tier 2 prefetches only
+  the index-resolved slice ranges. **2.8× fewer bytes on a point query**; wall is
+  unchanged (samtools is decode-bound), so the win is byte-selectivity.
+- **Footer family — Parquet/zip tier-1 + tier-2 ([#108](https://github.com/scttfrdmn/lith/issues/108)).**
+  A columnar/archive container (Parquet/ORC/Arrow/zip) gets its footer (tail) +
+  head prefetched at open (tier 1, always on). An experimental tier 2
+  (`--footer-tier2`, **off by default** — see Changed) fetches the index-resolved
+  projection/entries byte-precise.
+- **Sparse chunk fills + coalescing substrate ([#118](https://github.com/scttfrdmn/lith/issues/118)/[#124](https://github.com/scttfrdmn/lith/issues/124)/[#31](https://github.com/scttfrdmn/lith/issues/31)).**
+  The 1 MiB cache chunk gains a 64 KiB-granularity filled-extent bitmap: a byte-
+  exact plan range and a non-sequential point read fetch only the extents they
+  cover, not the whole chunk; sequential reads still fill whole chunks. Fill
+  batches coalesce extents across chunks into range GETs, merging gaps up to
+  `--coalesce-gap` (default derived from NIC × first-byte latency ÷ usable
+  concurrency, clamped [256 KiB, 64 MiB]), and dispatch their runs concurrently.
+  The disk tier persists the bitmap. New metrics `lith_fill_partial_total`,
+  `lith_fill_runs_total`, `lith_fill_bytes_total{kind=plan|demand|whole|gap}`,
+  `lith_fill_gap_bytes_total`, `lith_fill_batch_size`, `lith_fill_inflight`,
+  `lith_fill_inflight_peak`.
+- **Read-path metrics ([#65](https://github.com/scttfrdmn/lith/issues/65)).** A
+  read-size histogram (`lith_read_size_bytes`) and a distinct-object-bytes-read
+  gauge (`lith_distinct_bytes_read`) from per-object 64 KiB touched-extent bitmaps.
 - **`lith index build --keys <file>` / `--keys-from-manifest <url-or-key>`
   ([M6](https://github.com/scttfrdmn/lith/issues/106)).** Build an index from an
   explicit key list, for buckets that are GET-public but deny `ListObjectsV2`
@@ -18,19 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is counted and listed, failing the build unless `--keys-allow-missing`. A
   manifest is fetched (`.gz` transparently) then parsed the same way. The index
   records its build source and the key-file sha256; `lith index inspect` prints them.
-- **Sparse chunk fills ([#118](https://github.com/scttfrdmn/lith/issues/118)).**
-  The 1 MiB cache chunk gains a 64 KiB-granularity filled-extent bitmap. A
-  format plan's byte-exact range (e.g. a Parquet column projection) and a
-  non-sequential point read now fetch only the extents they cover, not the whole
-  enclosing chunk; sequential/streaming reads still fill whole chunks. Fill
-  batches coalesce extents across chunks into range GETs, tolerating gaps under
-  `--coalesce-gap` (default 256 KiB), so a projection is a few large GETs, not
-  many tiny ones. The disk tier persists the bitmap (partial chunks are valid).
-  New metrics `lith_fill_partial_total`, `lith_fill_runs_total`,
-  `lith_fill_bytes_total{kind=plan|demand|whole|gap}`, `lith_fill_gap_bytes_total`.
 
 ### Changed
 
+- **`--footer-tier2` defaults to off (experimental).** Byte-precise Parquet
+  projection fetch is measured slower than default whole-file streaming on every
+  tested instance class, in-region: a whole-file stream is a handful of coalesced
+  GETs at line rate, while byte-precise fetch pays a round-trip per column chunk
+  through a filesystem that sees reads one at a time. Criterion 3 is **met by
+  streaming**; tier 2 ships as a correct, tested, opt-in substrate, and the
+  precision work moves to [#125](https://github.com/scttfrdmn/lith/issues/125)
+  (v0.4). With tier 2 off a footer handle streams exactly like a plain one (tier 1
+  footer+head prefetch only).
 - **`lith_distinct_bytes_read` now counts filled 64 KiB extents, not 1 MiB
   chunks** (it was chunk-rounded). Values are finer-grained (and smaller) than
   before for sub-chunk access ([#118](https://github.com/scttfrdmn/lith/issues/118)).
@@ -366,7 +404,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/lith/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/scttfrdmn/lith/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scttfrdmn/lith/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scttfrdmn/lith/compare/v0.1.0...v0.2.0
