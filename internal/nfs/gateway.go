@@ -128,5 +128,11 @@ func (s *server) windowBlocks() int64 {
 	if w < 2 {
 		w = 2
 	}
+	// Cap the readahead window: past a few hundred MB in flight, deeper dispatch
+	// only queues goroutines behind the block store's prefetch semaphore without
+	// adding throughput. 96 blocks ≈ 768 MB at an 8 MiB block.
+	if w > 96 {
+		w = 96
+	}
 	return w
 }

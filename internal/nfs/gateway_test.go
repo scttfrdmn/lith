@@ -137,26 +137,32 @@ func TestFairShareArithmetic(t *testing.T) {
 	if budget < 8 {
 		t.Skipf("prefetch budget %d blocks too small for the 8-client assertion", budget)
 	}
-	// 1 client: whole budget.
+	// window = min(budget/clients, cap) with a floor of 2. The cap bounds
+	// per-stream readahead dispatch; below it the share divides by client count.
+	const cap, floor = 96, 2
+	want := func(n int64) int64 {
+		w := budget / n
+		if w > cap {
+			w = cap
+		}
+		if w < floor {
+			w = floor
+		}
+		return w
+	}
 	s.mountClient("10.0.0.1")
-	if w := s.windowBlocks(); w != budget {
-		t.Errorf("1 client window = %d, want %d", w, budget)
+	if w := s.windowBlocks(); w != want(1) {
+		t.Errorf("1 client window = %d, want %d", w, want(1))
 	}
-	// 2 clients: half.
 	s.mountClient("10.0.0.2")
-	if w := s.windowBlocks(); w != budget/2 {
-		t.Errorf("2 clients window = %d, want %d", w, budget/2)
+	if w := s.windowBlocks(); w != want(2) {
+		t.Errorf("2 clients window = %d, want %d", w, want(2))
 	}
-	// 8 clients: an eighth, floored at 2.
 	for i := 3; i <= 8; i++ {
 		s.mountClient("10.0.0." + string(rune('0'+i)))
 	}
-	want := budget / 8
-	if want < 2 {
-		want = 2
-	}
-	if w := s.windowBlocks(); w != want {
-		t.Errorf("8 clients window = %d, want %d", w, want)
+	if w := s.windowBlocks(); w != want(8) {
+		t.Errorf("8 clients window = %d, want %d", w, want(8))
 	}
 }
 

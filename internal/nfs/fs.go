@@ -196,14 +196,19 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 	r.st.mu.Unlock()
 
 	if hi >= lo && hi >= 0 {
-		go func(lo, hi int64) {
-			for b := lo; b <= hi; b++ {
-				if b*blk >= r.size {
-					break
-				}
-				r.fs.cfg.Store.Prefetch(r.fs.ctx, r.key, b, r.size)
+		// Dispatch each block's readahead CONCURRENTLY: Prefetch blocks until its
+		// block is filled, so a serial loop would fetch one block at a time and
+		// throttle a cold single stream (the session-40 finding: 67 MB/s vs the
+		// FUSE mount's 787). One goroutine per block lets the block store's own
+		// prefetch semaphore bound in-flight depth, matching the FUSE prefetcher's
+		// concurrency.
+		for b := lo; b <= hi; b++ {
+			if b*blk >= r.size {
+				break
 			}
-		}(lo, hi)
+			b := b
+			go r.fs.cfg.Store.Prefetch(r.fs.ctx, r.key, b, r.size)
+		}
 	}
 
 	// Serve via Chunk() per 1 MiB cache chunk — the same caching read primitive
