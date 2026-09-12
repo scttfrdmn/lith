@@ -29,10 +29,20 @@ func (bs *BlockStore) recordBacking(f func(backingRecorder)) {
 	}
 }
 
+// maxFrameBytes bounds a single zstd frame lith will decode into memory. Normal
+// frames are ~ the archive's frame size (e.g. 16 MiB). CargoShip frames only at
+// file boundaries, so a large file becomes one giant frame; a zstd frame is not
+// randomly seekable, so serving a small read from a multi-GB frame would decode
+// the whole thing (and per-chunk re-decodes are quadratic). Such a file belongs
+// in a frameless (plain .tar) chunk — lith reads that as a direct range GET. We
+// cap the decoder here so a giant frame is a clear error, never an OOM.
+const maxFrameBytes = 512 << 20
+
 func (bs *BlockStore) decoder() *zstd.Decoder {
 	bs.zdecOnce.Do(func() {
 		// DecodeAll is safe for concurrent use; one shared decoder serves all fills.
-		bs.zdec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		bs.zdec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0),
+			zstd.WithDecoderMaxMemory(maxFrameBytes))
 	})
 	return bs.zdec
 }
@@ -86,6 +96,14 @@ func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) 
 	compLen := compEnd - compStart
 	if compLen <= 0 {
 		return nil, "", fmt.Errorf("cargoship: empty compressed run for [%d,%d)", off, end)
+	}
+	// Reject a frame too large to decode into memory (see maxFrameBytes): a large
+	// file that CargoShip framed as one giant frame is not randomly readable. It
+	// should be stored in a frameless (plain .tar) chunk, or cut into sub-frames.
+	for i := lo; i <= hi; i++ {
+		if frames[i].UncompLen > maxFrameBytes {
+			return nil, "", fmt.Errorf("cargoship: frame %d is %d bytes uncompressed (> %d cap) — a large file was framed as one giant zstd frame, which is not randomly readable; store it frameless or cut sub-frames (cargoship framing)", i, frames[i].UncompLen, maxFrameBytes)
+		}
 	}
 
 	bs.record(func(r Recorder) { r.StartInflight() })
