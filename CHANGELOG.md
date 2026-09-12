@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.2] - 2026-09-12
 
+> Includes the [0.3.1] section below, which was never tagged — its CargoShip
+> integration ships here (v0.3.1's tag was gated on an acknowledgment that the
+> session never reached, and the next release picked up the slack). The compare
+> link for this release points back to **v0.3.0** so the notes and `git log`
+> agree.
+
 CargoShip read efficiency and safety. The packed small-files win is now
 **universal, not archive-specific**: a tree walk moves ~1× the archive's
 compressed bytes regardless of the frame size (was up to ~3× at the 16 MiB
@@ -518,7 +524,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.2
 [0.3.1]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/scttfrdmn/lith/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/scttfrdmn/lith/compare/v0.2.1...v0.2.2
