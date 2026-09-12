@@ -27,6 +27,7 @@ import (
 
 type mountFlags struct {
 	indexFile        string
+	cargoship        string
 	memCache         string
 	diskCache        string
 	diskPath         string
@@ -80,6 +81,7 @@ func newMountCmd() *cobra.Command {
 	}
 	fl := cmd.Flags()
 	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built automatically if absent and under --auto-index-limit). A whole-bucket or parent-prefix index can back mounts rooted at any prefix at or below its own root, concurrently")
+	fl.StringVar(&f.cargoship, "cargoship", "", "mount a CargoShip 2.1 archive: build the index in-process from this manifest s3:// URL (.gz transparent) and present the archive's original file tree. Fails closed — a manifest that cannot be resolved is an error, never a fallback to listing the bucket. Mutually exclusive with --index-file")
 	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables)")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
@@ -121,6 +123,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return daemonize()
 	}
 	log := newLogger()
+
+	if f.cargoship != "" && f.indexFile != "" {
+		return fmt.Errorf("--cargoship and --index-file are mutually exclusive")
+	}
 
 	blockSize, err := parseSize(f.blockSize)
 	if err != nil {
@@ -189,9 +195,33 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 
-	ix, closeIdx, err := loadOrBuildIndex(ctx, f, client, bucket, prefix, log)
-	if err != nil {
-		return err
+	var (
+		ix       *index.Index
+		closeIdx func() error
+		manifest string // set for a --cargoship mount (recorded, shown by `lith mounts`)
+	)
+	if f.cargoship != "" {
+		// Fail-closed CargoShip mount: build the archive index in-process from the
+		// manifest. A resolution failure returns an error here — it must NEVER fall
+		// through to loadOrBuildIndex's whole-bucket listing (#137 auto-list footgun).
+		manBucket, manKey, perr := parseCargoshipManifestArg(f.cargoship, bucket)
+		if perr != nil {
+			return perr
+		}
+		if manBucket != bucket {
+			return fmt.Errorf("--cargoship manifest is in bucket %q but the mount is s3://%s; the archive chunks must be in the mounted bucket", manBucket, bucket)
+		}
+		ix, err = buildCargoshipIndex(ctx, client, bucket, manKey, f.exec, log)
+		if err != nil {
+			return err
+		}
+		manifest = manKey
+		log.Info("mounted cargoship archive", "source", "cargoship", "manifest", manKey, "keys", ix.Len())
+	} else {
+		ix, closeIdx, err = loadOrBuildIndex(ctx, f, client, bucket, prefix, log)
+		if err != nil {
+			return err
+		}
 	}
 	if closeIdx != nil {
 		defer func() { _ = closeIdx() }()
@@ -332,7 +362,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// on clean exit. Best-effort — a record failure must not fail the mount.
 	if p, werr := writeMountRecord(mountRecord{
 		PID: os.Getpid(), Mountpoint: mountpoint, Bucket: bucket, Root: root.Prefix(),
-		IndexFile: f.indexFile, Start: time.Now(),
+		IndexFile: f.indexFile, Manifest: manifest, Start: time.Now(),
 	}); werr != nil {
 		log.Warn("could not write mount record", "err", werr)
 	} else {

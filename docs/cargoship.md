@@ -21,14 +21,21 @@ walk is a handful of coalesced range GETs.
 ## Build the index and mount
 
 ```
-# 2.1 archive manifest (any upload under the archive prefix)
+# One command — build the index in-process from the manifest and mount it:
+lith mount s3://bucket /mnt/archive \
+  --cargoship s3://bucket/prefix/uploads/<id>/manifest.json.gz
+
+# Or build a reusable index file first, then mount it:
 lith index build --cargoship s3://bucket/prefix/uploads/<id>/manifest.json.gz \
   --index-file archive.idx
-lith mount s3://bucket archive.idx /mnt/archive
+lith mount s3://bucket /mnt/archive --index-file archive.idx
 ```
 
 `lith index inspect archive.idx` prints the archive id, format/features, and the
 chunk and frame counts. The index records the manifest's sha256 as provenance.
+`--cargoship` **fails closed**: a manifest that cannot be resolved (missing,
+unparseable, wrong version, encrypted) is a hard error — it never falls back to
+listing the bucket. `lith mounts` shows a CargoShip mount as `[cargoship:<key>]`.
 
 ## What the frame path costs
 
@@ -36,7 +43,11 @@ A read of a file maps to the zstd frame(s) covering its bytes in the chunk's
 uncompressed tar stream: one coalesced range GET fetches them, each frame's
 sha256 (over the compressed bytes) is verified — a mismatch is a hard `EIO`,
 never a silent bad read — and the decoded bytes cache as ordinary 1 MiB chunks.
-Decompression runs off the read path.
+Decompression runs off the read path. A **decoded-frame cache** ([#137](https://github.com/scttfrdmn/lith/issues/137))
+means each frame is fetched and decoded only once no matter how many files or
+1 MiB chunks it covers: the first fill decodes the frame; every later fill it
+covers is served with no GET and no decode. So a tree walk moves ~1× the
+archive's compressed bytes regardless of the frame size.
 
 ## Framed and frameless chunks
 
@@ -75,26 +86,22 @@ noise of native. <!-- numbers: sessions 33–34, #94 -->
   ranges), or cut sub-frames (cargoship#502).
 - **Encrypted (KMS-envelope) manifests are rejected.** 2.0 archives are
   unsupported (no `archive_offset`); re-pack with v0.24.3.
-- **Framed-chunk reads re-fetch a frame per fill** (no frame cache yet), so a
-  tree walk *over-fetches bytes* — each 1 MiB fill decodes its whole covering
-  frame and discards the rest. This shows up as **bytes, not GETs**: readahead
-  still coalesces the walk into a handful of GETs (a 1,985-file, 3-chunk archive
-  walks in ~24 GETs regardless of frame size), but the bytes moved are a multiple
-  of the archive size — 3× at the 16 MiB default (see "Choosing a frame size").
-  It is not chunk-count–dependent: a tree-order walk continues its readahead
-  across chunk boundaries, so multi-chunk archives read as cleanly as single-chunk
-  ones. Frameless plain-`.tar` chunks avoid it entirely. Tracked in
-  [#137](https://github.com/scttfrdmn/lith/issues/137).
+A tree-order walk continues its readahead across chunk boundaries, so multi-chunk
+archives read as cleanly as single-chunk ones — there is no cross-chunk penalty.
 
 ## Choosing a frame size
 
-CargoShip's `--frame-size` sets the zstd frame granularity. Because lith fetches
-whole frames, the frame size is the **over-fetch unit**: a single-file random read
-pulls its entire covering frame, and a sequential walk (until the frame cache in
-[#137](https://github.com/scttfrdmn/lith/issues/137) lands) re-fetches each frame
-once per 1 MiB fill it covers. Smaller frames move fewer wasted bytes; the cost is
-a larger frame table in the manifest. Measured on the A1 archive (1,985 small
-files, ~13 MB compressed; [`bench/results/framesize-curve.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/framesize-curve.csv)):
+lith keeps a **decoded-frame cache** ([#137](https://github.com/scttfrdmn/lith/issues/137)):
+a fetched zstd frame is decoded once and served to every fill it covers, so a
+sequential walk fetches and decodes each frame exactly once — walk bytes are ~1×
+the archive's compressed size regardless of frame size (`lith_backing_frame_reuse_total`
+counts the fills served from cache). What the frame size still governs is
+**random single-file** over-fetch: a point read of one small file pulls its whole
+covering frame, which only a smaller frame can shrink. Smaller frames move fewer
+wasted bytes on random reads; the cost is a larger frame table in the manifest.
+Measured on the A1 archive (1,985 small files, ~13 MB compressed;
+[`bench/results/framesize-curve.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/framesize-curve.csv),
+before the frame cache — the tree-walk column is now ~1× at every size):
 
 | `--frame-size` | archive | frames | tree-walk bytes | one-file read |
 |---|---|---|---|---|

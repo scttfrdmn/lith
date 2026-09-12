@@ -171,25 +171,44 @@ func buildFromCargoship(ctx context.Context, f *indexFlags, bucket, manifestKey 
 	if err != nil {
 		return nil, err
 	}
+	return buildCargoshipIndex(ctx, client, bucket, manifestKey, f.exec, log)
+}
+
+// buildCargoshipIndex resolves a CargoShip 2.1 manifest and builds the archive
+// index against the given client and bucket. It GETs the manifest (transparently
+// gunzipped), records its sha256 as provenance, parses it, walks the incremental
+// chain, and HEADs each chunk — it NEVER issues a ListObjectsV2. Every failure
+// mode (missing/unreadable manifest, unparseable body, unsupported version,
+// encrypted, or a resolution error) is returned as an error naming the manifest
+// key, so a --cargoship build or mount fails closed instead of silently falling
+// back to a whole-bucket listing (the session-36 auto-list footgun, #137).
+func buildCargoshipIndex(ctx context.Context, client s3client.API, bucket, manifestKey string, exec bool, log *slog.Logger) (*index.Index, error) {
+	if manifestKey == "" {
+		return nil, fmt.Errorf("--cargoship needs a manifest URL: s3://bucket/prefix/uploads/<id>/manifest.json[.gz]")
+	}
 	rc, gerr := client.GetObject(ctx, manifestKey, 0, 0)
 	if gerr != nil {
-		return nil, fmt.Errorf("fetch cargoship manifest: %w", gerr)
+		return nil, fmt.Errorf("fetch cargoship manifest %q: %w", manifestKey, gerr)
 	}
 	raw, rerr := io.ReadAll(io.LimitReader(rc, cargoship.MaxManifestBytes+1))
 	_ = rc.Close()
 	if rerr != nil {
-		return nil, fmt.Errorf("read cargoship manifest: %w", rerr)
+		return nil, fmt.Errorf("read cargoship manifest %q: %w", manifestKey, rerr)
 	}
 	sum := sha256.Sum256(raw)
 	data, derr := index.ReadManifestBytes(bytes.NewReader(raw))
 	if derr != nil {
-		return nil, derr
+		return nil, fmt.Errorf("cargoship manifest %q: %w", manifestKey, derr)
 	}
-	return index.BuildFromCargoshipManifest(ctx, client, index.CargoshipOptions{
-		Options:       index.Options{Bucket: bucket, Prefix: "", Exec: f.exec, Logger: log},
+	ix, berr := index.BuildFromCargoshipManifest(ctx, client, index.CargoshipOptions{
+		Options:       index.Options{Bucket: bucket, Prefix: "", Exec: exec, Logger: log},
 		ManifestBytes: data,
 		ManifestSHA:   sum,
 	})
+	if berr != nil {
+		return nil, fmt.Errorf("cargoship manifest %q: %w", manifestKey, berr)
+	}
+	return ix, nil
 }
 
 // buildFromKeys wires an explicit key-list source. The list is either --keys (a

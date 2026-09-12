@@ -51,6 +51,7 @@ type Metrics struct {
 	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
 	fillInflPk  prometheus.Gauge       // high-water mark of fill-batch runs in flight (#31)
 	backFrames  prometheus.Counter     // CargoShip frames fetched (#94)
+	backReuse   prometheus.Counter     // CargoShip frames served from the decoded-frame cache (#137)
 	backDecomp  prometheus.Counter     // CargoShip bytes decompressed (#94)
 	backCkFail  prometheus.Counter     // CargoShip per-frame checksum failures (#94)
 	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
@@ -160,6 +161,9 @@ func New() *Metrics {
 		backFrames: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_backing_frames_fetched_total", Help: "CargoShip zstd frames fetched from packed chunks (#94).",
 		}),
+		backReuse: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_backing_frame_reuse_total", Help: "CargoShip frame fills served from the decoded-frame cache — no GET, no decode (#137).",
+		}),
 		backDecomp: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_backing_decompress_bytes_total", Help: "Bytes decompressed from CargoShip frames (#94).",
 		}),
@@ -178,7 +182,7 @@ func New() *Metrics {
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
-		m.backFrames, m.backDecomp, m.backCkFail)
+		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -437,6 +441,14 @@ func (m *Metrics) FillInflightPeak(n float64) {
 func (m *Metrics) BackingFramesFetched(n int64) {
 	if m != nil && n > 0 {
 		m.backFrames.Add(float64(n))
+	}
+}
+
+// BackingFrameReuse records n CargoShip frame fills served from the decoded-frame
+// cache (no GET, no decode) (#137). Nil-safe.
+func (m *Metrics) BackingFrameReuse(n int64) {
+	if m != nil && n > 0 {
+		m.backReuse.Add(float64(n))
 	}
 }
 

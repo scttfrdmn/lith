@@ -93,7 +93,11 @@ func newMountsCmd() *cobra.Command {
 				if root == "" {
 					root = "(bucket root)"
 				}
-				_, _ = fmt.Fprintf(out, "%-24s %-10s %-14s %-8d %s  [%s]\n", r.Mountpoint, status, r.Bucket, r.PID, root, r.IndexFile)
+				source := r.IndexFile
+				if r.Manifest != "" {
+					source = "cargoship:" + r.Manifest
+				}
+				_, _ = fmt.Fprintf(out, "%-24s %-10s %-14s %-8d %s  [%s]\n", r.Mountpoint, status, r.Bucket, r.PID, root, source)
 			}
 			// lith mounts in /proc with no record (started elsewhere).
 			for _, pm := range procMountsReader() {

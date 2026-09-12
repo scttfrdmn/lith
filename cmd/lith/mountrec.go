@@ -21,6 +21,7 @@ type mountRecord struct {
 	Bucket     string    `json:"bucket"`
 	Root       string    `json:"root"`
 	IndexFile  string    `json:"index_file"`
+	Manifest   string    `json:"manifest,omitempty"` // cargoship manifest key for a --cargoship mount
 	Start      time.Time `json:"start"`
 	path       string    // the record file (not serialized)
 }

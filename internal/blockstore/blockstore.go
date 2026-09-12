@@ -110,8 +110,14 @@ type Config struct {
 	NICBytesPerSec int64
 	// TTFB seeds the rolling first-byte-latency median used to derive the gap
 	// before any fill has been measured (e.g. from the index-build HEADs).
-	TTFB     time.Duration
-	Recorder Recorder
+	TTFB time.Duration
+	// FrameCache bounds the decoded-CargoShip-frame cache (#137): a fetched zstd
+	// frame is decoded once and served to every fill it covers, so a tree walk
+	// moves ~1× the archive's compressed bytes regardless of frame size. <=0
+	// defaults to 25% of MemCache (min 64 MiB); the cache is only allocated for a
+	// CargoShip-backed mount. A frame larger than the whole budget is not cached.
+	FrameCache int64
+	Recorder   Recorder
 }
 
 // chunkState is an in-flight (or just-completed) chunk fetch. With sparse fills
@@ -166,12 +172,13 @@ type BlockStore struct {
 	// timeline is the optional per-chunk diagnostic sink (#70); nil unless the
 	// installed Recorder implements chunkTimelineRecorder. When nil the read
 	// path takes no extra clock reads or counter updates.
-	timeline  chunkTimelineRecorder
-	fill      fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
-	backing   backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
-	zdec      *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
-	zdecOnce  sync.Once
-	inflightN atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
+	timeline   chunkTimelineRecorder
+	fill       fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
+	backing    backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
+	zdec       *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
+	zdecOnce   sync.Once
+	frameCache *frameCache  // decoded CargoShip frame LRU (#137); nil when disabled
+	inflightN  atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
 	mu       sync.Mutex
 	inflight map[string]*chunkState
@@ -262,6 +269,14 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 	if r, ok := cfg.Recorder.(backingRecorder); ok {
 		bs.backing = r
 	}
+	frameBudget := cfg.FrameCache
+	if frameBudget <= 0 {
+		frameBudget = cfg.MemCache / 4
+		if frameBudget < 64<<20 {
+			frameBudget = 64 << 20
+		}
+	}
+	bs.frameCache = newFrameCache(frameBudget)
 	bs.mem.setOnEvictUnread(bs.onEvictUnread)
 	if disk != nil {
 		writers := cfg.DiskWriters
