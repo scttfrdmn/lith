@@ -75,3 +75,8 @@ noise of native. <!-- numbers: sessions 33–34, #94 -->
   ranges), or cut sub-frames (cargoship#502).
 - **Encrypted (KMS-envelope) manifests are rejected.** 2.0 archives are
   unsupported (no `archive_offset`); re-pack with v0.24.3.
+- **Framed-chunk reads re-fetch a frame per fill** (no frame cache yet), so a
+  tree walk over an archive whose files span *several* framed chunks can
+  over-fetch badly (the small-files win holds cleanly when the walk stays within
+  one chunk, and frameless plain-`.tar` chunks avoid it entirely). Tracked in
+  [#137](https://github.com/scttfrdmn/lith/issues/137).

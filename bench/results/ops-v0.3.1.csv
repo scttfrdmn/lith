@@ -1,0 +1,11 @@
+# lith v0.3.1 operations ledger — counts from CloudTrail S3 data+read-management events (neutral, not self-reported). us-east-1, c8gd.4xlarge, cold, exclusive time windows filtered to the box principal (spored-instance-role). Staged branch: sources in scttfrdmn-lith-bench (cross-account RODA data events are NOT captured by the caller's trail — verified). request rates: GET/HEAD $0.0004/1000, LIST $0.005/1000 (Price List us-east-1); in-region transfer $0; instance $0.7838/hr.
+workload,tool,wall_s,get,head,list,multipart,bytes_out,request_usd,instance_usd,total_usd
+A1,lith-cargoship-multichunk,78.67,5554,0,3,0,24076902236,0.002237,0.0171,0.0194
+A1,lith-native,7.57,1998,0,0,0,175957267,0.000799,0.0016,0.0024
+A1,mount-s3,124.38,2013,4018,4021,0,178046153,0.022517,0.0271,0.0496
+A1,copy-best,1.00,1985,0,2,0,176662832,0.000804,0.0002,0.0010
+A3-flagstat,lith-cargoship,48.51,458,0,0,0,11479255439,0.000183,0.0106,0.0107
+A3-flagstat,lith-native,47.53,0,0,0,0,0,0.000000,0.0103,0.0103
+A1,lith-cargoship-1chunk,0.65,12,0,0,0,40908598,0.000005,0.0001,0.0001
+R4,lith-native,6.43,684,0,0,0,5364081284,0.000274,0.0014,0.0017
+R4,pyarrow-native,42.32,6162,1,2,0,1004090368,0.002475,0.0092,0.0117

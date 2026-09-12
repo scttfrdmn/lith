@@ -144,6 +144,43 @@ widens with:**
   reader that saves bytes by fetching a precise slice can still lose to a
   whole-file stream if it pays more round-trips to do it (see Parquet, above).
 
+## Operations, not just time
+
+Time-to-result is one axis; bytes-touched is a second. The third — the one that
+shows up on the S3 bill and against the rate limit — is the **operations** a tool
+issues. These counts are from a **CloudTrail S3 data-event ledger**, not from any
+tool's self-report (lith's own counter matches the ledger exactly; mount-s3 and
+pyarrow don't report one). A 1,985-file tree walk, cold:
+
+| tool | GET | HEAD | LIST | total ops | request $ |
+|---|---|---|---|---|---|
+| lith-cargoship (packed, 1 chunk) | 12 | 0 | 0 | **12** | $0.000005 |
+| lith-native | 1,998 | **0** | **0** | 1,998 | $0.0008 |
+| mount-s3 | 2,013 | **4,018** | **4,021** | **10,052** | $0.0225 |
+| copy (s5cmd) | 1,985 | 0 | 2 | 1,987 | $0.0008 |
+
+The gap is two halves. **Metadata:** lith is 0 HEAD / 0 LIST — the index answers
+`stat` and `readdir` locally; mount-s3 issues a HeadObject per open and a
+ListObjects per readdir (that is its 5× ops, not data). **Data:** packing
+collapses 1,985 object GETs into 12; format plans and coalescing keep the rest
+sparse (R4 Parquet: lith 684 GETs vs pyarrow's 6,162 byte-precise ones).
+
+Three sentences on why it matters — the same op count reads three ways:
+
+- **It's small per call.** In-region a GET is $0.0004/1,000, so a single walk is
+  cents. It becomes a budget line at scale: a **10M-file** walk is ≈ **$113** on
+  mount-s3 (dominated by LISTs), **$4** on lith-native, **~$0.10** packed —
+  nightly, that is the difference between a rounding error and a line item.
+- **It's on your bill.** On a requester-pays bucket every op is billed to the
+  reader; mount-s3's 5 ops/file is 5× the invoice of lith's 1, ~800× the packed
+  path.
+- **It's your ceiling.** S3 throttles ~5,500 GET/s per prefix, so op count is a
+  fan-out ceiling: at 5 ops/file that is ~1,100 files/s, at 1 GET/file 5,500/s,
+  and a 64-node array multiplies per-node ops against the *shared* prefix.
+
+The reframe: the index makes metadata free, plans and CargoShip make data ops
+sparse — the win is **operations you never issue**. <!-- numbers: bench/results/ops-v0.3.1.csv, CloudTrail ledger, session 35 -->
+
 ## The rule
 
 **Pay for the bytes you touch, not the bytes you own.** Copy first only when you
