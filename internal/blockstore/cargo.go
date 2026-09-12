@@ -43,7 +43,11 @@ func (bs *BlockStore) decoder() *zstd.Decoder {
 // object itself (one range GET). For a CargoShip chunk it is the chunk's
 // uncompressed tar stream, served by decoding the covering zstd frames.
 func (bs *BlockStore) fetchReader(ctx context.Context, k Key, off, length int64) (io.ReadCloser, string, error) {
-	if k.Cargo == nil {
+	// A frameless (plain .tar) CargoShip chunk reads like an ordinary object: the
+	// requested offset is already a byte offset in the uncompressed tar object
+	// (the FUSE layer added the file's archive_offset), so it is a direct range
+	// GET — no decode, no per-frame checksum (#94, cargoship v0.24.3).
+	if k.Cargo == nil || len(k.Cargo.Frames) == 0 {
 		bs.record(func(r Recorder) { r.StartInflight() })
 		t0 := time.Now()
 		body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)
