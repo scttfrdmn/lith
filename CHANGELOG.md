@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-12
+
+CargoShip archive integration: mount a [CargoShip](https://github.com/scttfrdmn/cargoship)
+2.1 archive as its **original file tree** and serve reads from the packed chunks.
+Packing many small objects once and mounting them turns the many-small-objects
+case (Zarr, sharded datasets) into large-object streaming — lith's best shape.
+
+### ⚠️ Upgrade — rebuild your index
+
+On-disk **index format is now v5** (adds an optional CargoShip backing section).
+A v4 index is rejected with `index: unsupported format version 4 (this build
+writes v5); rebuild the index with lith index build`. Rebuild any saved index.
+
+### Added
+
+- **`lith index build --cargoship s3://…/manifest.json[.gz]`** ([#94](https://github.com/scttfrdmn/lith/issues/94)).
+  Builds an index whose namespace is the archive's original tree (no
+  `ListObjectsV2`). The new `internal/cargoship` parses and hardens the 2.1
+  manifest (lith#101: size cap, every offset bounds-checked, fuzzed), handling
+  dedup and split files; incremental chains (`previous_manifest_id`) fold to a
+  union-of-latest. `lith index inspect` prints archive/chunk/frame provenance.
+- **CargoShip backing read path** ([#94](https://github.com/scttfrdmn/lith/issues/94)).
+  A read of a virtual file maps to its packed chunk. **Framed** `.tar.zst` chunks:
+  the covering zstd frame(s) — one coalesced range GET, each verified by its
+  sha256-of-compressed checksum and decoded, cached as 1 MiB uncompressed chunks
+  so files sharing a chunk share the cache. **Frameless** plain-`.tar` chunks
+  (already-compressed/small content): a direct range GET at `archive_offset`, no
+  decode (requires cargoship **v0.24.3**). Mixed archives route per chunk. New
+  metrics `lith_backing_frames_fetched_total`, `lith_backing_decompress_bytes_total`,
+  `lith_backing_checksum_fail_total`.
+
+### Measured
+
+A1 tree walk (1985 small files): **0.64 s / 12 GETs vs native 14.05 s / 1998
+GETs** (22× faster). A2 one-month packed-Zarr query: **9.9 s ≤ native 10.7 s ≤
+xarray+s3fs 14.3 s**. A3 tabix on a frameless VCF: within noise of native.
+
+### Known limits
+
+- A large file that CargoShip framed as one giant zstd frame is not randomly
+  readable (a zstd frame isn't seekable); lith caps decodable frame size and
+  errors clearly. Store large already-compressed files frameless, or cut
+  sub-frames ([cargoship#502](https://github.com/scttfrdmn/cargoship/issues/502)).
+- Encrypted (KMS-envelope) manifests are rejected; 2.0 archives are unsupported.
+
+### Upstream (CargoShip) follow-ups filed
+- [cargoship#492](https://github.com/scttfrdmn/cargoship/issues/492) `archive_offset`
+  for every file — **fixed in v0.24.3** (enables the frameless read path).
+- [cargoship#493](https://github.com/scttfrdmn/cargoship/issues/493) manifest
+  records intermediate staging snapshots (lith keeps the complete entry).
+- [cargoship#494](https://github.com/scttfrdmn/cargoship/issues/494) `chunk_id`
+  identity is per-shard (lith keys chunks by `s3_key`).
+- [cargoship#502](https://github.com/scttfrdmn/cargoship/issues/502) file-boundary
+  framing makes a large file one giant non-seekable frame.
+
 ## [0.3.0] - 2026-09-10
 
 The **format-aware plan** release. lith learns the on-disk shape of the formats it
@@ -404,7 +459,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/scttfrdmn/lith/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/scttfrdmn/lith/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scttfrdmn/lith/compare/v0.2.0...v0.2.1
