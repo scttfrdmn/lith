@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-12
+
+CargoShip read efficiency and safety. The packed small-files win is now
+**universal, not archive-specific**: a tree walk moves ~1× the archive's
+compressed bytes regardless of the frame size (was up to ~3× at the 16 MiB
+default). Recommended with cargoship **v0.24.5** and `--frame-size 4MiB`.
+
+### Added
+
+- **Decoded-frame cache** for CargoShip framed reads ([#137](https://github.com/scttfrdmn/lith/issues/137)).
+  A fetched zstd frame is decoded **once** and served to every fill it covers — a
+  byte-bounded LRU keyed by (chunk object, frame offset) with a **per-frame
+  singleflight** so the concurrent prefetch fills of a large frame's many 1 MiB
+  cache chunks don't each re-fetch it. A tree walk now fetches and decodes each
+  frame exactly once at any frame size. New metric `lith_backing_frame_reuse_total`;
+  `lith_backing_decompress_bytes_total` now counts each frame once. Budget
+  defaults to 25% of the mem cache (min 64 MiB), allocated only for a CargoShip
+  mount; a frame larger than the whole budget is served but not retained.
+  Ledger-verified (CloudTrail S3 data events; lith counters match exactly), A1
+  tree walk (1,985 files, ~13.1 MB compressed archive), cold:
+
+  | frame size | before (main) | after (frame cache) |
+  |---|---|---|
+  | 16 MiB | 38.1 MB (2.9×), 23 GETs | **13.1 MB (1.0×), 11 GETs** |
+  | 4 MiB | 19.7 MB (1.5×), 23 GETs | **13.1 MB (1.0×), 23 GETs** |
+
+  A single 90 KB file's cold random read pulls only its one covering frame
+  (1.1 MB at 16 MiB); a same-frame neighbour is 0 GETs. **Packed-Zarr (A2) drops
+  2.66 GB → 0.76 GB (167 → 58 GETs)** as a side effect — Zarr chunks packed in
+  key order share frames, so the frame cache serves neighbouring chunks without
+  re-fetch; the CargoShip-plus-Zarr combination pays off twice. Frameless CRAM
+  (A3) is unchanged (flagstat fetches the file size exactly, wall within 2% of
+  native).
+
+- **`lith mount --cargoship <manifest-url>`** ([#141](https://github.com/scttfrdmn/lith/issues/141)).
+  Build the archive index in-process and mount it in one command. Mutually
+  exclusive with `--index-file`; `lith mounts` shows `[cargoship:<key>]`.
+
+### Fixed
+
+- **`--cargoship` fails closed — it never falls back to listing the bucket**
+  ([#141](https://github.com/scttfrdmn/lith/issues/141), P0). A manifest that
+  cannot be resolved (missing, unparseable, unsupported version, encrypted) is a
+  hard error naming the manifest key, for both `mount` and `index build` — with
+  **zero `ListObjectsV2`** calls (regression-tested against a fake-S3 call log).
+  Previously a failed `--cargoship` build left the index file absent, and a
+  follow-up `lith mount --index-file` then **auto-listed the whole bucket**
+  (session-36 benchmark artifact: 2,632 objects / 24 GB walked where one archive
+  was intended). The catastrophic multi-chunk "thrash" once attributed to lith
+  was this benchmark artifact, not a read-path bug; the real issue was the byte
+  over-fetch fixed above.
+
+### Docs
+
+- CargoShip page: decoded-frame cache behaviour, one-command `mount --cargoship`,
+  and "Choosing a frame size" (the tree walk is ~1× at every size; frame size now
+  governs only random single-file over-fetch). Frame-size curve in
+  [`bench/results/framesize-curve.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/framesize-curve.csv).
+
 ## [0.3.1] - 2026-09-12
 
 CargoShip archive integration: mount a [CargoShip](https://github.com/scttfrdmn/cargoship)
