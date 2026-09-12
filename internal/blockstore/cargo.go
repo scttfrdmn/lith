@@ -132,23 +132,43 @@ func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) 
 	var etag string
 	var fetched, reused, decBytes int64
 	for i := lo; i <= hi; {
-		// Cache hit: serve this frame with no GET and no decode.
-		if ub, et, ok := bs.frameCache.get(frameKey(k.Key, frames[i].CompOff)); ok {
+		key := frameKey(k.Key, frames[i].CompOff)
+		data, et, cached, fl, mine := bs.frameCache.acquire(key)
+		if cached {
 			reused++
-			if etag == "" {
-				etag = et
-			}
-			copySlice(frames[i], ub)
+			etag = et
+			copySlice(frames[i], data)
 			i++
 			continue
 		}
-		// Gather a maximal run of consecutive missing frames [i,j], fetched in one
-		// range GET (they are contiguous in compressed space).
+		if !mine {
+			// Another fill owns this frame's fetch+decode — wait for it and serve
+			// its decoded bytes (no GET, no decode of our own).
+			<-fl.done
+			if fl.err != nil {
+				return nil, "", fl.err
+			}
+			reused++
+			etag = fl.etag
+			copySlice(frames[i], fl.data)
+			i++
+			continue
+		}
+		// We own frame i. Extend a run over consecutive frames we can also claim
+		// (not cached, not owned by another fill) so contiguous misses coalesce
+		// into one range GET.
+		flights := []*frameFlight{fl}
 		j := i
-		for j+1 <= hi && !bs.frameCache.has(frameKey(k.Key, frames[j+1].CompOff)) {
+		for j+1 <= hi {
+			_, _, c2, fl2, m2 := bs.frameCache.acquire(frameKey(k.Key, frames[j+1].CompOff))
+			if !m2 {
+				_ = c2 // cached or in-flight elsewhere: end the run, handle on the next iteration
+				break
+			}
+			flights = append(flights, fl2)
 			j++
 		}
-		et, db, err := bs.fetchFrameRun(ctx, k, frames, i, j, copySlice)
+		et, db, err := bs.fetchFrameRun(ctx, k, frames, i, j, flights, copySlice)
 		if err != nil {
 			return nil, "", err
 		}
@@ -167,10 +187,23 @@ func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) 
 }
 
 // fetchFrameRun GETs the compressed span of frames [lo,hi] (contiguous in
-// compressed space) in one request, verifies each frame's checksum, decodes it,
-// caches the decoded bytes, and copies each frame's overlap into out via copy.
-// It returns the chunk object's ETag and the total bytes decoded.
-func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargoship.Frame, lo, hi int, emit func(cargoship.Frame, []byte)) (string, int64, error) {
+// compressed space, all owned by this caller via flights) in one request,
+// verifies each frame's checksum, decodes it, publishes it to the frame cache
+// (waking any waiters), and copies each frame's overlap into out via emit. On
+// any error the run's still-unpublished flights are failed with that error so
+// waiters do not hang. Returns the chunk object's ETag and total bytes decoded.
+func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargoship.Frame, lo, hi int, flights []*frameFlight, emit func(cargoship.Frame, []byte)) (etag string, decBytes int64, err error) {
+	// Ensure every owned flight is resolved, even on an early error, so no waiter
+	// hangs. published tracks how many we have fulfilled already.
+	published := 0
+	defer func() {
+		if err != nil {
+			for n := published; n < len(flights); n++ {
+				bs.frameCache.fulfill(frameKey(k.Key, frames[lo+n].CompOff), flights[n], nil, "", err)
+			}
+		}
+	}()
+
 	compStart := frames[lo].CompOff
 	compEnd := frames[hi].CompOff + frames[hi].CompLen
 	compLen := compEnd - compStart
@@ -180,10 +213,10 @@ func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargosh
 
 	bs.record(func(r Recorder) { r.StartInflight() })
 	t0 := time.Now()
-	body, etag, err := bs.src.GetRangeReader(ctx, k.Key, compStart, compLen)
-	bs.record(func(r Recorder) { r.S3Get(compLen, err != nil); r.EndInflight() })
-	if err != nil {
-		return "", 0, err
+	body, et, gerr := bs.src.GetRangeReader(ctx, k.Key, compStart, compLen)
+	bs.record(func(r Recorder) { r.S3Get(compLen, gerr != nil); r.EndInflight() })
+	if gerr != nil {
+		return "", 0, gerr
 	}
 	bs.recordTTFB(time.Since(t0))
 	comp, rerr := io.ReadAll(body)
@@ -196,29 +229,29 @@ func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargosh
 	}
 
 	dec := bs.decoder()
-	var decBytes int64
 	for i := lo; i <= hi; i++ {
 		f := frames[i]
 		cs := f.CompOff - compStart
 		if cs < 0 || cs+f.CompLen > int64(len(comp)) {
-			return "", 0, fmt.Errorf("cargoship: frame %d compressed span out of run", i)
+			return "", decBytes, fmt.Errorf("cargoship: frame %d compressed span out of run", i)
 		}
 		cb := comp[cs : cs+f.CompLen]
 		if f.HasSum && sha256.Sum256(cb) != f.Sum {
 			bs.recordBacking(func(r backingRecorder) { r.BackingChecksumFail() })
 			bs.markStale(k.Key)
-			return "", 0, ErrStale
+			return "", decBytes, ErrStale
 		}
 		ub, derr := dec.DecodeAll(cb, nil)
 		if derr != nil {
-			return "", 0, fmt.Errorf("cargoship: decode frame %d: %w", i, derr)
+			return "", decBytes, fmt.Errorf("cargoship: decode frame %d: %w", i, derr)
 		}
 		if int64(len(ub)) != f.UncompLen {
-			return "", 0, fmt.Errorf("cargoship: frame %d decoded to %d bytes, want %d", i, len(ub), f.UncompLen)
+			return "", decBytes, fmt.Errorf("cargoship: frame %d decoded to %d bytes, want %d", i, len(ub), f.UncompLen)
 		}
 		decBytes += int64(len(ub))
-		bs.frameCache.put(frameKey(k.Key, f.CompOff), ub, etag)
+		bs.frameCache.fulfill(frameKey(k.Key, f.CompOff), flights[i-lo], ub, et, nil)
+		published++
 		emit(f, ub)
 	}
-	return etag, decBytes, nil
+	return et, decBytes, nil
 }

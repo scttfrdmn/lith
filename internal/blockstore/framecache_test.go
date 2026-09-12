@@ -220,6 +220,43 @@ func TestFrameCacheBudgetOversizedFrameNotCached(t *testing.T) {
 	}
 }
 
+// TestFrameCacheSingleflightConcurrent: many concurrent reads of DIFFERENT 1 MiB
+// chunks all covered by ONE frame collapse to a single GET and a single decode —
+// the singleflight that the block store's per-chunk singleflight cannot provide
+// (a big frame spans chunks filled by separate concurrent operations). Without
+// it, each concurrent fill would re-fetch and re-decode the same frame.
+func TestFrameCacheSingleflightConcurrent(t *testing.T) {
+	srv := fake.New()
+	const frameU = int64(8) << 20 // one frame spanning 8 one-MiB chunks
+	srv.GetDelay = 30 * time.Millisecond
+	rec := &backRec{}
+	k, master := makeFramedChunk(t, srv, "sf.tar.zst", 1, frameU)
+	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, Recorder: rec})
+
+	var wg sync.WaitGroup
+	for c := int64(0); c < 8; c++ { // one read in each distinct 1 MiB chunk
+		off := c * mib
+		wg.Add(1)
+		go func(off int64) {
+			defer wg.Done()
+			got, err := bs.GetRange(context.Background(), k, off, 4096, frameU)
+			if err != nil || string(got) != string(master[off:off+4096]) {
+				t.Errorf("read at %d: err=%v", off, err)
+			}
+		}(off)
+	}
+	wg.Wait()
+	if g := atomic.LoadInt64(&rec.get); g != 1 {
+		t.Errorf("S3 GETs = %d, want 1 (singleflight dedups concurrent same-frame fills)", g)
+	}
+	if f := atomic.LoadInt64(&rec.frames); f != 1 {
+		t.Errorf("frames fetched = %d, want 1", f)
+	}
+	if d := atomic.LoadInt64(&rec.decomp); d != frameU {
+		t.Errorf("decompress = %d, want %d (one decode)", d, frameU)
+	}
+}
+
 // TestFrameCacheConcurrentRace exercises the frame cache under concurrent reads
 // sharing frames (run with -race).
 func TestFrameCacheConcurrentRace(t *testing.T) {
