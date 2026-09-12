@@ -38,24 +38,40 @@ sha256 (over the compressed bytes) is verified — a mismatch is a hard `EIO`,
 never a silent bad read — and the decoded bytes cache as ordinary 1 MiB chunks.
 Decompression runs off the read path.
 
-## Measured (A1: many small objects)
+## Framed and frameless chunks
 
-`changelog_details` (1000genomes), packed with `cargoship upload --frame-size
-16MiB`; full tree walk (`find … -exec cat`), cold, c8gd.4xlarge, us-east-1.
+A 2.1 archive mixes two chunk kinds, and lith reads both:
 
-| files | lith-cargoship | lith-native (per-object) |
+- **Framed `.tar.zst`** (compressible content): a read maps to the covering zstd
+  frame(s) — one coalesced range GET, checksum-verified, decoded.
+- **Frameless plain `.tar`** (already-compressed or small content — a `.vcf.gz`,
+  an index sibling, a Zarr chunk): a read is a **direct range GET** at the file's
+  `archive_offset`, no decode. This needs `archive_offset` on every file, which
+  CargoShip records from **v0.24.3** (older archives with a null offset on a
+  frameless file are rejected with an upgrade message).
+
+## Measured
+
+`c8gd.4xlarge`, us-east-1, cold; lith-cargoship vs the in-place reader.
+
+| workload | lith-cargoship | comparison |
 |---|---|---|
-| 600 | **0.34 s**, 8 GETs | 2.56 s, 604 GETs |
-| 1985 | **0.64 s**, 12 GETs | 14.05 s, 1998 GETs |
+| **A1** tree walk, 1985 small files | **0.64 s**, 12 GETs | native per-object 14.05 s, 1998 GETs |
+| **A1** tree walk, 600 small files | **0.34 s**, 8 GETs | native 2.56 s, 604 GETs |
+| **A2** one-month Zarr query (packed NWM chrtout) | **9.9 s**, 184 GETs | lith-native raw 10.7 s; xarray+s3fs 14.3 s |
+| **A3** tabix region (frameless VCF) | **0.5 s**, 4 GETs | native 0.5 s, 28 GETs |
 
-**7.5×–22× faster, ~150× fewer GETs.** Metadata (`stat`) is served from the index
-— zero S3. <!-- number: session 33, #94 -->
+A1 is **7.5×–22× faster** with ~150× fewer GETs; `stat` is index-served (0 S3).
+A2 (packed Zarr) beats both raw-native and s3fs. A3's frameless VCF is within
+noise of native. <!-- numbers: sessions 33–34, #94 -->
 
 ## Limits (this release)
 
-lith reads **fully-framed** 2.1 archives. CargoShip routes already-compressed or
-small content (a `.vcf.gz`, an index sibling, a Zarr chunk) into plain, unframed
-`.tar` chunks; lith rejects those with a clear message for now. Pack a
-compressible tree for the streaming win; mixed archives (the direct-range /
-header-walk path) are tracked for a later release. Encrypted (KMS-envelope)
-manifests are rejected.
+- **A large file framed as one giant zstd frame is not readable.** CargoShip
+  frames only at file boundaries, so a large *compressible-looking* file (it
+  framed a 3.5 GB CRAM) becomes one multi-GB frame — a zstd frame isn't
+  seekable, so lith caps decodable frame size and errors clearly. Store large,
+  already-compressed files in frameless `.tar` chunks (lith reads those as direct
+  ranges), or cut sub-frames (cargoship#502).
+- **Encrypted (KMS-envelope) manifests are rejected.** 2.0 archives are
+  unsupported (no `archive_offset`); re-pack with v0.24.3.
