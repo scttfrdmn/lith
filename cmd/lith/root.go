@@ -21,6 +21,7 @@ func newRootCmd() *cobra.Command {
 		newVersionCmd(),
 		newIndexCmd(),
 		newMountCmd(),
+		newServeCmd(),
 		newBenchCmd(),
 		newMountsCmd(),
 		newUmountCmd(),
