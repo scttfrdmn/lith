@@ -50,6 +50,9 @@ type Metrics struct {
 	fillBatchSz prometheus.Histogram   // ranges per fill batch (#124/session 30)
 	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
 	fillInflPk  prometheus.Gauge       // high-water mark of fill-batch runs in flight (#31)
+	nfsClients  prometheus.Gauge       // active NFS gateway clients (#143)
+	nfsOps      *prometheus.CounterVec // NFS ops by op= (#143)
+	nfsReadByte prometheus.Counter     // bytes served over NFS READ (#143)
 	backFrames  prometheus.Counter     // CargoShip frames fetched (#94)
 	backReuse   prometheus.Counter     // CargoShip frames served from the decoded-frame cache (#137)
 	backDecomp  prometheus.Counter     // CargoShip bytes decompressed (#94)
@@ -158,6 +161,15 @@ func New() *Metrics {
 		fillInflPk: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "lith_fill_inflight_peak", Help: "High-water mark of fill-batch range GETs in flight since mount (#31).",
 		}),
+		nfsClients: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lith_nfs_clients", Help: "Active NFS gateway clients (#143).",
+		}),
+		nfsOps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_nfs_ops_total", Help: "NFS gateway operations by type (#143).",
+		}, []string{"op"}),
+		nfsReadByte: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_nfs_read_bytes_total", Help: "Bytes served over NFS READ (#143).",
+		}),
 		backFrames: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_backing_frames_fetched_total", Help: "CargoShip zstd frames fetched from packed chunks (#94).",
 		}),
@@ -182,7 +194,8 @@ func New() *Metrics {
 		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
-		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail)
+		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
+		m.nfsClients, m.nfsOps, m.nfsReadByte)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -441,6 +454,27 @@ func (m *Metrics) FillInflightPeak(n float64) {
 func (m *Metrics) BackingFramesFetched(n int64) {
 	if m != nil && n > 0 {
 		m.backFrames.Add(float64(n))
+	}
+}
+
+// NFSClients adds delta to the active-NFS-clients gauge (#143). Nil-safe.
+func (m *Metrics) NFSClients(delta int) {
+	if m != nil {
+		m.nfsClients.Add(float64(delta))
+	}
+}
+
+// NFSOp increments the NFS op counter for op (#143). Nil-safe.
+func (m *Metrics) NFSOp(op string) {
+	if m != nil {
+		m.nfsOps.WithLabelValues(op).Inc()
+	}
+}
+
+// NFSReadBytes records n bytes served over NFS READ (#143). Nil-safe.
+func (m *Metrics) NFSReadBytes(n int64) {
+	if m != nil && n > 0 {
+		m.nfsReadByte.Add(float64(n))
 	}
 }
 
