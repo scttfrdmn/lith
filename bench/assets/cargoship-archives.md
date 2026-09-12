@@ -26,3 +26,15 @@ Drivers: `bench/cargoship/bootstrap.sh`, `bench/cargoship/run_a1.sh`.
 ## Notes
 - A committed read-path fixture (small, deterministic) lives at `internal/cargoship/testdata/fixture/` (manifest + 38 KB chunk).
 - CargoShip records intermediate staging snapshots of a chunk under one `s3_key`; the resolver keeps the complete (max `compressed_size`) entry. Chunk `id` is only unique within a shard, so chunks are keyed by `s3_key`.
+
+## Session 34 (cargoship v0.24.3, frameless backing)
+
+Re-uploaded with v0.24.3 (`archive_offset` on every file); 7-day lifecycle, **expires ~2026-09-19**.
+
+| archive | prefix | manifest sha256 | notes |
+|---|---|---|---|
+| **A3 mixed** | `a3-243/` | `d5663cd90eb66020c4bdd53aa539e75e078316918a5edf96f735cb1bf5946267` | CRAM framed (giant frame, unreadable — cargoship#502); VCF/crai/tbi frameless (readable) |
+| **A2 packed-Zarr** | `a2-zarr/` | `b836bdaf5ce13b832e4e60fc1c23c3d423a329e2e6887a7d291ec52647caf090` | 104 files (one-month streamflow selection) → 4 framed chunks; A2 criterion MET |
+| A2 native-raw | `zarr-native/chrtout.zarr/` | — | raw staged chunks for the lith-native comparison |
+
+Drivers: `bench/cargoship/{bootstrap34.sh,run_a3.sh,run_a1.sh}`, plus A2 `/tmp/run_a2.sh`+`pyq_a2.py` (one-month streamflow query).
