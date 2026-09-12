@@ -76,7 +76,39 @@ noise of native. <!-- numbers: sessions 33–34, #94 -->
 - **Encrypted (KMS-envelope) manifests are rejected.** 2.0 archives are
   unsupported (no `archive_offset`); re-pack with v0.24.3.
 - **Framed-chunk reads re-fetch a frame per fill** (no frame cache yet), so a
-  tree walk over an archive whose files span *several* framed chunks can
-  over-fetch badly (the small-files win holds cleanly when the walk stays within
-  one chunk, and frameless plain-`.tar` chunks avoid it entirely). Tracked in
+  tree walk *over-fetches bytes* — each 1 MiB fill decodes its whole covering
+  frame and discards the rest. This shows up as **bytes, not GETs**: readahead
+  still coalesces the walk into a handful of GETs (a 1,985-file, 3-chunk archive
+  walks in ~24 GETs regardless of frame size), but the bytes moved are a multiple
+  of the archive size — 3× at the 16 MiB default (see "Choosing a frame size").
+  It is not chunk-count–dependent: a tree-order walk continues its readahead
+  across chunk boundaries, so multi-chunk archives read as cleanly as single-chunk
+  ones. Frameless plain-`.tar` chunks avoid it entirely. Tracked in
   [#137](https://github.com/scttfrdmn/lith/issues/137).
+
+## Choosing a frame size
+
+CargoShip's `--frame-size` sets the zstd frame granularity. Because lith fetches
+whole frames, the frame size is the **over-fetch unit**: a single-file random read
+pulls its entire covering frame, and a sequential walk (until the frame cache in
+[#137](https://github.com/scttfrdmn/lith/issues/137) lands) re-fetches each frame
+once per 1 MiB fill it covers. Smaller frames move fewer wasted bytes; the cost is
+a larger frame table in the manifest. Measured on the A1 archive (1,985 small
+files, ~13 MB compressed; [`bench/results/framesize-curve.csv`](https://github.com/scttfrdmn/lith/blob/main/bench/results/framesize-curve.csv)):
+
+| `--frame-size` | archive | frames | tree-walk bytes | one-file read |
+|---|---|---|---|---|
+| 16 MiB (current default) | 13.1 MB | 13 | 40.0 MB (3.0×) | 3.30 MB |
+| 8 MiB | 13.1 MB | 22 | 25.6 MB (2.0×) | 1.70 MB |
+| **4 MiB** | 13.1 MB | 42 | **20.2 MB (1.5×)** | **0.60 MB** |
+| 1 MiB | 13.2 MB | 152 | 15.0 MB (1.1×) | 0.90 MB |
+
+The **archive size is flat** across frame sizes (zstd's per-frame context reset
+costs almost nothing on this content), so smaller frames are close to free on
+storage while cutting over-fetch sharply. The knee is **4 MiB**: over-fetch drops
+from 3.0× to 1.5× and a single-file read from 3.3 MB to 0.6 MB, then flattens
+while the frame table keeps growing. **Pack with `--frame-size 4MiB`** for
+mount-heavy archives (recommended as the cargoship default in
+[cargoship#512](https://github.com/scttfrdmn/cargoship/issues/512)); use frameless
+chunks for already-compressed large files, which pay no over-fetch at all.
+<!-- numbers: bench/results/framesize-curve.csv, CloudTrail ledger, session 36 -->
