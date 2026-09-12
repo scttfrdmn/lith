@@ -34,9 +34,12 @@ default). Recommended with cargoship **v0.24.5** and `--frame-size 4MiB`.
   | 4 MiB | 19.7 MB (1.5×), 23 GETs | **13.1 MB (1.0×), 23 GETs** |
 
   A single 90 KB file's cold random read pulls only its one covering frame
-  (1.1 MB at 16 MiB); a same-frame neighbour is 0 GETs. Packed-Zarr (A2) also
-  improves (2.66 GB → 0.76 GB, 167 → 58 GETs). Frameless CRAM (A3) is unchanged
-  (flagstat fetches the file size exactly, wall within 2% of native).
+  (1.1 MB at 16 MiB); a same-frame neighbour is 0 GETs. **Packed-Zarr (A2) drops
+  2.66 GB → 0.76 GB (167 → 58 GETs)** as a side effect — Zarr chunks packed in
+  key order share frames, so the frame cache serves neighbouring chunks without
+  re-fetch; the CargoShip-plus-Zarr combination pays off twice. Frameless CRAM
+  (A3) is unchanged (flagstat fetches the file size exactly, wall within 2% of
+  native).
 
 - **`lith mount --cargoship <manifest-url>`** ([#141](https://github.com/scttfrdmn/lith/issues/141)).
   Build the archive index in-process and mount it in one command. Mutually

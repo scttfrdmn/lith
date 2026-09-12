@@ -112,10 +112,13 @@ before the frame cache — the tree-walk column is now ~1× at every size):
 
 The **archive size is flat** across frame sizes (zstd's per-frame context reset
 costs almost nothing on this content), so smaller frames are close to free on
-storage while cutting over-fetch sharply. The knee is **4 MiB**: over-fetch drops
-from 3.0× to 1.5× and a single-file read from 3.3 MB to 0.6 MB, then flattens
-while the frame table keeps growing. **Pack with `--frame-size 4MiB`** for
-mount-heavy archives (recommended as the cargoship default in
-[cargoship#512](https://github.com/scttfrdmn/cargoship/issues/512)); use frameless
-chunks for already-compressed large files, which pay no over-fetch at all.
-<!-- numbers: bench/results/framesize-curve.csv, CloudTrail ledger, session 36 -->
+storage. **The frame size no longer matters for a sequential walk** — the frame
+cache makes it ~1× at every size (the tree-walk column above is pre-cache). It
+**still matters for random single-file access**: a point read pulls its whole
+covering frame either way, so a smaller frame wastes fewer bytes (0.6 MB at 4 MiB
+vs 3.3 MB at 16 MiB). If your access is random rather than a full walk, **pack
+with `--frame-size 4MiB`** (the curve's knee; recommended as the cargoship default
+in [cargoship#512](https://github.com/scttfrdmn/cargoship/issues/512)); use
+frameless chunks for already-compressed large files, which pay no over-fetch at
+all.
+<!-- numbers: bench/results/framesize-curve.csv, CloudTrail ledger, sessions 36–37 -->
