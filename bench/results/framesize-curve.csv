@@ -1,0 +1,9 @@
+# A1 frame-size curve — 1985 small files, cargoship v0.24.5, c8gd.4xlarge us-east-1, cold.
+# archive_MB = sum of chunk compressed_size from manifest; frames = sum over chunks.
+# walk_* = tree-order `find -type f -exec cat`; 1file_* = one 90KB file, fresh cold mount.
+# Numbers via lith metrics (== CloudTrail ledger, cross-checked session 35). Session 36, #137/#512.
+frame_MiB,archive_MB,frames,chunks,walk_gets,walk_MB,walk_overfetch_x,1file_gets,1file_MB
+16,13.1,13,3,25,40.0,3.0,4,3.30
+8,13.1,22,3,23,25.6,2.0,3,1.70
+4,13.1,42,3,25,20.2,1.5,2,0.60
+1,13.2,152,3,23,15.0,1.1,2,0.90
