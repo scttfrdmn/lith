@@ -59,11 +59,11 @@ type rawFileEntry struct {
 	ModTime       time.Time `json:"mod_time"`
 	ChunkID       int       `json:"chunk_id"`
 	S3Key         string    `json:"s3_key"`
-	Offset        int64     `json:"offset"`      // start offset within the file for a split part
-	Length        int64     `json:"length"`      // length of this part (0 = full file)
-	PartIndex     int       `json:"part_index"`  // 0 for a non-split file
-	TotalParts    int       `json:"total_parts"` // 0 or 1 for a non-split file
-	ArchiveOffset int64     `json:"archive_offset"`
+	Offset        int64     `json:"offset"`         // start offset within the file for a split part
+	Length        int64     `json:"length"`         // length of this part (0 = full file)
+	PartIndex     int       `json:"part_index"`     // 0 for a non-split file
+	TotalParts    int       `json:"total_parts"`    // 0 or 1 for a non-split file
+	ArchiveOffset *int64    `json:"archive_offset"` // pointer: nil distinguishes a v0.24.2 null-on-frameless file from a genuine 0
 	Checksum      string    `json:"checksum"`
 	IsDuplicate   bool      `json:"is_duplicate"`
 	DupOfHash     string    `json:"duplicate_of_hash"`
@@ -120,9 +120,11 @@ func Parse(b []byte) (*Manifest, error) {
 	if rm.Version != "2.1" {
 		return nil, fmt.Errorf("cargoship manifest: version %q is not supported — lith reads format 2.1 (upgrade the archive with cargoship v0.24.0+; the 2.0 offset sidecar is out of scope, see cargoship#437)", rm.Version)
 	}
-	if !hasFeature(rm.FormatFeatures, "frames") {
-		return nil, fmt.Errorf("cargoship manifest: no %q feature — this build reads only framed 2.1 archives written by cargoship v0.24.0+ (rebuild with --frame-size)", "frames")
-	}
+	// A 2.1 archive is read via per-chunk frame tables (framed chunks) and/or each
+	// file's archive_offset (frameless plain-.tar chunks, cargoship v0.24.3). The
+	// "frames" feature is a capability hint, not required — an archive of only
+	// incompressible content may have no framed chunks. The real contract, a
+	// non-null archive_offset on every file, is enforced in Resolve.
 	if len(rm.Chunks) == 0 {
 		return nil, fmt.Errorf("cargoship manifest: no chunks (a direct-upload manifest has no framed archive to mount)")
 	}
@@ -135,8 +137,11 @@ func Parse(b []byte) (*Manifest, error) {
 		if c.CompressedSize < 0 || c.UncompressedSize < 0 {
 			return nil, fmt.Errorf("cargoship manifest: chunk %d has negative size", ci)
 		}
+		// A frameless (plain .tar) chunk is valid: reads are direct ranges at each
+		// file's archive_offset (v0.24.3). Only framed chunks carry a frame index,
+		// which must tile the chunk contiguously.
 		if len(c.Frames) == 0 {
-			return nil, fmt.Errorf("cargoship manifest: chunk %d (%s) has no frame index — lith reads fully-framed 2.1 archives only; CargoShip stores already-compressed or small content in plain (unframed) .tar chunks, whose direct-range/header-walk read path is not implemented yet. Pack a compressible tree, or wait for plain-.tar support", ci, c.S3Key)
+			continue
 		}
 		var wantU int64
 		for fi := range c.Frames {
@@ -169,15 +174,6 @@ func Parse(b []byte) (*Manifest, error) {
 		Files:              rm.Files,
 		Chunks:             rm.Chunks,
 	}, nil
-}
-
-func hasFeature(feats []string, want string) bool {
-	for _, f := range feats {
-		if f == want {
-			return true
-		}
-	}
-	return false
 }
 
 // relPath turns a manifest file path (which may be absolute under source_path,

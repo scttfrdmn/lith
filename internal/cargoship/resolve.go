@@ -101,8 +101,17 @@ func (m *Manifest) Resolve() (*Archive, error) {
 		}
 		sortFramesByUncomp(frames)
 		var total int64
-		for _, fr := range frames {
-			total += fr.UncompLen
+		if len(frames) == 0 {
+			// Frameless (plain .tar) chunk: the object IS the uncompressed tar stream
+			// that archive_offset indexes; its size is the object size.
+			total = rc.CompressedSize
+			if total == 0 {
+				total = rc.UncompressedSize
+			}
+		} else {
+			for _, fr := range frames {
+				total += fr.UncompLen
+			}
 		}
 		chunks[idx] = Chunk{Key: resolveChunkKey(m.Prefix, rc.S3Key), UncompTotal: total, Frames: frames}
 		keyToIdx[rc.S3Key] = idx
@@ -154,11 +163,14 @@ func (m *Manifest) Resolve() (*Archive, error) {
 		if !ok {
 			return Part{}, fmt.Errorf("cargoship: file %q references unknown chunk %q", fe.Path, src.S3Key)
 		}
+		if src.ArchiveOffset == nil {
+			return Part{}, fmt.Errorf("cargoship: file %q has a null archive_offset — CargoShip v0.24.0–.2 omitted it for files in plain (unframed) .tar chunks; re-pack the archive with cargoship v0.24.3+ (which records archive_offset for every file)", fe.Path)
+		}
 		length := fe.Length
 		if length == 0 { // full file
 			length = fe.Size
 		}
-		p := Part{ChunkIndex: ci, ArchiveOffset: src.ArchiveOffset, FileOffset: fe.Offset, Length: length}
+		p := Part{ChunkIndex: ci, ArchiveOffset: *src.ArchiveOffset, FileOffset: fe.Offset, Length: length}
 		if p.ArchiveOffset < 0 || p.Length < 0 || p.FileOffset < 0 {
 			return Part{}, fmt.Errorf("cargoship: file %q has a negative offset/length", fe.Path)
 		}

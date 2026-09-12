@@ -3,6 +3,8 @@
 package blockstore
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -178,3 +180,46 @@ func TestCargoConcurrentReadsRace(t *testing.T) {
 }
 
 func sha256sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+
+// TestCargoFramelessDirectRange: a frameless (plain .tar) chunk is read by
+// direct range GET at archive_offset — no decode, no per-frame checksum. Two
+// files in one frameless chunk share the cached 1 MiB chunk (one GET).
+func TestCargoFramelessDirectRange(t *testing.T) {
+	// Build a plain tar with two files; record each file's data offset.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	fileA := bytes.Repeat([]byte("A"), 1000)
+	fileB := bytes.Repeat([]byte("B"), 2000)
+	offA := int64(512) // first header is 512 bytes; data follows
+	_ = tw.WriteHeader(&tar.Header{Name: "a.bin", Size: int64(len(fileA)), Mode: 0o644})
+	_, _ = tw.Write(fileA)
+	// A's data is padded to a 512 multiple, then B's 512 header, then B's data.
+	offB := offA + roundUp512(int64(len(fileA))) + 512
+	_ = tw.WriteHeader(&tar.Header{Name: "b.bin", Size: int64(len(fileB)), Mode: 0o644})
+	_, _ = tw.Write(fileB)
+	_ = tw.Close()
+	tarBytes := buf.Bytes()
+
+	srv := fake.New()
+	srv.Put("plain.tar", tarBytes, time.Unix(1_700_000_000, 0))
+	k := keyFor(t, srv, "plain.tar")
+	k.Cargo = &CargoChunk{Frames: nil, UncompTotal: int64(len(tarBytes))} // frameless
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20})
+	total := int64(len(tarBytes))
+
+	da, err := bs.GetRange(context.Background(), k, offA, int64(len(fileA)), total)
+	if err != nil || !bytes.Equal(da, fileA) {
+		t.Fatalf("frameless read A: err=%v equal=%v", err, bytes.Equal(da, fileA))
+	}
+	// B lives in the same 1 MiB chunk → served from cache, no new GET.
+	before := srv.GetCallCount()
+	db, err := bs.GetRange(context.Background(), k, offB, int64(len(fileB)), total)
+	if err != nil || !bytes.Equal(db, fileB) {
+		t.Fatalf("frameless read B: err=%v equal=%v", err, bytes.Equal(db, fileB))
+	}
+	if after := srv.GetCallCount(); after != before {
+		t.Fatalf("second frameless read issued %d new GET(s); expected a shared-chunk cache hit", after-before)
+	}
+}
+
+func roundUp512(n int64) int64 { return (n + 511) &^ 511 }
