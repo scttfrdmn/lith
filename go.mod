@@ -9,10 +9,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.3
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.330.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.111.0
+	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.19.1
 	github.com/prometheus/client_golang v1.24.1
-	github.com/spf13/cobra v1.8.1
+	github.com/spf13/cobra v1.10.2
+	github.com/willscott/go-nfs v0.0.4
 	github.com/zeebo/xxh3 v1.0.2
 )
 
@@ -33,7 +35,6 @@ require (
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-git/go-billy/v5 v5.9.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -41,8 +42,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/willscott/go-nfs v0.0.4 // indirect
+	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
