@@ -289,6 +289,40 @@ func TestLocate(t *testing.T) {
 	}
 }
 
+func TestLocateRange(t *testing.T) {
+	m, ok := ParseParquetFooter(build4x6Footer())
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	set := func(ls []Located) map[string]bool {
+		s := map[string]bool{}
+		for _, l := range ls {
+			s[fmt.Sprintf("%d:%s", l.RowGroup, l.Path)] = true
+		}
+		return s
+	}
+	// A read that STARTS in the gap before RG1.c2 but spans into it resolves to c2 —
+	// the case start-offset-only Locate misses (e.g. a header read covering the first
+	// column). c2 = [base(1,2), base(1,2)+clen(2)).
+	got := set(m.LocateRange(base(1, 2)-50, base(1, 2)+10))
+	if !got["1:c2"] || len(got) != 1 {
+		t.Errorf("gap-start read: got %v, want just 1:c2", got)
+	}
+	// A read spanning RG1.c2 and RG1.c3 resolves to both.
+	got = set(m.LocateRange(base(1, 2)+5, base(1, 3)+5))
+	if !got["1:c2"] || !got["1:c3"] || len(got) != 2 {
+		t.Errorf("two-column span: got %v, want 1:c2 and 1:c3", got)
+	}
+	// A read wholly inside a gap (between c2's end and c3's start) resolves to none.
+	if r := m.LocateRange(base(1, 2)+clen(2)+10, base(1, 2)+clen(2)+50); len(r) != 0 {
+		t.Errorf("in-gap read: got %v, want none", r)
+	}
+	// Degenerate range.
+	if r := m.LocateRange(base(1, 2), base(1, 2)); r != nil {
+		t.Errorf("empty range: got %v, want nil", r)
+	}
+}
+
 func TestProjectionChunks(t *testing.T) {
 	m, ok := ParseParquetFooter(build4x6Footer())
 	if !ok {

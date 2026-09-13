@@ -130,21 +130,26 @@ func (f *rawFS) maybeFooterReadahead(relPath string, h *fileHandle, size int64) 
 // result, the learned projection, the dispatched set), so the whole hook runs
 // under the handle's footerMu. The one-time parse's GetRange runs under the lock
 // too — it blocks only the first concurrent reads on this handle, once.
-func (f *rawFS) footerReadExtend(h *fileHandle, off int64) {
+func (f *rawFS) footerReadExtend(h *fileHandle, off, end int64) {
 	h.footerMu.Lock()
 	defer h.footerMu.Unlock()
 	switch h.footerKind {
 	case footer.FormatParquet:
-		f.footerParquetRead(h, off)
+		f.footerParquetRead(h, off, end)
 	case footer.FormatZip:
 		f.footerZipRead(h, off)
 	}
 }
 
-// footerParquetRead maps a demand read to (row group, column), learns the
-// projection, and prefetches that row group's projection columns (current row
-// group only — no cross-row-group speculation; see the package comment).
-func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
+// footerParquetRead maps a demand read [off,end) to the column chunks it spans,
+// learns the projection, and prefetches that row group's projection columns
+// (current row group only — no cross-row-group speculation; see the package
+// comment). It records EVERY column the read overlaps (LocateRange), not just the
+// one at the start offset: a coalesced read spans several columns, and a read that
+// begins in the padding before a column (off=0 precedes id.Start=4) still covers
+// it — start-offset-only mapping missed the first column for any header-reading
+// reader and mislearned a coalesced read as its leading column (#125 session 43).
+func (f *rawFS) footerParquetRead(h *fileHandle, off, end int64) {
 	if h.footerProj == nil {
 		return
 	}
@@ -162,17 +167,19 @@ func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
 	if p.planned {
 		return // one-shot plan already fired; remaining reads are demand-served
 	}
-	rg, col, ok := h.footerMeta.Locate(off)
-	if !ok {
+	located := h.footerMeta.LocateRange(off, end)
+	if len(located) == 0 {
 		return // the footer itself or a gap between chunks
 	}
-	if p.colRGs[col] == nil {
-		p.colRGs[col] = map[int]bool{}
-	}
-	p.colRGs[col][rg] = true
-	p.rgsSeen[rg] = true
-	if rg > p.maxRG {
-		p.maxRG = rg
+	for _, l := range located {
+		if p.colRGs[l.Path] == nil {
+			p.colRGs[l.Path] = map[int]bool{}
+		}
+		p.colRGs[l.Path][l.RowGroup] = true
+		p.rgsSeen[l.RowGroup] = true
+		if l.RowGroup > p.maxRG {
+			p.maxRG = l.RowGroup
+		}
 	}
 	// Fire only once the app has read into a THIRD distinct row group, so two row
 	// groups are fully observed and the recurrence filter is meaningful (#124/#125).

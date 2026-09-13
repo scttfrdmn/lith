@@ -505,7 +505,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// footer tier 2 (#108): prefetch this row group's projection columns
 	// (Parquet) or this/next zip entries so follow-on reads are cache hits.
 	if h.footerKind != footer.FormatNone && !f.cfg.DisableFooterTier2 && !h.footerStream {
-		f.footerReadExtend(h, off)
+		f.footerReadExtend(h, off, end)
 		// Batch a burst of concurrent demand misses on this object into one
 		// coalesced fetch (#124/session 30) — a front-loading reader (pyarrow
 		// pre_buffer) issues many reads at once; without this each is its own tiny
