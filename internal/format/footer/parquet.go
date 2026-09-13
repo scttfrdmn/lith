@@ -476,6 +476,38 @@ func (m *ParquetMeta) Locate(off int64) (rowGroup int, path string, ok bool) {
 	return 0, "", false
 }
 
+// Located is one column chunk a read range overlaps.
+type Located struct {
+	RowGroup int
+	Path     string
+}
+
+// LocateRange returns every column chunk whose byte range [Start,Start+Length)
+// overlaps the read range [off,end). Unlike Locate — which maps only the start
+// offset — this resolves a read that SPANS several columns (a reader's coalesced
+// pre_buffer read) to all of them, and a read that begins in the padding before a
+// column (e.g. off=0 precedes id.Start=4, the 4-byte PAR1 magic) still resolves to
+// the column it covers. Start-offset-only mapping missed that column for any reader
+// whose first read includes the header (#125 session 43).
+func (m *ParquetMeta) LocateRange(off, end int64) []Located {
+	if end <= off {
+		return nil
+	}
+	var out []Located
+	for rgi := range m.RowGroups {
+		for _, c := range m.RowGroups[rgi].Columns {
+			if c.Length <= 0 {
+				continue
+			}
+			// [c.Start, c.Start+c.Length) intersects [off, end)?
+			if c.Start < end && off < c.Start+c.Length {
+				out = append(out, Located{RowGroup: rgi, Path: c.Path})
+			}
+		}
+	}
+	return out
+}
+
 // ProjectionChunks returns, sorted by Start, the column chunks for the given
 // column paths across row groups in the half-open index range [rgFrom, rgTo)
 // (rgTo is clamped to len(RowGroups)).

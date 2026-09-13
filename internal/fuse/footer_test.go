@@ -219,6 +219,47 @@ func TestFooterParquetExcludesSingleRGColumn(t *testing.T) {
 	}
 }
 
+// TestFooterParquetLearnsSpannedColumn (#125 session 43): a read that STARTS in
+// the padding before a column but SPANS it must still learn that column. This is
+// the id-at-offset-0 bug — id.Start=4 sits after the 4-byte magic, so pyarrow's
+// header-covering read arrives at off=0 and start-offset-only Locate missed id
+// entirely. Here reads begin at each row group's start (offset before col0) and
+// span into col0; range-aware LocateRange learns col0 and the plan fires for it.
+func TestFooterParquetLearnsSpannedColumn(t *testing.T) {
+	srv := fake.New()
+	srv.Put("t.parquet", buildParquetObject(5, 2), time.Unix(1_700_000_000, 0))
+	met := metrics.New()
+	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met})
+	h, fh := openHandle(t, raw, "t.parquet")
+	readAt := func(off int64) {
+		buf := make([]byte, 4096)
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+	}
+	planRanges := func() int {
+		s := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`)
+		if s == "" {
+			return 0
+		}
+		n := 0
+		_, _ = fmt.Sscanf(s[strings.LastIndex(s, " ")+1:], "%d", &n)
+		return n
+	}
+	// Each read starts at a row group's first byte — before col0 (parquetColStart
+	// puts col0 100 bytes in) — and spans into col0. Start-only Locate would resolve
+	// every one to the pre-col0 gap and learn nothing (no plan ever). Row-group start
+	// = parquetColStart(rg,0) - 100.
+	readAt(parquetColStart(0, 0) - 100) // RG0
+	readAt(parquetColStart(1, 0) - 100) // RG1
+	readAt(parquetColStart(2, 0) - 100) // RG2 → third distinct row group → plan fires
+	waitStableGets(srv)
+	if !h.footerProj.planned {
+		t.Fatal("plan did not fire: a read spanning col0 from the pre-column padding was not learned")
+	}
+	if got := planRanges(); got != 2 {
+		t.Fatalf("plan dispatched %d ranges, want 2 (col0 for RG3,RG4)", got)
+	}
+}
+
 // TestProjectedColsRecurrence unit-tests the recurrence filter directly.
 func TestProjectedColsRecurrence(t *testing.T) {
 	p := newFooterProjection()
