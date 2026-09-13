@@ -125,14 +125,14 @@ func scrapeMetric(m *metrics.Metrics, substr string) string {
 	return strings.Join(out, "\n")
 }
 
-// TestFooterParquetFullProjectionPlan (#124/session 30): the plan fires ONCE the
-// projection is confirmed — the same columns read in two row groups — and then
-// plans A,C for all remaining row groups (RG2..n) in one batch. Nothing is
-// planned after only one row group, and the touched row groups (0,1) are not
-// planned (they are demand-served).
+// TestFooterParquetFullProjectionPlan (#124/session 30, #125): the plan fires ONCE
+// the projection is confirmed — the recurring column set, observed across two full
+// row groups, seen again as the app enters a third — and then plans the projection
+// for all remaining row groups (RG3..n) in one batch. Nothing is planned after only
+// one or two row groups, and the touched row groups are not planned (demand-served).
 func TestFooterParquetFullProjectionPlan(t *testing.T) {
 	srv := fake.New()
-	obj := buildParquetObject(4, 2) // 4 row groups, 2 columns
+	obj := buildParquetObject(5, 2) // 5 row groups, 2 columns
 	srv.Put("t.parquet", obj, time.Unix(1_700_000_000, 0))
 	met := metrics.New()
 	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met})
@@ -151,26 +151,92 @@ func TestFooterParquetFullProjectionPlan(t *testing.T) {
 		_, _ = fmt.Sscanf(s[strings.LastIndex(s, " ")+1:], "%d", &n)
 		return n
 	}
-	// Read row group 0's two columns — one row group only: no plan yet.
+	// Read row groups 0 and 1 in full — only two row groups observed: no plan yet
+	// (the recurring set is not confirmed until the app moves past the second).
 	readAt(parquetColStart(0, 0))
 	readAt(parquetColStart(0, 1))
-	waitStableGets(srv)
-	if h.footerProj == nil || h.footerProj.planned {
-		t.Fatal("plan fired after only one row group")
-	}
-	if got := planRanges(); got != 0 {
-		t.Fatalf("plan dispatched %d ranges after one row group, want 0", got)
-	}
-	// Read row group 1's two columns — projection confirmed → plan fires once for
-	// RG2,RG3 (2 cols × 2 row groups = 4 ranges).
 	readAt(parquetColStart(1, 0))
 	readAt(parquetColStart(1, 1))
 	waitStableGets(srv)
+	if h.footerProj == nil || h.footerProj.planned {
+		t.Fatal("plan fired after only two row groups")
+	}
+	if got := planRanges(); got != 0 {
+		t.Fatalf("plan dispatched %d ranges after two row groups, want 0", got)
+	}
+	// Read into row group 2 — a third distinct row group → projection confirmed →
+	// plan fires once for RG3,RG4 (2 cols × 2 remaining row groups = 4 ranges).
+	readAt(parquetColStart(2, 0))
+	waitStableGets(srv)
 	if !h.footerProj.planned {
-		t.Fatal("plan did not fire after the projection was confirmed in two row groups")
+		t.Fatal("plan did not fire after the projection was confirmed in three row groups")
 	}
 	if got := planRanges(); got != 4 {
-		t.Fatalf("plan dispatched %d ranges, want 4 (A,C for RG2,RG3 — nothing in touched RG0,RG1)", got)
+		t.Fatalf("plan dispatched %d ranges, want 4 (both cols for RG3,RG4 — nothing in touched RG0,RG1,RG2)", got)
+	}
+}
+
+// TestFooterParquetExcludesSingleRGColumn (#125): a column located in only one
+// row group — as happens when pyarrow's coalesced pre_buffer read's offset lands
+// in a non-projected column — is NOT added to the projection plan. Only columns
+// that recur across ≥2 row groups (the true projection) are planned. This is the
+// fix for the plan over-enumeration that fetched ~2.3× the projection.
+func TestFooterParquetExcludesSingleRGColumn(t *testing.T) {
+	srv := fake.New()
+	obj := buildParquetObject(5, 2) // 5 row groups, 2 columns
+	srv.Put("t.parquet", obj, time.Unix(1_700_000_000, 0))
+	met := metrics.New()
+	raw := mkFS(t, srv, Config{SmallFile: 4 << 10, PartsMax: 4 << 10, Metrics: met})
+	h, fh := openHandle(t, raw, "t.parquet")
+	readAt := func(off int64) {
+		buf := make([]byte, 4096)
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: 0}, Fh: fh, Offset: uint64(off), Size: 4096}, buf)
+	}
+	planRanges := func() int {
+		s := scrapeMetric(met, `lith_format_plan_ranges_total{format="parquet"}`)
+		if s == "" {
+			return 0
+		}
+		n := 0
+		_, _ = fmt.Sscanf(s[strings.LastIndex(s, " ")+1:], "%d", &n)
+		return n
+	}
+	// col0 recurs (RG0, RG1, RG2 — the real projection); col1 is touched only once
+	// (RG0), the coalesced-read noise. After two full row groups plus the move into a
+	// third, the recurrence filter confirms col0 and excludes col1.
+	readAt(parquetColStart(0, 0)) // col0 in RG0
+	readAt(parquetColStart(0, 1)) // col1 in RG0 (spurious, single row group)
+	readAt(parquetColStart(1, 0)) // col0 in RG1
+	readAt(parquetColStart(2, 0)) // col0 in RG2 → third distinct row group → plan fires
+	waitStableGets(srv)
+	if !h.footerProj.planned {
+		t.Fatal("plan did not fire after three row groups")
+	}
+	// col0 only, for RG3+RG4 = 2 ranges. If col1 (single-RG noise) leaked in, it
+	// would be 4.
+	if got := planRanges(); got != 2 {
+		t.Fatalf("plan dispatched %d ranges, want 2 (col0 for RG3,RG4; the single-RG col1 excluded)", got)
+	}
+}
+
+// TestProjectedColsRecurrence unit-tests the recurrence filter directly.
+func TestProjectedColsRecurrence(t *testing.T) {
+	p := newFooterProjection()
+	p.colRGs = map[string]map[int]bool{
+		"keep":   {0: true, 1: true, 5: true}, // 3 row groups
+		"keep2":  {0: true, 3: true},          // 2 row groups
+		"noise":  {0: true},                   // 1 row group → excluded at minRGs=2
+		"noise2": {7: true},                   // 1 row group → excluded
+	}
+	got := map[string]bool{}
+	for _, c := range p.projectedCols(2) {
+		got[c] = true
+	}
+	if !got["keep"] || !got["keep2"] {
+		t.Errorf("recurring columns dropped: %v", got)
+	}
+	if got["noise"] || got["noise2"] {
+		t.Errorf("single-row-group columns included: %v", got)
 	}
 }
 

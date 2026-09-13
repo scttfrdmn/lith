@@ -3,6 +3,7 @@
 package fuse
 
 import (
+	"log/slog"
 	"sort"
 	"sync"
 
@@ -53,20 +54,48 @@ func newFooterState() *footerState {
 }
 
 // footerProjection tracks, per handle, the Parquet columns the app has demanded
-// and the row groups it has touched. Once the projection is confirmed — the same
-// column set read in two distinct row groups — the plan fires once, prefetching
-// the projected column chunks of ALL remaining row groups in a single coalesced
-// batch (#124/session 30). The current and already-touched row groups stay
-// demand-served.
+// and the row groups it has touched. Once the projection is confirmed the plan
+// fires once, prefetching the projected column chunks of ALL remaining row groups
+// in a single coalesced batch (#124/session 30). The already-touched row groups
+// stay demand-served.
+//
+// colRGs records, per column, the distinct row groups a read's offset located it
+// in. A genuinely-projected column is read in every row group, so it recurs; a
+// column that only appears because pyarrow's pre_buffer coalesced a read across
+// it lands in ~one row group. The plan therefore includes only columns seen in
+// ≥2 row groups (#125): that excludes the coalesced-read noise that otherwise
+// inflated the plan ~2.3× on scattered projections (session 42c: kind=plan was
+// 265 MB for a 115 MB projection). Under-including a real column is safe — it is
+// still served byte-exact on demand; over-including fetches bytes we never use.
+//
+// The plan fires only once the app has moved into a THIRD distinct row group. The
+// recurrence filter can exclude noise only after two row groups are FULLY observed,
+// and a row group is fully observed only when the app has moved past it — reading
+// into the next one. Firing earlier (the instant the second row group is first
+// touched) would see only that row group's first column recurred and wrongly drop
+// the rest of the projection (whose second read has not happened yet).
 type footerProjection struct {
-	cols    map[string]bool
+	colRGs  map[string]map[int]bool // column -> distinct row groups it was located in
 	rgsSeen map[int]bool
 	maxRG   int  // highest row group the app has read; -1 = none yet
 	planned bool // the one-shot full-projection plan has fired
 }
 
 func newFooterProjection() *footerProjection {
-	return &footerProjection{cols: map[string]bool{}, rgsSeen: map[int]bool{}, maxRG: -1}
+	return &footerProjection{colRGs: map[string]map[int]bool{}, rgsSeen: map[int]bool{}, maxRG: -1}
+}
+
+// projectedCols returns the columns confirmed by recurrence — located in at least
+// minRGs distinct row groups — i.e. the true projection with coalesced-read noise
+// removed.
+func (p *footerProjection) projectedCols(minRGs int) []string {
+	cols := make([]string, 0, len(p.colRGs))
+	for c, rgs := range p.colRGs {
+		if len(rgs) >= minRGs {
+			cols = append(cols, c)
+		}
+	}
+	return cols
 }
 
 // maybeFooterReadahead applies tier 1 at open and arms tier 2. Returns true when
@@ -137,25 +166,72 @@ func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
 	if !ok {
 		return // the footer itself or a gap between chunks
 	}
-	p.cols[col] = true
+	if p.colRGs[col] == nil {
+		p.colRGs[col] = map[int]bool{}
+	}
+	p.colRGs[col][rg] = true
 	p.rgsSeen[rg] = true
 	if rg > p.maxRG {
 		p.maxRG = rg
 	}
-	// Fire only once the projection is confirmed — the app has read into two
-	// distinct row groups, so the column set is stable (#124/session 30). Then
-	// plan the projection for ALL remaining row groups (beyond the highest touched)
-	// in ONE coalesced batch; the current and touched row groups stay demand-served.
-	if len(p.rgsSeen) < 2 {
+	// Fire only once the app has read into a THIRD distinct row group, so two row
+	// groups are fully observed and the recurrence filter is meaningful (#124/#125).
+	// Then plan the projection for ALL remaining row groups (beyond the highest
+	// touched) in ONE coalesced batch; the touched row groups stay demand-served.
+	if len(p.rgsSeen) < 3 {
 		return
 	}
-	p.planned = true
-	cols := make([]string, 0, len(p.cols))
-	for c := range p.cols {
-		cols = append(cols, c)
+	// Include only columns confirmed by recurrence across ≥2 row groups — a
+	// projected column recurs in every row group, while a column that only appears
+	// because a coalesced pre_buffer read's offset landed in it does not. This is
+	// the fix for the plan over-enumeration (#125): planning every located column
+	// fetched ~2.3× the projection on scattered layouts.
+	cols := p.projectedCols(2)
+	if len(cols) == 0 {
+		return // no column confirmed across ≥2 row groups yet; keep observing (do not fire)
 	}
+	p.planned = true
 	nRG := len(h.footerMeta.RowGroups)
-	f.footerPrefetch(h, h.footerMeta.ProjectionChunks(cols, p.maxRG+1, nRG), "parquet")
+	ranges := h.footerMeta.ProjectionChunks(cols, p.maxRG+1, nRG)
+	if slog.Default().Enabled(f.ctx, slog.LevelDebug) {
+		f.logProjectionPlan(h, p, ranges, nRG)
+	}
+	f.footerPrefetch(h, ranges, "parquet")
+}
+
+// logProjectionPlan emits per-column diagnostics at the plan fire (#125): for
+// EVERY located column its name, the distinct row groups it recurred in, whether
+// the ≥2-RG filter planned it, and its planned bytes over [maxRG+1, nRG). This
+// resolves, from one bench run, which regime the projection is in:
+//
+//   - noise columns present with recurrence counts ≈ the projection's → pre_buffer
+//     sweeps the same adjacent span every row group; the filter cannot help and the
+//     fix is replaying observed byte ranges, not reasoning about columns;
+//   - only the projected columns planned and plan bytes near the true projection →
+//     the filter worked;
+//   - only projected columns planned but bytes still high → something else inflates,
+//     and the per-column bytes name it.
+func (f *rawFS) logProjectionPlan(h *fileHandle, p *footerProjection, ranges []footer.Range, nRG int) {
+	var planBytes int64
+	for _, r := range ranges {
+		planBytes += r.End - r.Start
+	}
+	names := make([]string, 0, len(p.colRGs))
+	for c := range p.colRGs {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	for _, c := range names {
+		var colBytes int64
+		for _, r := range h.footerMeta.ProjectionChunks([]string{c}, p.maxRG+1, nRG) {
+			colBytes += r.End - r.Start
+		}
+		slog.Debug("footer projection column", "col", c, "rgcount", len(p.colRGs[c]),
+			"planned", len(p.colRGs[c]) >= 2, "col_bytes", colBytes)
+	}
+	slog.Debug("footer projection plan", "planned_cols", len(p.projectedCols(2)),
+		"located_cols", len(p.colRGs), "plan_bytes", planBytes, "plan_MB", planBytes/(1<<20),
+		"from_rg", p.maxRG+1, "to_rg", nRG)
 }
 
 // footerZipRead prefetches the entry a read falls in (local header + data) and,
