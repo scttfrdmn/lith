@@ -45,5 +45,6 @@ nav:
   - Sizing the node: sizing.md
   - Meet a deadline: deadline.md
   - CargoShip archives: cargoship.md
+  - Serving a cluster: serving-a-cluster.md
   - Knobs: knobs.md
   - What lith is not: not.md
