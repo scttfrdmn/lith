@@ -100,10 +100,11 @@ func (bs *BlockStore) recordTTFB(d time.Duration) {
 type fillKind int
 
 const (
-	fillWhole  fillKind = iota // a whole-chunk fill (streaming/prefetch/sequential demand)
-	fillDemand                 // a demand read of an unfilled extent (non-sequential)
-	fillPlan                   // a format plan's byte-exact projection range
-	fillSilent                 // a fill whose bytes FillBatch accounts itself (no per-run recordFill)
+	fillWhole       fillKind = iota // a whole-chunk fill (streaming/prefetch/sequential demand)
+	fillDemand                      // a demand read of an unfilled extent (non-sequential)
+	fillPlan                        // a format plan's byte-exact projection range
+	fillDemandBatch                 // the coalesced union of a burst of demand reads (GatherDemand)
+	fillSilent                      // a fill whose bytes FillBatch accounts itself (no per-run recordFill)
 )
 
 func (fk fillKind) label() string {
@@ -112,6 +113,8 @@ func (fk fillKind) label() string {
 		return "demand"
 	case fillPlan:
 		return "plan"
+	case fillDemandBatch:
+		return "demand-batch"
 	default:
 		return "whole"
 	}
@@ -287,6 +290,15 @@ func (bs *BlockStore) FillRange(ctx context.Context, k Key, off, end, objSize in
 // (#125 item 1). Capping the gap keeps only genuinely-adjacent projected chunks
 // merged.
 func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objSize, maxGap int64) {
+	bs.fillBatch(ctx, k, ranges, objSize, maxGap, fillPlan)
+}
+
+// fillBatch is FillBatch with an explicit fill kind for byte accounting: the
+// coalesced union is recorded under kind (fillPlan for a format projection plan,
+// fillDemandBatch for a coalesced demand burst) so lith_fill_bytes_total does not
+// conflate the two sources (they were both "plan" before, which hid that a demand
+// burst — not the projection plan — was the dominant fetch on spread projections).
+func (bs *BlockStore) fillBatch(ctx context.Context, k Key, ranges []Range, objSize, maxGap int64, kind fillKind) {
 	type span struct{ lo, hi int64 }
 	aligned := make([]span, 0, len(ranges))
 	for _, rg := range ranges {
@@ -391,7 +403,7 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 	if gapBytes < 0 {
 		gapBytes = 0
 	}
-	bs.recordBatch(planBytes, gapBytes, int64(len(runs)), len(aligned))
+	bs.recordBatch(planBytes, gapBytes, int64(len(runs)), len(aligned), kind)
 }
 
 // fillInflightInc/Dec track concurrent fill-batch runs (the lith_fill_inflight
@@ -464,10 +476,18 @@ func (bs *BlockStore) Covered(k Key, off, length, objSize int64) bool {
 
 // GatherDemand collects a footer demand read's range into a per-object batch and,
 // as the batch leader, waits one tick for concurrent misses, then dispatches a
-// single coalesced FillBatch (#124/session 30). Non-leaders wait for the leader's
+// single coalesced fillBatch (#124/session 30). Non-leaders wait for the leader's
 // dispatch. On return the read's extents are filled or in flight, so the caller's
 // serve joins one coalesced GET instead of issuing its own tiny GET.
-func (bs *BlockStore) GatherDemand(ctx context.Context, k Key, off, length, objSize int64) {
+//
+// maxGap caps the coalesce gap exactly as fillBatch/FillRange do (#125 session 43):
+// a byte-precise footer handle passes ProjectionCoalesceGap so a burst of column
+// demand reads is NOT merged across the multi-MB non-projected columns between them.
+// This is the same cap #153 wired to the projection-plan caller of the coalescer;
+// the demand caller was missed, and on a fat NIC its concurrency-derived gap reaches
+// ~18 MB, sweeping the whole row group (session 43: kind=gap was 461 MB of a 585 MB
+// fetch for a 115 MB projection). maxGap<=0 keeps the device-derived gap.
+func (bs *BlockStore) GatherDemand(ctx context.Context, k Key, off, length, objSize, maxGap int64) {
 	if length <= 0 {
 		return
 	}
@@ -491,7 +511,7 @@ func (bs *BlockStore) GatherDemand(ctx context.Context, k Key, off, length, objS
 	delete(bs.demand, k.Key)
 	rs := g.ranges
 	bs.dmu.Unlock()
-	bs.FillBatch(ctx, k, rs, objSize, 0) // device-derived gap (demand batch)
+	bs.fillBatch(ctx, k, rs, objSize, maxGap, fillDemandBatch)
 	close(g.ready)
 }
 

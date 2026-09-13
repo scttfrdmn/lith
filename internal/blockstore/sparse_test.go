@@ -335,6 +335,26 @@ func TestFillBatchProjectionGapCap(t *testing.T) {
 	t.Logf("projection bytes fetched: uncapped=%d MiB, capped=%d KiB", srv.GetBytes/mib, srv2.GetBytes/1024)
 }
 
+// TestFillKindLabels (#125 session 43): the fill-kind labels are fixed strings the
+// metric depends on. In particular a coalesced demand burst must NOT be labeled
+// "plan" — conflating it with the format projection plan is what hid, for two
+// sessions, that the demand path (not the plan) was the dominant fetch.
+func TestFillKindLabels(t *testing.T) {
+	for _, c := range []struct {
+		k    fillKind
+		want string
+	}{
+		{fillWhole, "whole"},
+		{fillDemand, "demand"},
+		{fillPlan, "plan"},
+		{fillDemandBatch, "demand-batch"},
+	} {
+		if got := c.k.label(); got != c.want {
+			t.Errorf("fillKind(%d).label() = %q, want %q", c.k, got, c.want)
+		}
+	}
+}
+
 // TestGatherDemandBatchesBurst (#124/session 30): concurrent footer demand misses
 // on one object within the tick are collected into one coalesced FillBatch — a
 // large gap merges the burst into a single GET.
@@ -350,7 +370,7 @@ func TestGatherDemandBatchesBurst(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			off := int64(i) * mib
-			bs.GatherDemand(context.Background(), k, off, 100<<10, size)
+			bs.GatherDemand(context.Background(), k, off, 100<<10, size, 0) // uncapped: device gap
 		}(i)
 	}
 	wg.Wait()
@@ -359,6 +379,50 @@ func TestGatherDemandBatchesBurst(t *testing.T) {
 	if srv.GetCalls > 2 {
 		t.Fatalf("GetCalls=%d, want ≤2 (burst coalesced into one batch)", srv.GetCalls)
 	}
+}
+
+// TestGatherDemandAppliesProjectionCap (#125 session 43): the demand caller of the
+// coalescer must honor the projection cap exactly as the plan caller does — the cap
+// #153 wired to FillBatch's plan path but that the demand path (GatherDemand) missed.
+// With the cap, a burst of demand reads separated by multi-MB non-projected columns
+// is NOT swept into one GET; without it the fat-NIC device gap sweeps the whole span.
+// This is the both-paths-get-the-cap guard: a future third caller can copy the shape.
+func TestGatherDemandAppliesProjectionCap(t *testing.T) {
+	// 8 demand reads of 100 KiB at 4 MiB spacing across a 32 MiB object — ~3.9 MiB of
+	// non-projected data between each; true demand ~0.8 MiB. Mirrors the plan-path
+	// TestFillBatchProjectionGapCap so both callers are proven against one layout.
+	burst := func(bs *BlockStore, k Key, maxGap int64) {
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				bs.GatherDemand(context.Background(), k, int64(i)*4*mib, 100<<10, 32*mib, maxGap)
+			}(i)
+		}
+		wg.Wait()
+	}
+	// Fat-NIC device gap, NO cap: the small burst collapses C toward 1, the gap
+	// balloons, and the reads merge across the non-projected columns → a big sweep.
+	srv := fake.New()
+	makeObj(srv, "obj", 32)
+	k := keyFor(t, srv, "obj")
+	bug := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	burst(bug, k, 0)
+	if srv.GetBytes < 20*mib {
+		t.Fatalf("uncapped demand: fetched %d bytes, expected a big sweep (>20 MiB)", srv.GetBytes)
+	}
+	// Same device gap, WITH the projection cap: the ~3.9 MiB gaps exceed the 1 MiB
+	// cap, so the reads stay byte-precise.
+	srv2 := fake.New()
+	makeObj(srv2, "obj", 32)
+	k2 := keyFor(t, srv2, "obj")
+	fixed := newStore(t, srv2, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	burst(fixed, k2, ProjectionCoalesceGap)
+	if srv2.GetBytes > 2*mib {
+		t.Fatalf("capped demand: fetched %d bytes, expected byte-precise (<2 MiB)", srv2.GetBytes)
+	}
+	t.Logf("demand burst bytes: uncapped=%d MiB, capped=%d KiB", srv.GetBytes/mib, srv2.GetBytes/1024)
 }
 
 // TestFillBatchParallelDispatch (#31): a many-run batch dispatches its runs
