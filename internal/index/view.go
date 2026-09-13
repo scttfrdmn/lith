@@ -21,6 +21,10 @@ type Reader interface {
 	Readdir(path string, cursor uint64, n int) ([]Dirent, uint64, error)
 	ETagHashOf(path string) uint64
 	Position(path string) (int, bool)
+	// ByInode resolves an inode to its "/"-rooted path (reverse of the build-time
+	// inode assignment), for NFS handle resolution (#144). ok=false if no entry
+	// has that inode (or, for a View, it lies outside the view).
+	ByInode(ino uint64) (path string, ok bool)
 	Neighborhood(path string, n int) []Sibling
 	// BackingOf returns the CargoShip read-mapping for a virtual file, or ok=false
 	// for an object-backed index. The backing travels with the entry, so a View

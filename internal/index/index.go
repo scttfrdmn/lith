@@ -82,6 +82,13 @@ type Index struct {
 	totalOnce sync.Once
 	totalSize int64
 
+	// Inode lookup (built lazily at first ByInode): a sorted inode array with a
+	// parallel ref (high bit = directory, low bits = table position). Lets the
+	// NFS gateway resolve a file handle's inode back to a path (#144).
+	inoOnce sync.Once
+	inoKeys []uint64 // sorted inodes (files + dirs share the collision namespace)
+	inoRefs []uint32 // parallel; inoDirBit set => dir table position, else key position
+
 	// Build statistics, surfaced by inspect.
 	dropped    uint64 // keys rejected by sanitization
 	shadowed   uint64 // file keys shadowed by a same-named directory
