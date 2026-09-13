@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -28,6 +29,8 @@ type serveFlags struct {
 	cargoship  string
 	region     string
 	memCache   string
+	diskCache  string
+	diskPath   string
 	metrics    string
 	clientIdle time.Duration
 	noPortmap  bool
@@ -64,6 +67,8 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.cargoship, "cargoship", "", "export a CargoShip 2.1 archive: build the index in-process from this manifest s3:// URL (fail-closed, never lists)")
 	fl.StringVar(&f.region, "region", "", "bucket region (resolved if empty)")
 	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
+	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables); on a gateway, size it to the working set so a warm re-read and a restart serve from local disk, not S3")
+	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
 	fl.DurationVar(&f.clientIdle, "client-idle", 5*time.Minute, "release a client's readahead share after this idle time")
 	fl.BoolVar(&f.noPortmap, "no-portmap", true, "do not register with rpcbind; clients mount with an explicit port (mountport=)")
@@ -113,8 +118,17 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		return err
 	}
 
+	diskCache, err := parseSize(f.diskCache)
+	if err != nil {
+		return err
+	}
+	diskPath := f.diskPath
+	if diskPath == "" {
+		diskPath = filepath.Join(os.TempDir(), "lith-cache")
+	}
 	bs, err := blockstore.New(client, blockstore.Config{
 		Bucket: bucket, BlockSize: 8 << 20, MemCache: memCache, MaxRange: 64 << 20,
+		DiskCache: diskCache, DiskPath: diskPath, DiskWriters: 8,
 		S3Concurrency: 128, Recorder: met,
 	})
 	if err != nil {
