@@ -11,3 +11,11 @@ efs,hydration,~1020,,,,50000000000,"pre-hydration 50GB in 869s = ~59 MB/s (incom
 efs,run,n/a,,,,,"run not executed: hydration wall (>17min for 60GB) is EFS's dominant, disqualifying cost line"
 fsx_lustre,create+run,n/a,,,,,"NOT created (cost analytical): SCRATCH2 1.2 TiB minimum ~= $0.24/hr dominant line; lazy-load hydration slow (per-first-read); lustre client on Ubuntu arm64 a known blocker"
 kill_restart,gateway,,0,,,,"criterion 4 MET: SIGKILL -> hard-mount clients block/soft EIO; restart from index-file (no relist) + on-disk cache serves with 0 S3 GET"
+# --- Shared-dataset workload (session 42): 8 nodes read the SAME 8.88 GB GRCh38 bwa index (broad-references, staged lith-bench/bwa/). ---
+config,phase,aggregate_wall_s,S3_GET,S3_HEAD,S3_LIST,bytes,notes
+gateway_shared,run1_cold,36.4,1139,24,56,9127837487,"shared index fetched ONCE, served to all 8; self-report 8.88GB/1091 GET"
+gateway_shared,run2_warm,0.4,0,0,0,0,"criterion 2: second run 0 S3 — whole index in gateway on-disk cache"
+independent_lith_shared,run1_cold,13.3,8561,32,32,71296472068,"each node fetches the full 8.88GB index — 8x the S3 traffic; parallel across 8 NICs (faster cold)"
+efs_shared,hydration,273,,,,8881233251,"pre-hydration 8.88GB in 273s (~32 MB/s) on billing compute before any read"
+efs_shared,run,51.7,0,0,0,,"post-hydration read; slowest of the three; run issues no S3 (served from EFS)"
+# criterion 1 (restated, shared): ops 1139 vs 8561 GET = ~1/7.5 (MET); cold wall 36.4 vs 13.3 (NOT met — gateway is a one-NIC funnel). Win = 8x less S3 + free 2nd run + no hydration/FS-minimum.

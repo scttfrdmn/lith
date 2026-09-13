@@ -187,3 +187,10 @@ sparse — the win is **operations you never issue**. <!-- numbers: bench/result
 will re-read a dataset many times from fast local storage and the staging cost
 amortizes across those reads — and then copy to local NVMe, never EBS. For
 query-once, selective, or batch work, mount.
+
+**And a third option for a cluster:** when many nodes read the **same** dataset,
+one node can [**serve** it to the rest over NFS](serving-a-cluster.md) — the
+shared data is fetched from S3 once, not once per node, and the second job is
+free. (The gateway reads *faster* than the FUSE mount — no FUSE hop — so sharing
+costs no per-read speed; it's a funnel on aggregate cold throughput, so size it
+by total demand.) Distinct data per node → per-node mounts; shared data → gateway.

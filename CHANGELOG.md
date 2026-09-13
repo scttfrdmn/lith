@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-13
+
+**The NFS gateway: one node mounts, a cluster shares.** `lith serve nfs` exports a
+lith mount over read-only NFSv3, so N compute nodes read a shared S3 dataset
+through one node — fetched from S3 **once**, not once per node — with the second
+job free. It replaces EFS/FSx-linked-to-S3 for read-only shared datasets: no
+hydration, no filesystem minimum, no filesystem to create and delete.
+
+### Added
+
+- **`lith serve nfs s3://bucket[/prefix]`** ([#143](https://github.com/scttfrdmn/lith/issues/143)/[#144](https://github.com/scttfrdmn/lith/issues/144)):
+  read-only NFSv3 gateway over `willscott/go-nfs`, serving the `Index` and
+  `BlockStore` directly (no FUSE in the path). **Deterministic `(index-sha,
+  inode)` file handles** — stable across a restart against the same index,
+  `NFS3ERR_STALE` against a rebuilt one, no server-side handle table. Every
+  mutating op is `NFS3ERR_ROFS`. **`READDIRPLUS`/`GETATTR`/`FSSTAT` served from
+  the index** (0 S3). **Per-client fair-share** readahead window. `MOUNT` v3 on
+  the same port (clients mount with an explicit port; no portmap). Metrics
+  `lith_nfs_clients`, `lith_nfs_ops_total{op}`, `lith_nfs_read_bytes_total`.
+- **`Index.ByInode(ino)`** ([#144](https://github.com/scttfrdmn/lith/issues/144)):
+  reverse inode→path lookup for NFS handle resolution, through `View`; a sorted
+  side array built lazily (~12 B/key).
+- **`lith serve nfs --disk-cache/--disk-path`** ([#143](https://github.com/scttfrdmn/lith/issues/143)):
+  a gateway sized to its working set serves a warm re-read and a restart from
+  local disk, not S3.
+- **`serve` flag parity with `mount`** ([#143](https://github.com/scttfrdmn/lith/issues/143)):
+  the read-path/cache/S3 tuning flags (`--block-size`, `--max-range`,
+  `--prefetch-budget`/`-concurrency`, `--inflight-bytes`, `--coalesce-gap`,
+  `--s3-concurrency`, `--nic-gbps`, `--endpoint`, `--path-style`,
+  `--auto-index-limit`) are on `serve`; FUSE-only/diagnostic flags are documented
+  inapplicable. A test fails CI if any mount flag is silently missing.
+
+### Changed
+
+- **Gateway read path dispatches readahead concurrently** ([#143](https://github.com/scttfrdmn/lith/issues/143)):
+  a cold single stream reads **1,463 MB/s** on loopback — *faster than the FUSE
+  mount* (no FUSE hop); was 67 MB/s with the initial serial dispatch.
+
+### Measured (N=8, CloudTrail-ledger-backed)
+
+- **Shared dataset** (8 nodes read the same 8.88 GB bwa index): the gateway
+  fetches it **once** — 1,139 GETs / 9.1 GB — where 8 independent mounts fetch it
+  **8×** (8,561 GETs / 71.3 GB): **~1/8 the S3 traffic**. The second run issues
+  **0 S3**. Cheaper than EFS (which needs ~4.5 min to hydrate 8.88 GB first) and
+  FSx Lustre (1.2 TiB minimum).
+- **Distinct data per node** (W3, 8 CRAMs): independent per-node `lith mount`
+  wins (parallel across 8 NICs); the gateway is a one-NIC funnel. **The sizing
+  rule: distinct data → per-node mounts; shared data → gateway.** See
+  [Serving a cluster](https://github.com/scttfrdmn/lith/blob/main/docs/serving-a-cluster.md).
+
+### Known limits
+
+NFSv3 only (no NFSv4 state/delegations/ACLs); read-only; `AUTH_UNIX`/squash, no
+Kerberos; per-**path** (not per-client) sequential state (go-nfs's stateless read
+path); FSx Lustre client unavailable on arm64 Ubuntu (costed analytically).
+
 ## [0.3.2] - 2026-09-12
 
 > Includes the [0.3.1] section below, which was never tagged — its CargoShip
@@ -524,7 +580,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/scttfrdmn/lith/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.2
 [0.3.1]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/scttfrdmn/lith/compare/v0.2.2...v0.3.0
