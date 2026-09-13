@@ -1,0 +1,13 @@
+# W3 cluster campaign, N=8, one CRAM per node, samtools flagstat. Session 41 (#143).
+# Same-account staged data s3://scttfrdmn-lith-bench/lith-bench/w3/ (60.0 GB, 8 heterogeneous CRAMs).
+# c8g.2xlarge compute @ $0.31904/hr; c8gd.4xlarge gateway @ $0.78384/hr (AWS Price List, us-east-1).
+# S3 ops/bytes from the CloudTrail S3-data-event ledger (principal spored-instance-role), exclusive windows.
+# lith self-report cross-check: gateway cumulative 7216 GET / 60.03 GB across both runs (== warm added ~0).
+config,phase,aggregate_wall_s,S3_GET,S3_HEAD,S3_LIST,bytes,notes
+gateway,run1_cold,90.3,6762,126,118,56096726383,"all S3 from ONE node (gateway); 8 NFS clients issue zero; window-clipped ~4GB of the 14GB CRAM tail (self-report 60GB)"
+gateway,run2_warm,101.2,0,0,3,1872,"criterion 2 MET: second run issues ~0 S3 — served from the gateway's on-disk cache"
+independent_lith,run1_cold,72.2,7183,32,26,59945393798,"8 nodes each read their own CRAM directly; parallel across 8 NICs; S3 from 8 nodes"
+efs,hydration,~1020,,,,50000000000,"pre-hydration 50GB in 869s = ~59 MB/s (incomplete at kill); 8 nodes would idle-bill throughout; EFS storage+elastic-throughput extra"
+efs,run,n/a,,,,,"run not executed: hydration wall (>17min for 60GB) is EFS's dominant, disqualifying cost line"
+fsx_lustre,create+run,n/a,,,,,"NOT created (cost analytical): SCRATCH2 1.2 TiB minimum ~= $0.24/hr dominant line; lazy-load hydration slow (per-first-read); lustre client on Ubuntu arm64 a known blocker"
+kill_restart,gateway,,0,,,,"criterion 4 MET: SIGKILL -> hard-mount clients block/soft EIO; restart from index-file (no relist) + on-disk cache serves with 0 S3 GET"

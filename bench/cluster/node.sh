@@ -6,6 +6,7 @@
 # CONFIG (gateway|indep|efs|fsx), GW_IP, IDXKEY, EFS_DNS, FSX_MNT, PHASES.
 set -uo pipefail
 export AWS_REGION=us-east-1
+export PATH=/usr/local/bin:$PATH
 B="s3://$BUCKET"; MP=/mnt/data; sudo mkdir -p "$MP"
 m(){ aws s3 ls "$1" >/dev/null 2>&1; }         # marker exists?
 put(){ printf '%s' "$2" | aws s3 cp - "$1" >/dev/null 2>&1; }
@@ -29,7 +30,7 @@ CRAM=${CRAMS[$IDX]}
 
 REC="vers=3,proto=tcp,port=2049,mountport=2049,nolock,hard,rsize=1048576,wsize=1048576,nconnect=4,actimeo=600"
 case "$CONFIG" in
-  gateway) sudo mount -t nfs -o "$REC" "$GW_IP:/" "$MP"; CRAMPATH="$MP/w3/$CRAM" ;;
+  gateway) sudo mount -t nfs -o "$REC" "$GW_IP:/" "$MP"; CRAMPATH="$MP/$CRAM" ;;
   indep)   aws s3 cp "$B/$IDXKEY" /tmp/w3.idx >/dev/null 2>&1
            /usr/local/bin/lith mount "s3://$BUCKET/lith-bench/w3" "$MP" --index-file /tmp/w3.idx --daemon >/tmp/lith.log 2>&1
            for i in $(seq 1 60); do mountpoint -q "$MP" && break; sleep 0.5; done; CRAMPATH="$MP/$CRAM" ;;
@@ -42,6 +43,7 @@ while [ "$(aws s3 ls "$B/barrier/$RUN_ID/ready/" 2>/dev/null | wc -l)" -lt "$N" 
 
 for ph in $PHASES; do
   while ! m "$B/barrier/$RUN_ID/go/$ph"; do sleep 2; done
+  sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null
   s=$(date -u +%s.%N)
   samtools flagstat "$CRAMPATH" >"/tmp/fs.$ph.out" 2>"/tmp/fs.$ph.err"; rc=$?
   e=$(date -u +%s.%N)
