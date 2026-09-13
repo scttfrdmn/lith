@@ -24,18 +24,29 @@ import (
 )
 
 type serveFlags struct {
-	listen     string
-	indexFile  string
-	cargoship  string
-	region     string
-	memCache   string
-	diskCache  string
-	diskPath   string
-	metrics    string
-	clientIdle time.Duration
-	noPortmap  bool
-	noSign     bool
-	reqPays    bool
+	listen         string
+	indexFile      string
+	cargoship      string
+	region         string
+	memCache       string
+	diskCache      string
+	diskPath       string
+	blockSize      string
+	maxRange       string
+	prefetchBudget string
+	inflightBytes  string
+	coalesceGap    string
+	s3Concurrency  int
+	prefetchConc   int
+	nicGbps        float64
+	autoIndexLimit int
+	endpoint       string
+	pathStyle      bool
+	metrics        string
+	clientIdle     time.Duration
+	noPortmap      bool
+	noSign         bool
+	reqPays        bool
 }
 
 func newServeCmd() *cobra.Command {
@@ -69,6 +80,19 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables); on a gateway, size it to the working set so a warm re-read and a restart serve from local disk, not S3")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
+	// Block-store / S3-client tuning — parity with `lith mount` for the flags that
+	// configure the read path, cache, budget, and S3 client the gateway uses.
+	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size (1MiB-64MiB)")
+	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
+	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
+	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
+	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between fill ranges merged into one GET; 0 = derive from NIC × TTFB (#124)")
+	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
+	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
+	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "NIC bandwidth in Gbps for the coalesce gap / inflight budget (0 = a fixed fallback; serve does not autodetect)")
+	fl.IntVar(&f.autoIndexLimit, "auto-index-limit", 5_000_000, "max keys to auto-index when no --index-file/--cargoship is given")
+	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
+	fl.BoolVar(&f.pathStyle, "path-style", false, "use path-style S3 addressing")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
 	fl.DurationVar(&f.clientIdle, "client-idle", 5*time.Minute, "release a client's readahead share after this idle time")
 	fl.BoolVar(&f.noPortmap, "no-portmap", true, "do not register with rpcbind; clients mount with an explicit port (mountport=)")
@@ -91,7 +115,8 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	}
 
 	client, err := newS3Client(ctx, s3client.Config{
-		Bucket: bucket, Region: f.region, NoSignRequest: f.noSign, RequesterPays: f.reqPays, Concurrency: 128,
+		Bucket: bucket, Region: f.region, NoSignRequest: f.noSign, RequesterPays: f.reqPays,
+		Endpoint: f.endpoint, PathStyle: f.pathStyle, Concurrency: f.s3Concurrency,
 	})
 	if err != nil {
 		return err
@@ -126,10 +151,43 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if diskPath == "" {
 		diskPath = filepath.Join(os.TempDir(), "lith-cache")
 	}
+	blockSize, err := parseSize(f.blockSize)
+	if err != nil {
+		return err
+	}
+	if blockSize < 1<<20 || blockSize > 64<<20 {
+		return fmt.Errorf("block size must be between 1MiB and 64MiB")
+	}
+	maxRange, err := parseSize(f.maxRange)
+	if err != nil {
+		return err
+	}
+	coalesceGap, err := parseSize(f.coalesceGap)
+	if err != nil {
+		return err
+	}
+	var prefetchBudget, inflight int64
+	if f.prefetchBudget != "" {
+		if prefetchBudget, err = parseSize(f.prefetchBudget); err != nil {
+			return err
+		}
+	}
+	if f.inflightBytes != "" {
+		if inflight, err = parseSize(f.inflightBytes); err != nil {
+			return err
+		}
+	}
+	var nicBytesPerSec int64
+	if f.nicGbps > 0 {
+		nicBytesPerSec = int64(f.nicGbps * 1e9 / 8)
+	}
 	bs, err := blockstore.New(client, blockstore.Config{
-		Bucket: bucket, BlockSize: 8 << 20, MemCache: memCache, MaxRange: 64 << 20,
+		Bucket: bucket, BlockSize: blockSize, MemCache: memCache, MaxRange: maxRange,
 		DiskCache: diskCache, DiskPath: diskPath, DiskWriters: 8,
-		S3Concurrency: 128, Recorder: met,
+		S3Concurrency: f.s3Concurrency, PrefetchConcurrency: f.prefetchConc,
+		PrefetchBudget: prefetchBudget, InflightBytes: inflight,
+		CoalesceGap: coalesceGap, NICBytesPerSec: nicBytesPerSec,
+		Recorder: met,
 	})
 	if err != nil {
 		return err
@@ -199,6 +257,7 @@ func loadServeIndex(ctx context.Context, f *serveFlags, client s3client.API, buc
 	default:
 		ix, err := index.BuildFromList(ctx, client, index.ListOptions{
 			Options: index.Options{Bucket: bucket, Prefix: prefix, Logger: log},
+			MaxKeys: f.autoIndexLimit,
 		})
 		if err != nil {
 			return nil, nil, rootID, err
