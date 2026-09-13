@@ -194,14 +194,44 @@ func (f *rawFS) footerParquetRead(h *fileHandle, off int64) {
 	nRG := len(h.footerMeta.RowGroups)
 	ranges := h.footerMeta.ProjectionChunks(cols, p.maxRG+1, nRG)
 	if slog.Default().Enabled(f.ctx, slog.LevelDebug) {
-		var planBytes int64
-		for _, r := range ranges {
-			planBytes += r.End - r.Start
-		}
-		slog.Debug("footer projection plan", "cols", len(cols), "located", len(p.colRGs),
-			"plan_MB", planBytes/(1<<20), "from_rg", p.maxRG+1, "to_rg", nRG)
+		f.logProjectionPlan(h, p, ranges, nRG)
 	}
 	f.footerPrefetch(h, ranges, "parquet")
+}
+
+// logProjectionPlan emits per-column diagnostics at the plan fire (#125): for
+// EVERY located column its name, the distinct row groups it recurred in, whether
+// the ≥2-RG filter planned it, and its planned bytes over [maxRG+1, nRG). This
+// resolves, from one bench run, which regime the projection is in:
+//
+//   - noise columns present with recurrence counts ≈ the projection's → pre_buffer
+//     sweeps the same adjacent span every row group; the filter cannot help and the
+//     fix is replaying observed byte ranges, not reasoning about columns;
+//   - only the projected columns planned and plan bytes near the true projection →
+//     the filter worked;
+//   - only projected columns planned but bytes still high → something else inflates,
+//     and the per-column bytes name it.
+func (f *rawFS) logProjectionPlan(h *fileHandle, p *footerProjection, ranges []footer.Range, nRG int) {
+	var planBytes int64
+	for _, r := range ranges {
+		planBytes += r.End - r.Start
+	}
+	names := make([]string, 0, len(p.colRGs))
+	for c := range p.colRGs {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	for _, c := range names {
+		var colBytes int64
+		for _, r := range h.footerMeta.ProjectionChunks([]string{c}, p.maxRG+1, nRG) {
+			colBytes += r.End - r.Start
+		}
+		slog.Debug("footer projection column", "col", c, "rgcount", len(p.colRGs[c]),
+			"planned", len(p.colRGs[c]) >= 2, "col_bytes", colBytes)
+	}
+	slog.Debug("footer projection plan", "planned_cols", len(p.projectedCols(2)),
+		"located_cols", len(p.colRGs), "plan_bytes", planBytes, "plan_MB", planBytes/(1<<20),
+		"from_rg", p.maxRG+1, "to_rg", nRG)
 }
 
 // footerZipRead prefetches the entry a read falls in (local header + data) and,
