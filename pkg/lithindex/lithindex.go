@@ -8,6 +8,12 @@
 // a publish that silently ships no index. The heavy lifting lives in the
 // internal index builder; this package is a thin, dependency-light adapter over
 // a caller-supplied S3 read surface.
+//
+// As the one public, cross-repo entry point into lith's index machinery, this
+// package's exported API (S3Fetcher, Options, BuildIndexFromManifest) is a
+// compatibility surface for downstream modules and is deliberately kept minimal:
+// prefer adding fields to Options over new functions, and do not widen S3Fetcher
+// beyond the reads a manifest build actually performs.
 package lithindex
 
 import (
