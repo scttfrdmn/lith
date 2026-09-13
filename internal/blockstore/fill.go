@@ -23,6 +23,13 @@ const (
 	ttfbMax  = 8 // rolling window of measured first-byte latencies
 )
 
+// ProjectionCoalesceGap caps the coalesce gap for the byte-precise projection
+// fill (#125 item 1): projected column chunks separated by less than this much
+// non-projected data still merge into one GET, but larger non-projected columns
+// are not swept in. Conservative default; bench-tune against pyarrow's projection
+// bytes (target: within ~10%).
+const ProjectionCoalesceGap = 1 << 20
+
 func deriveCoalesceGap(bytesPerSec int64, ttfb time.Duration, c int) int64 {
 	if bytesPerSec <= 0 || ttfb <= 0 || c <= 0 {
 		return gapFloor
@@ -269,13 +276,17 @@ func (bs *BlockStore) FillRange(ctx context.Context, k Key, off, end, objSize in
 
 // FillBatch fills the extents covering a batch of byte ranges (#124), coalescing
 // them across chunk boundaries into range GETs: each range is extent-aligned
-// (64 KiB), then sorted and merged whenever the gap to the next is below
-// coalesceGap — bytes inside a closed gap are fetched and marked filled (counted
+// (64 KiB), then sorted and merged whenever the gap to the next is below the
+// coalesce gap — bytes inside a closed gap are fetched and marked filled (counted
 // as kind=gap so the rounding cost is visible). Each merged run is one coalesced
-// GET (via ensureChunks, which fetches a run of owned chunks in one request and
-// joins any in-flight chunk). A format tier-2 plan calls this so a projection is
-// a few large GETs, not many tiny ones. Best-effort, prefetch priority.
-func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objSize int64) {
+// GET. Best-effort, prefetch priority. maxGap<=0 uses the device-derived gap
+// (the demand-batch path); a positive maxGap caps it, which the byte-precise
+// projection path needs: on a fat in-region NIC the device gap can reach 64 MiB
+// and would merge projected column chunks *across* the multi-MB non-projected
+// columns between them, sweeping the whole row group and defeating byte precision
+// (#125 item 1). Capping the gap keeps only genuinely-adjacent projected chunks
+// merged.
+func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objSize, maxGap int64) {
 	type span struct{ lo, hi int64 }
 	aligned := make([]span, 0, len(ranges))
 	for _, rg := range ranges {
@@ -351,7 +362,11 @@ func (bs *BlockStore) FillBatch(ctx context.Context, k Key, ranges []Range, objS
 	if c < 1 {
 		c = 1
 	}
-	runs := coalesce(bs.gapForC(c))
+	gap := bs.gapForC(c)
+	if maxGap > 0 && gap > maxGap {
+		gap = maxGap // byte-precise projection: don't merge across large non-projected gaps (#125)
+	}
+	runs := coalesce(gap)
 
 	// Dispatch every run concurrently — no per-run serialization; each run's GET
 	// bounds itself on the prefetch pool inside fillRun (#31).
@@ -476,7 +491,7 @@ func (bs *BlockStore) GatherDemand(ctx context.Context, k Key, off, length, objS
 	delete(bs.demand, k.Key)
 	rs := g.ranges
 	bs.dmu.Unlock()
-	bs.FillBatch(ctx, k, rs, objSize)
+	bs.FillBatch(ctx, k, rs, objSize, 0) // device-derived gap (demand batch)
 	close(g.ready)
 }
 

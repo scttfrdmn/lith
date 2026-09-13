@@ -300,7 +300,7 @@ func (f *rawFS) footerPrefetch(h *fileHandle, ranges []footer.Range, format stri
 	}
 	go func() {
 		defer f.release(total)
-		f.store.FillBatch(f.ctx, h.key, batch, h.size)
+		f.store.FillBatch(f.ctx, h.key, batch, h.size, blockstore.ProjectionCoalesceGap)
 	}()
 }
 

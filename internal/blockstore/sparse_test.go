@@ -152,7 +152,7 @@ func TestFillBatchCoalescesAcrossChunks(t *testing.T) {
 		{0, 300 * kb}, {400 * kb, 700 * kb}, {800 * kb, 1100 * kb},
 		{1200 * kb, 1500 * kb}, {1600 * kb, 1900 * kb}, {2000 * kb, 2300 * kb},
 	}
-	bs.FillBatch(context.Background(), k, ranges, size)
+	bs.FillBatch(context.Background(), k, ranges, size, 0)
 	if srv.GetCalls != 1 {
 		t.Fatalf("GetCalls=%d, want 1 (6 ranges / 3 chunks / 100 KiB gaps coalesced)", srv.GetCalls)
 	}
@@ -170,7 +170,7 @@ func TestFillBatchGapBreaksRun(t *testing.T) {
 	k := keyFor(t, srv, "obj")
 	size := int64(4) * mib
 	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
-	bs.FillBatch(context.Background(), k, []Range{{0, 200 << 10}, {1400 << 10, 1600 << 10}}, size)
+	bs.FillBatch(context.Background(), k, []Range{{0, 200 << 10}, {1400 << 10, 1600 << 10}}, size, 0)
 	if srv.GetCalls != 2 {
 		t.Fatalf("GetCalls=%d, want 2 (runs 1 MiB apart)", srv.GetCalls)
 	}
@@ -187,9 +187,9 @@ func TestFillBatchJoinsInflight(t *testing.T) {
 	srv.GetDelay = 60 * time.Millisecond
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { defer wg.Done(); bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size) }()
-	time.Sleep(20 * time.Millisecond)                                    // let the first batch's GET get in flight
-	bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size) // same extents
+	go func() { defer wg.Done(); bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size, 0) }()
+	time.Sleep(20 * time.Millisecond)                                       // let the first batch's GET get in flight
+	bs.FillBatch(context.Background(), k, []Range{{0, 300 << 10}}, size, 0) // same extents
 	wg.Wait()
 	if srv.GetCalls != 1 {
 		t.Fatalf("GetCalls=%d, want 1 (second batch joined the in-flight fill)", srv.GetCalls)
@@ -209,7 +209,7 @@ func TestFillBatchRace(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			off := int64(i) * (300 << 10)
-			bs.FillBatch(context.Background(), k, []Range{{off, off + 200<<10}}, size)
+			bs.FillBatch(context.Background(), k, []Range{{off, off + 200<<10}}, size, 0)
 			_, _ = bs.GetRange(context.Background(), k, off, 100, size)
 		}(i)
 	}
@@ -282,7 +282,7 @@ func TestFillBatchGapControlsGETs(t *testing.T) {
 	makeObj(srv, "obj", 8)
 	k := keyFor(t, srv, "obj")
 	bsBig := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
-	bsBig.FillBatch(context.Background(), k, mk(), 8*mib)
+	bsBig.FillBatch(context.Background(), k, mk(), 8*mib, 0)
 	if srv.GetCalls != 1 {
 		t.Fatalf("64 MiB gap: GetCalls=%d, want 1", srv.GetCalls)
 	}
@@ -291,10 +291,48 @@ func TestFillBatchGapControlsGETs(t *testing.T) {
 	makeObj(srv2, "obj", 8)
 	k2 := keyFor(t, srv2, "obj")
 	bsSmall := newStore(t, srv2, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 256 << 10})
-	bsSmall.FillBatch(context.Background(), k2, mk(), 8*mib)
+	bsSmall.FillBatch(context.Background(), k2, mk(), 8*mib, 0)
 	if srv2.GetCalls != 8 {
 		t.Fatalf("256 KiB gap: GetCalls=%d, want 8 (per-range)", srv2.GetCalls)
 	}
+}
+
+// TestFillBatchProjectionGapCap (#125 item 1): a byte-precise projection whose
+// columns are separated by multi-MB non-projected columns must NOT be merged
+// across them by the fat-NIC device gap. maxGap=0 sweeps the whole span (the
+// bug: ~618 MB fetched for a ~127 MB projection); the projection cap keeps it
+// byte-precise.
+func TestFillBatchProjectionGapCap(t *testing.T) {
+	// 8 projected 100 KiB columns at 4 MiB spacing across a 32 MiB object — i.e.
+	// ~3.9 MiB of non-projected data between each. True projection ~0.8 MiB.
+	mk := func() []Range {
+		var rs []Range
+		for i := int64(0); i < 8; i++ {
+			rs = append(rs, Range{i * 4 * mib, i*4*mib + 100<<10})
+		}
+		return rs
+	}
+	// Fat-NIC device gap (64 MiB), NO cap: all 8 merge across the non-projected
+	// columns → one sweeping GET of ~28 MiB. This is the over-fetch bug.
+	srv := fake.New()
+	makeObj(srv, "obj", 32)
+	k := keyFor(t, srv, "obj")
+	bug := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	bug.FillBatch(context.Background(), k, mk(), 32*mib, 0)
+	if srv.GetBytes < 20*mib {
+		t.Fatalf("uncapped: fetched %d bytes, expected a big sweep (>20 MiB) reproducing the bug", srv.GetBytes)
+	}
+	// Same fat-NIC device gap, WITH the projection cap: the ~3.9 MiB non-projected
+	// gaps exceed the 1 MiB cap, so columns are fetched separately — byte-precise.
+	srv2 := fake.New()
+	makeObj(srv2, "obj", 32)
+	k2 := keyFor(t, srv2, "obj")
+	fixed := newStore(t, srv2, Config{BlockSize: 8 << 20, MaxRange: 64 << 20, CoalesceGap: 64 << 20})
+	fixed.FillBatch(context.Background(), k2, mk(), 32*mib, ProjectionCoalesceGap)
+	if srv2.GetBytes > 2*mib {
+		t.Fatalf("capped: fetched %d bytes, expected byte-precise (~0.8 MiB, <2 MiB)", srv2.GetBytes)
+	}
+	t.Logf("projection bytes fetched: uncapped=%d MiB, capped=%d KiB", srv.GetBytes/mib, srv2.GetBytes/1024)
 }
 
 // TestGatherDemandBatchesBurst (#124/session 30): concurrent footer demand misses
@@ -339,7 +377,7 @@ func TestFillBatchParallelDispatch(t *testing.T) {
 	for i := int64(0); i < 64; i++ {
 		ranges = append(ranges, Range{i * mib, i*mib + 100<<10})
 	}
-	bs.FillBatch(context.Background(), k, ranges, size)
+	bs.FillBatch(context.Background(), k, ranges, size, 0)
 	if peak := bs.FillInflightPeak(); peak < 48 {
 		t.Fatalf("fill inflight peak = %d, want ≥ ~64 (parallel dispatch of a 64-run batch)", peak)
 	}
