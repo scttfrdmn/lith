@@ -944,14 +944,14 @@ func (bs *BlockStore) recordFill(kind fillKind, n int64) {
 // recordBatch records a coalesced fill batch (#124): plan bytes (the requested
 // projection), gap bytes (fetched only to close sub-coalesceGap gaps), and one
 // FillRun per merged range GET.
-func (bs *BlockStore) recordBatch(planBytes, gapBytes, runs int64, batchSize int) {
+func (bs *BlockStore) recordBatch(planBytes, gapBytes, runs int64, batchSize int, kind fillKind) {
 	if bs.fill == nil {
 		return
 	}
 	bs.fill.FillBatchSize(batchSize)
 	if planBytes > 0 {
 		bs.fill.FillPartial()
-		bs.fill.FillBytes("plan", planBytes)
+		bs.fill.FillBytes(kind.label(), planBytes)
 	}
 	if gapBytes > 0 {
 		bs.fill.FillBytes("gap", gapBytes)

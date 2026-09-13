@@ -142,7 +142,7 @@ func New() *Metrics {
 			Name: "lith_fill_partial_total", Help: "Sub-chunk (sparse) fills — fewer than all extents of a 1 MiB chunk (#118).",
 		}),
 		fillBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection), demand (read of an unfilled extent), whole (streaming/prefetch), gap (fetched only to close a sub-coalesce-gap hole) (#118/#124).",
+			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection plan), demand-batch (coalesced union of a demand-read burst), demand (single unfilled-extent read), whole (streaming/prefetch), gap (fetched only to close a sub-coalesce-gap hole) (#118/#124/#125).",
 		}, []string{"kind"}),
 		fillRuns: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_fill_runs_total", Help: "Coalesced fill-batch range GETs (#124).",

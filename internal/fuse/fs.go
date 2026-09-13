@@ -511,7 +511,11 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// pre_buffer) issues many reads at once; without this each is its own tiny
 		// GET. Skipped when the extents are already cached (no tick on a warm read).
 		if end > off && !f.store.Covered(h.key, off, end-off, h.size) {
-			f.store.GatherDemand(f.ctx, h.key, off, end-off, h.size)
+			// Cap the demand-batch coalesce gap: a byte-precise footer handle must not
+			// let a burst of column reads merge across the non-projected columns between
+			// them (#125 session 43 — the demand caller of the coalescer that #153's cap
+			// missed).
+			f.store.GatherDemand(f.ctx, h.key, off, end-off, h.size, blockstore.ProjectionCoalesceGap)
 		}
 	}
 
