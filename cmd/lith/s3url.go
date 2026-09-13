@@ -43,16 +43,35 @@ func parseCargoshipManifestArg(arg, mountBucket string) (bucket, key string, err
 	return mountBucket, strings.TrimPrefix(arg, "/"), nil
 }
 
-// newLogger returns a slog logger writing to stderr: text on a terminal, JSON
-// otherwise (per design §6).
-func newLogger() *slog.Logger {
+// newLogger returns an info-level slog logger writing to stderr: text on a
+// terminal, JSON otherwise (per design §6).
+func newLogger() *slog.Logger { return newLoggerAt(slog.LevelInfo) }
+
+// newLoggerAt is newLogger at an explicit minimum level.
+func newLoggerAt(level slog.Level) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
 	var h slog.Handler
 	if isTerminal(os.Stderr) {
-		h = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{})
+		h = slog.NewTextHandler(os.Stderr, opts)
 	} else {
-		h = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{})
+		h = slog.NewJSONHandler(os.Stderr, opts)
 	}
 	return slog.New(h)
+}
+
+// parseLogLevel maps a --log-level string to a slog.Level, defaulting to info
+// for an empty or unrecognized value.
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func isTerminal(f *os.File) bool {

@@ -56,6 +56,7 @@ type mountFlags struct {
 	exec             bool
 	autoIndexLimit   int
 	daemon           bool
+	logLevel         string
 
 	// S3 client options (shared with index build).
 	noSignRequest bool
@@ -110,6 +111,7 @@ func newMountCmd() *cobra.Command {
 	fl.BoolVar(&f.exec, "exec", false, "report files as mode 0555 instead of 0444")
 	fl.IntVar(&f.autoIndexLimit, "auto-index-limit", 5_000_000, "max keys to auto-index at mount")
 	fl.BoolVar(&f.daemon, "daemon", false, "fork into the background after the mount is ready")
+	fl.StringVar(&f.logLevel, "log-level", "info", "log verbosity: debug, info, warn, error")
 	fl.BoolVar(&f.noSignRequest, "no-sign-request", false, "send anonymous requests (public buckets)")
 	fl.BoolVar(&f.requesterPays, "requester-pays", false, "add the requester-pays header to every request")
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
@@ -122,7 +124,8 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if f.daemon && !isDaemonChild() {
 		return daemonize()
 	}
-	log := newLogger()
+	log := newLoggerAt(parseLogLevel(f.logLevel))
+	slog.SetDefault(log) // so package-level slog.Debug diagnostics (e.g. footer plan) honor --log-level
 
 	if f.cargoship != "" && f.indexFile != "" {
 		return fmt.Errorf("--cargoship and --index-file are mutually exclusive")
