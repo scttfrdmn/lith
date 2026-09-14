@@ -466,7 +466,6 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// (it wants the whole file), like every non-footer handle.
 	if fi.Size > f.partsThreshold() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		for _, pb := range h.pf.open(f.perHandleWindow()) {
-			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
 	}
@@ -564,7 +563,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		res = fuse.ReadResultData(chunk[lo:hi])
 	} else {
 		// Straddles a chunk boundary: assemble (a copy).
-		f.cfg.Metrics.ReadStraddle()
+		f.met.ReadStraddle()
 		data, err := f.store.GetRange(f.ctx, h.key, off, length, h.size)
 		if err != nil {
 			return nil, fuse.EIO
@@ -580,7 +579,6 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		blk := off / f.blockSize
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
-			pb := pb
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
 	}
@@ -772,7 +770,7 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	if h != nil {
 		halvings, resets := h.pf.halvings(), h.pf.resets()
 		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
-		f.cfg.Metrics.PrefetchSeeks(halvings, resets)
+		f.met.PrefetchSeeks(halvings, resets)
 	}
 }
 

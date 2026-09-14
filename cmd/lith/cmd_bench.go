@@ -32,7 +32,6 @@ type benchFlags struct {
 	blockSize      string
 	memCache       string
 	diskCache      string
-	diskPath       string
 	cacheDir       string
 	ops            int
 	runs           int
@@ -74,7 +73,6 @@ func newBenchCmd() *cobra.Command {
 	fl.StringVar(&f.blockSize, "block-size", "8MiB", "fill/readahead block size")
 	fl.StringVar(&f.memCache, "mem-cache", "1GiB", "memory cache size")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk cache size (0 disables)")
-	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory")
 	fl.StringVar(&f.cacheDir, "cache-dir", "", "throwaway base dir for per-run cold caches (default $TMPDIR)")
 	fl.IntVar(&f.ops, "ops", 10000, "number of ops for rand4k/stride")
 	fl.IntVar(&f.runs, "runs", 1, "number of cold runs (median reported); a warm run follows")
@@ -199,7 +197,6 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	if cacheBase == "" {
 		cacheBase = os.TempDir()
 	}
-	benchBucket = bucket
 
 	mkStore := func(cacheDir string) (*blockstore.BlockStore, *countingRecorder, error) {
 		rec := &countingRecorder{}
@@ -215,7 +212,7 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 	}
 
 	if f.readers > 0 {
-		return runMultiReader(ctx, out, f, client, mkStore, cacheBase, s3status)
+		return runMultiReader(ctx, out, f, client, mkStore, cacheBase, bucket, s3status)
 	}
 	if key == "" {
 		return fmt.Errorf("bench needs an object key: s3://bucket/key")
@@ -224,29 +221,29 @@ func runBench(ctx context.Context, out io.Writer, f *benchFlags, bucket, key str
 }
 
 // mountObjects builds an index over the given keys and mounts it, returning the
-// mount dir, the server, the recorder, and a cleanup func.
-func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64, stats *fusefs.PrefetchStats, met *metrics.Metrics) (string, *fusefs.Config, func(), error) {
+// mount dir and a cleanup func.
+func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.BlockStore, bucket string, keys []string, maxReadahead int64, stats *fusefs.PrefetchStats, met *metrics.Metrics) (string, func(), error) {
 	entries := make([]index.Entry, 0, len(keys))
 	for _, k := range keys {
 		h, err := client.HeadObject(ctx, k)
 		if err != nil {
-			return "", nil, nil, fmt.Errorf("head %s: %w", k, err)
+			return "", nil, fmt.Errorf("head %s: %w", k, err)
 		}
 		entries = append(entries, index.Entry{Key: k, Size: h.Size, MTime: h.LastModified.UnixNano(), ETagHash: index.HashETag(h.ETag)})
 	}
 	ix := index.Build(entries, index.Options{Bucket: bucket})
 	mnt, err := os.MkdirTemp("", "lith-bench-mnt-")
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, err
 	}
 	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead, PrefetchStats: stats, Metrics: met}
 	srv, _, err := fusefs.Mount(mnt, *cfg, fusefs.MountOptions{FsName: "lith-bench"})
 	if err != nil {
 		_ = os.RemoveAll(mnt)
-		return "", nil, nil, fmt.Errorf("bench mount: %w", err)
+		return "", nil, fmt.Errorf("bench mount: %w", err)
 	}
 	cleanup := func() { _ = srv.Unmount(); _ = os.RemoveAll(mnt) }
-	return mnt, cfg, cleanup, nil
+	return mnt, cleanup, nil
 }
 
 func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3client.API, mkStore func(string) (*blockstore.BlockStore, *countingRecorder, error), cacheBase, bucket, key string, blockSize, windowBytes int64) error {
@@ -270,7 +267,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 		}
 		met := metrics.New()
 		lastMet = met
-		mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, met)
+		mnt, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, met)
 		if merr != nil {
 			return merr
 		}
@@ -296,7 +293,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	if berr != nil {
 		return berr
 	}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, nil)
+	mnt, cleanup, merr := mountObjects(ctx, client, bs, bucket, []string{key}, f.maxReadahead, nil, nil)
 	if merr != nil {
 		return merr
 	}
@@ -344,7 +341,7 @@ func runSingle(ctx context.Context, out io.Writer, f *benchFlags, client s3clien
 	return nil
 }
 
-func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3client.API, mkStore func(string) (*blockstore.BlockStore, *countingRecorder, error), cacheBase string, s3status *statusCounter) error {
+func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3client.API, mkStore func(string) (*blockstore.BlockStore, *countingRecorder, error), cacheBase string, bucket string, s3status *statusCounter) error {
 	if f.objects == "" {
 		return fmt.Errorf("--readers requires --objects (comma-separated keys)")
 	}
@@ -358,7 +355,7 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 		return berr
 	}
 	pfStats := &fusefs.PrefetchStats{}
-	mnt, _, cleanup, merr := mountObjects(ctx, client, bs, benchBucket, keys, f.maxReadahead, pfStats, nil)
+	mnt, cleanup, merr := mountObjects(ctx, client, bs, bucket, keys, f.maxReadahead, pfStats, nil)
 	if merr != nil {
 		return merr
 	}
@@ -413,9 +410,6 @@ func runMultiReader(ctx context.Context, out io.Writer, f *benchFlags, client s3
 	_ = tw.Flush()
 	return nil
 }
-
-// benchBucket is set by runBench so multi-reader mode can build its index.
-var benchBucket string
 
 func runReadersPaths(paths []string) (float64, []float64) {
 	per := make([]float64, len(paths))
