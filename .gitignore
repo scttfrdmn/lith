@@ -20,3 +20,6 @@ nic*.json
 .idea/
 .vscode/
 site/
+
+# Built binary (produced by `go build`; the release binary comes from goreleaser)
+/lith
