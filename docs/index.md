@@ -25,6 +25,22 @@ lith version
 
 Or, with Go installed: `go install github.com/scttfrdmn/lith/cmd/lith@latest`.
 
+## 1.5. Check your setup (`lith doctor`)
+
+One command tells you whether lith will work here before you mount anything —
+credentials, bucket access and region, LIST permission, FUSE, and the mountpoint.
+Each check prints `PASS`/`FAIL`/`N/A` with a one-line fix; it exits non-zero if
+anything fails.
+
+```bash
+lith doctor s3://1000genomes/phase3/data/HG00100/alignment --no-sign-request
+```
+
+It catches the things that otherwise surface as a cryptic mount error: a
+region-mismatched client, a bucket that denies `ListObjectsV2` (it points you at
+`--keys`), missing FUSE, or a `sudo`-created mountpoint that's root-owned. Run it
+first on a new box.
+
 ## 2. Build the index
 
 `s3://1000genomes` is public, so pass `--no-sign-request`. Index one sample's
