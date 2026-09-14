@@ -39,6 +39,8 @@ func resolvePointer(ctx context.Context, client s3client.API, bucket, dataset, r
 	switch ref {
 	case "current":
 		curKey := path.Join(dataset, "CURRENT")
+		// GetRange with 0, 0 reads the whole (small) pointer object into memory. This deliberately bypasses
+		// the block cache, which is for the mounted data path, not control objects.
 		data, _, err := client.GetRange(ctx, curKey, 0, 0)
 		if err != nil {
 			return nil, "", fmt.Errorf("resolve @current: GET pointer %q: %w", curKey, err)
