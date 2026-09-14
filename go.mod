@@ -3,7 +3,7 @@ module github.com/scttfrdmn/lith
 go 1.27.1
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.46.0
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.19.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.3
