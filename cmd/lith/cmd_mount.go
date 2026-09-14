@@ -209,18 +209,18 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// the prefix here; a plain prefix (dataset == prefix, ref == "") is unchanged.
 	dataset, ref := splitPointerRef(prefix)
 	rootPrefix := prefix
+	var resolvedVersion string // the published version id, for @ref mounts (refresh + record)
 	if ref != "" {
 		if f.cargoship != "" || f.indexFile != "" {
 			return fmt.Errorf("s3://…@%s is mutually exclusive with --cargoship and --index-file", ref)
 		}
-		var vid string
-		ix, vid, err = resolvePointer(ctx, client, bucket, dataset, ref)
+		ix, resolvedVersion, err = resolvePointer(ctx, client, bucket, dataset, ref)
 		if err != nil {
 			return err // fail closed: no fallback to listing (#141)
 		}
 		rootPrefix = ""
 		manifest = "s3://" + bucket + "/" + dataset + "@" + ref
-		log.Info("mounted published dataset", "dataset", dataset, "ref", ref, "version", vid, "keys", ix.Len())
+		log.Info("mounted published dataset", "dataset", dataset, "ref", ref, "version", resolvedVersion, "keys", ix.Len())
 	} else if f.cargoship != "" {
 		// Fail-closed CargoShip mount: build the archive index in-process from the
 		// manifest. A resolution failure returns an error here — it must NEVER fall
@@ -369,7 +369,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		Limits:             limits,
 	}
 
-	srv, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{
+	srv, swapper, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{
 		AllowOther: f.allowOther,
 		FsName:     "s3://" + bucket,
 	})
@@ -383,7 +383,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// on clean exit. Best-effort — a record failure must not fail the mount.
 	if p, werr := writeMountRecord(mountRecord{
 		PID: os.Getpid(), Mountpoint: mountpoint, Bucket: bucket, Root: root.Prefix(),
-		IndexFile: f.indexFile, Manifest: manifest, Start: time.Now(),
+		IndexFile: f.indexFile, Manifest: manifest, Version: resolvedVersion, Start: time.Now(),
 	}); werr != nil {
 		log.Warn("could not write mount record", "err", werr)
 	} else {
@@ -442,6 +442,39 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 			log.Warn("unmount failed; retrying via lazy unmount", "err", err)
 		}
 	}()
+
+	// `lith refresh` (#167): on SIGHUP, re-resolve @current (or the pinned ref) and,
+	// if the version changed, atomically swap the index. Explicit only — no polling.
+	// Open handles keep the version they resolved against; only new lookups see the
+	// swap. A version-changing swap on a gateway is a different (refused) story, but
+	// a single-client FUSE mount hot-swaps cleanly. Failures keep the current version.
+	if ref != "" && swapper != nil {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				newIx, newV, rerr := resolvePointer(ctx, client, bucket, dataset, ref)
+				if rerr != nil {
+					log.Warn("refresh failed; keeping current version", "version", resolvedVersion, "err", rerr)
+					continue
+				}
+				if newV == resolvedVersion {
+					log.Info("refresh: already at current version", "version", resolvedVersion)
+					continue
+				}
+				newRoot, rerr := newIx.Root("")
+				if rerr != nil {
+					log.Warn("refresh: cannot root new index; keeping current version", "err", rerr)
+					continue
+				}
+				old := resolvedVersion
+				swapper.SwapIndex(newRoot)
+				resolvedVersion = newV
+				_ = updateMountRecordVersion(mountpoint, newV)
+				log.Info("refreshed published dataset", "from", old, "to", newV, "keys", newRoot.Len())
+			}
+		}()
+	}
 
 	srv.Wait() // blocks until unmounted
 	log.Info("unmounted", "stale_objects", len(bs.StaleKeys()))

@@ -15,7 +15,7 @@ type MountOptions struct {
 // Mount builds the read-only FUSE server, mounts it at mountpoint, and starts
 // serving in the background. The caller waits on the returned server and calls
 // Unmount to tear it down.
-func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error) {
+func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, IndexSwapper, error) {
 	raw := NewRawFileSystem(cfg)
 
 	// Leave MaxWrite at the go-fuse default (128 KiB): the kernel then issues
@@ -35,11 +35,12 @@ func Mount(mountpoint string, cfg Config, mo MountOptions) (*fuse.Server, error)
 
 	srv, err := fuse.NewServer(raw, mountpoint, opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	go srv.Serve()
 	if err := srv.WaitMount(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return srv, nil
+	swapper, _ := raw.(IndexSwapper)
+	return srv, swapper, nil
 }

@@ -21,9 +21,41 @@ type mountRecord struct {
 	Bucket     string    `json:"bucket"`
 	Root       string    `json:"root"`
 	IndexFile  string    `json:"index_file"`
-	Manifest   string    `json:"manifest,omitempty"` // cargoship manifest key for a --cargoship mount
+	Manifest   string    `json:"manifest,omitempty"` // cargoship manifest key or s3://…@ref for a pointer mount
+	Version    string    `json:"version,omitempty"`  // resolved published version id for an @ref mount (#167)
 	Start      time.Time `json:"start"`
 	path       string    // the record file (not serialized)
+}
+
+// readMountRecord reads the record for a single mountpoint. It trusts the run dir
+// the same way listMountRecords does — a record from a dir we do not own is never
+// returned (its pid must never be signalled).
+func readMountRecord(mountpoint string) (mountRecord, error) {
+	var r mountRecord
+	if err := dirTrusted(lithRunDir()); err != nil {
+		return r, err
+	}
+	b, err := os.ReadFile(recordPath(mountpoint))
+	if err != nil {
+		return r, err
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return r, err
+	}
+	r.path = recordPath(mountpoint)
+	return r, nil
+}
+
+// updateMountRecordVersion rewrites a mount record's resolved version after a
+// refresh so `lith mounts` reflects the live version. Best-effort.
+func updateMountRecordVersion(mountpoint, version string) error {
+	r, err := readMountRecord(mountpoint)
+	if err != nil {
+		return err
+	}
+	r.Version = version
+	_, err = writeMountRecord(r)
+	return err
 }
 
 // lithRunDir returns the per-user runtime directory for mount records:
