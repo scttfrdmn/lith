@@ -70,14 +70,16 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      # Build the binary into the context exactly as goreleaser hands it to the
-      # Dockerfile, then build the image without pushing — a PR that breaks the
-      # image (bad COPY, base bump) fails here, before any tag is cut.
+      # Build the binary into the same os/arch layout goreleaser (dockers_v2)
+      # hands the Dockerfile, then build the image without pushing — a PR that
+      # breaks the image (bad COPY, base bump) fails here, before any tag is cut.
       - name: build binary into context
         env:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: "0"
-        run: go build -trimpath -o lith ./cmd/lith
+        run: |
+          mkdir -p linux/amd64
+          go build -trimpath -o linux/amd64/lith ./cmd/lith
       - name: docker build (no push)
-        run: docker build -t lith:ci .
+        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t lith:ci .

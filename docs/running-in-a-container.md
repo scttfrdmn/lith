@@ -124,27 +124,39 @@ volume for a sidecar or the gateway to pick up.
 
 ## The awkward case: FUSE mount inside a container
 
-`lith mount` works in a container, but mounting is not a userspace-only
-operation, so it needs more than the gateway does — and there is a caveat worth
-knowing before you try:
+`lith mount` in a container needs two things the gateway does not — and one of
+them the distroless image deliberately does not have:
 
-```bash
-docker run --rm -it \
-  --device /dev/fuse \
-  --cap-add SYS_ADMIN \
-  ghcr.io/scttfrdmn/lith:latest \
-  mount s3://1000genomes/phase3/data/HG00100/alignment /mnt \
-    --no-sign-request
-```
+1. **`fusermount3`**, which lith invokes to mount. The distroless image does
+   **not** ship it (that is the point of distroless), so `lith mount` fails
+   there with `exec: "/bin/fusermount": no such file or directory`. **The
+   published image cannot FUSE-mount** — for FUSE in a container you must build
+   your own image on a base that has `fuse3` installed:
 
-- `--device /dev/fuse` and `--cap-add SYS_ADMIN` (or a FUSE device plugin) are
-  required — the kernel mount syscall needs them.
-- **The mount is namespace-local.** It is visible only *inside that container*,
-  not on the host and not in other containers, unless you explicitly share the
-  mount (e.g. a bind-propagation `rshared` mount into the host). A user who
-  skips this sees a mount that "works" in the container and is invisible
-  everywhere else — that is expected, not a bug.
+   ```dockerfile
+   FROM amazonlinux:2023          # or debian:stable-slim, etc.
+   RUN dnf install -y fuse3 && dnf clean all
+   COPY --from=ghcr.io/scttfrdmn/lith:latest /lith /lith
+   ENTRYPOINT ["/lith"]
+   ```
+
+2. **`--device /dev/fuse` and `--cap-add SYS_ADMIN`** (or a FUSE device plugin)
+   at run time — the kernel mount syscall needs them. Without the device the
+   mount fails (`fuse device not found`); without the capability it is denied.
+
+   ```bash
+   docker run --rm -it --device /dev/fuse --cap-add SYS_ADMIN \
+     your-image-with-fuse3 \
+     mount s3://1000genomes/phase3/data/HG00100/alignment /mnt --no-sign-request
+   ```
+
+**The mount is namespace-local.** It is visible only *inside that container* —
+it does **not** appear in the host's mount table (`findmnt` / `/proc/mounts`) or
+in other containers, reachable from outside only by entering the container's
+namespace explicitly (`docker exec`, `/proc/<pid>/root`). A user who does not
+know this sees a mount that "works" in the container and is invisible
+everywhere else — that is expected, not a bug.
 
 For sharing a dataset across containers or nodes, don't reach for per-container
-FUSE mounts — run the **gateway** and mount it over NFS. That is what the image
-is for.
+FUSE mounts at all — run the **gateway** and mount it over NFS. That is what the
+published image is for.

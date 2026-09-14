@@ -11,7 +11,12 @@
 # then runs this same Dockerfile, so a PR that breaks the image fails the gate.
 FROM gcr.io/distroless/static:nonroot
 
-COPY lith /lith
+# goreleaser (dockers_v2) stages the prebuilt binary under an os/arch subdir and
+# sets TARGETPLATFORM per build, so one Dockerfile serves both architectures from
+# the already-built artifacts — no compile step here. The CI "docker build" check
+# reproduces the same layout (linux/amd64/lith) and passes the same build-arg.
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/lith /lith
 COPY LICENSE /LICENSE
 
 # `lith` as the entrypoint with no default command: `docker run … lith serve nfs`
