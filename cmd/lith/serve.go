@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -134,14 +136,40 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	// identity: the index file's sha256, else the CargoShip manifest sha, else
 	// the bucket+prefix). A restart against the same index reproduces it; a
 	// rebuilt index yields a different one, so old handles go STALE (#144).
-	ix, closeIdx, rootID, err := loadServeIndex(ctx, f, client, bucket, prefix, log)
-	if err != nil {
-		return err
+	// Pointer-based gateway (#167): s3://bucket/dataset@current or @<version-id>.
+	// Resolve the published version's prebuilt index and serve the archive's own
+	// file tree (root ""). The handle root id is derived from the version, so a
+	// version change would change every handle — which is exactly why the gateway
+	// refuses a live version swap (see the SIGHUP handler below).
+	dataset, ref := splitPointerRef(prefix)
+	rootPrefix := prefix
+	var (
+		ix            *index.Index
+		closeIdx      func() error
+		rootID        [8]byte
+		servedVersion string
+	)
+	if ref != "" {
+		if f.cargoship != "" || f.indexFile != "" {
+			return fmt.Errorf("s3://…@%s is mutually exclusive with --cargoship and --index-file", ref)
+		}
+		ix, servedVersion, err = resolvePointer(ctx, client, bucket, dataset, ref)
+		if err != nil {
+			return err // fail closed: no fallback to listing (#141)
+		}
+		rootPrefix = ""
+		rootID = pointerRootID(bucket, dataset, servedVersion)
+		log.Info("serving published dataset", "dataset", dataset, "ref", ref, "version", servedVersion)
+	} else {
+		ix, closeIdx, rootID, err = loadServeIndex(ctx, f, client, bucket, prefix, log)
+		if err != nil {
+			return err
+		}
 	}
 	if closeIdx != nil {
 		defer func() { _ = closeIdx() }()
 	}
-	reader, err := ix.Root(prefix)
+	reader, err := ix.Root(rootPrefix)
 	if err != nil {
 		return err
 	}
@@ -217,9 +245,56 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		"keys", reader.Len(), "root_id", fmt.Sprintf("%x", rootID), "portmap", !f.noPortmap)
 	fmt.Fprintf(os.Stderr, "mount with: sudo mount -t nfs -o vers=3,proto=tcp,port=%s,mountport=%s,nolock <host>:/ /mnt\n", portOf(f.listen), portOf(f.listen))
 
+	// Gateway refresh (#167): unlike a single-client FUSE mount, the gateway does
+	// NOT hot-swap. A version change would change every handle's RootID and STALE
+	// all connected clients, and NFSv3 is stateless so those clients cannot be
+	// detected. So on SIGHUP the gateway re-resolves and REFUSES a version change
+	// with a clear, actionable message (this is a documented steady state, not an
+	// operator error). A pointer that still resolves to the served version is a
+	// legitimate no-op success. The handler is installed for @ref gateways so a
+	// refresh attempt logs the refusal rather than SIGHUP's default (terminate).
+	if ref != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				_, resolved, rerr := resolvePointer(ctx, client, bucket, dataset, ref)
+				if rerr != nil {
+					log.Warn("refresh: cannot re-resolve the pointer; gateway unchanged", "serving", servedVersion, "err", rerr)
+					continue
+				}
+				if !gatewayRefreshRefused(servedVersion, resolved) {
+					log.Info("refresh: gateway already serving the current version (no-op)", "version", servedVersion)
+					continue
+				}
+				log.Warn("refresh REFUSED on the NFS gateway: adopting a new version would change every file handle and STALE all connected clients, and NFSv3 is stateless so connected clients cannot be detected. The gateway keeps serving the current version. To adopt the new version: restart the gateway, then remount clients.",
+					"serving", servedVersion, "available", resolved)
+			}
+		}()
+	}
+
 	return lithnfs.Serve(ctx, ln, lithnfs.Config{
 		Index: reader, Store: bs, RootID: rootID, ClientIdle: f.clientIdle, Metrics: met, Logger: log,
 	})
+}
+
+// gatewayRefreshRefused reports whether a gateway refresh must be refused: the
+// pointer resolved to a version DIFFERENT from the one being served (adopting it
+// would STALE every client handle). Resolving to the same version is a legitimate
+// no-op success, not a refusal.
+func gatewayRefreshRefused(served, resolved string) bool {
+	return resolved != "" && resolved != served
+}
+
+// pointerRootID derives an NFS handle root id from a published version: stable
+// while a gateway serves that version (so a restart reproduces handles), and
+// different across versions (so adopting a new version is a clean STALE, never a
+// silent reinterpretation of an existing handle).
+func pointerRootID(bucket, dataset, versionID string) [8]byte {
+	sum := sha256.Sum256([]byte("published:" + bucket + "/" + dataset + "@" + versionID))
+	var id [8]byte
+	copy(id[:], sum[:8])
+	return id
 }
 
 // loadServeIndex loads/builds the index and returns it, a close func, and the
