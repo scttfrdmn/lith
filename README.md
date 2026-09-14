@@ -13,6 +13,22 @@ index after a one-time build.
 bucket's objects as read-only strata, exactly as they were laid down: the
 bucket's native key layout is the stratum, and lith never rewrites it.
 
+**Read-only by definition — the reason lith exists.** No write path is not a
+limitation; it is what buys free local metadata, an index two uncoordinated
+readers agree on, handles pinned at open, and a cluster cache that never needs
+invalidation. A tool that can write cannot have those; writes are a separate
+program.
+
+**Cloud-native by thesis, portable by implementation — why it works.** lith runs
+against any S3-compatible endpoint, but its economics come from the cloud:
+aggregate bandwidth that grows as readers are added, data that is already in the
+store, ephemeral compute, and free durability. *Lustre and GPFS are on-prem
+designs running in the cloud; lith is a design that could not have been built
+anywhere else.*
+
+Whether lith is for you — and where it is the wrong tool — is
+**[What lith is for](https://scttfrdmn.github.io/lith/scope/)**.
+
 ## What it is
 
 - **Read-only.** There is no write path. Every mutating operation returns `EROFS`.
@@ -87,7 +103,7 @@ Full docs — how to use lith, when to use it, and when not to — are at
 - **[Sizing the node](https://scttfrdmn.github.io/lith/sizing/)** — NIC, RAM, NVMe, and lith's own CPU cost; the per-class matrix.
 - **[Meet a deadline](https://scttfrdmn.github.io/lith/deadline/)** — fan-out: wider is sooner *and* cheaper with a mount.
 - **[Knobs](https://scttfrdmn.github.io/lith/knobs/)** — every flag, grouped by the trade it makes.
-- **[What lith is not](https://scttfrdmn.github.io/lith/not/)** — the edges and the physical limits.
+- **[What lith is for](https://scttfrdmn.github.io/lith/scope/)** — whether lith fits, the two-category boundary, and where it is the wrong tool.
 
 Benchmark data lives in [`bench/results/`](bench/results/); the S3 client
 ceiling can be reproduced independently with `cmd/lith-s3bench`.
