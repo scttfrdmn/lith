@@ -7,6 +7,14 @@
 #
 # Installs: fuse3, samtools, fio, awscli, mountpoint-s3 (arm64), and a Go
 # toolchain matching the Mac. Mounts the local NVMe instance store at /mnt/nvme.
+#
+# spawn --cost-limit is a HARD RUNTIME KILL, not a launch guard: spawn terminates
+# the box the moment accrued cost reaches the cap, mid-run, even with TTL left. So
+# size the cap to the WORST-CASE runtime, not the estimate — a cap sized to the
+# expected cost silently truncates a run that goes long (W1, session 44: a
+# $12 cap on a $16.47/hr box killed the box at ~44 min, mid-measurement). Rule of
+# thumb: cap ≈ worst_case_minutes/60 × $/hr, with headroom. Note a full-device
+# instance-store fill is itself ~15-20 min (tens of TB) before any measurement.
 
 set -euo pipefail
 
