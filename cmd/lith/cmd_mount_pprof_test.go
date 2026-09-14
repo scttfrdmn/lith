@@ -14,7 +14,7 @@ import (
 // does NOT register the pprof surface. Uses httptest.ResponseRecorder against
 // the mux's handler directly — no real network listener is opened.
 func TestMetricsMuxHasNoPprof(t *testing.T) {
-	mux := newMetricsMux(metrics.New())
+	mux := newMetricsMux(metrics.New(), newReadiness("test"))
 
 	if got := statusFor(mux, "/metrics"); got != http.StatusOK {
 		t.Errorf("/metrics on metrics mux = %d, want 200", got)

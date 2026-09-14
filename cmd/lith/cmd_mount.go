@@ -396,7 +396,11 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// (often reachable network-wide) never expose the pprof surface.
 	var metricsSrv *http.Server
 	if met != nil {
-		metricsSrv = &http.Server{Addr: f.metrics, Handler: newMetricsMux(met)}
+		// The mount is already serving by here (Mount succeeded above), so /readyz
+		// reports ready as soon as the endpoint is reachable.
+		ready := newReadiness("starting")
+		ready.set(true, "mounted and serving")
+		metricsSrv = &http.Server{Addr: f.metrics, Handler: newMetricsMux(met, ready)}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Warn("metrics server stopped", "err", err)
@@ -494,9 +498,10 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 // newMetricsMux builds the --metrics mux. It serves ONLY /metrics; the pprof
 // handlers are deliberately not registered here (see F1) so a network-reachable
 // scrape target does not expose the pprof surface.
-func newMetricsMux(met *metrics.Metrics) *http.ServeMux {
+func newMetricsMux(met *metrics.Metrics, ready *readiness) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", met.Handler())
+	addHealth(mux, ready)
 	return mux
 }
 
