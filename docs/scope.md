@@ -27,7 +27,10 @@ lith is good at:
   opened, because nothing lith does can replace the bytes behind it.
 - **A cluster cache needs no invalidation.** The [gateway](serving-a-cluster.md)
   caches with no coherence protocol at all — nothing can go stale within the
-  index it is serving, so there is nothing to invalidate.
+  index it is serving, so there is nothing to invalidate. (When the bucket
+  itself changes underneath a running mount, that is a different thing, and lith
+  handles it by returning an error rather than stale bytes — see
+  [Where lith is the wrong tool](#where-lith-is-the-wrong-tool).)
 
 A tool with a write path cannot have these properties, no matter how well it is
 engineered — the moment any client can change the namespace, the free metadata,
@@ -62,7 +65,8 @@ properties from object storage, none of which an on-prem object store
 lith *runs* against any S3-compatible endpoint — point `--endpoint` at a lab's
 MinIO or a test server and it works, which is genuinely useful. What does not
 travel is the economic argument: on hardware you already bought, the crossover
-math that makes lith compelling is no longer the math you are doing.
+math that makes lith compelling is no longer the math you are doing. The
+distinction is one of economics and scale, not of what is technically possible:
 
 > Lustre and GPFS are on-prem designs running in the cloud; lith is a design
 > that could not have been built anywhere else.

@@ -38,6 +38,11 @@ markdown_extensions:
 
 plugins:
   - search
+  # not.md folded into scope.md; keep the published /not/ URL alive for
+  # search-engine and bookmarked links.
+  - redirects:
+      redirect_maps:
+        not.md: scope.md
 
 nav:
   - Start here: index.md
