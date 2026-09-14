@@ -47,5 +47,6 @@ nav:
   - CargoShip archives: cargoship.md
   - Published datasets: published-datasets.md
   - Serving a cluster: serving-a-cluster.md
+  - Running in a container: running-in-a-container.md
   - Knobs: knobs.md
   - What lith is not: not.md

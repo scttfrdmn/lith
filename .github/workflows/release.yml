@@ -37,6 +37,11 @@ jobs:
   goreleaser:
     needs: gate
     runs-on: ubuntu-latest
+    # packages: write lets goreleaser push the distroless image to GHCR in the
+    # same gated run as the binaries — an image never ships without the gate.
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
@@ -45,6 +50,14 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
+      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a  # v4.3.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+      - name: log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: goreleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6
         with:

@@ -37,6 +37,37 @@ archives:
     formats: [binary]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
+# Distroless multi-arch image, built from the same binaries as the archives
+# above (ids: [lith]) — not a second build path. dockers_v2 builds both
+# platforms and pushes one manifest per tag. Tags: the exact version and the
+# floating major.minor always; `latest` only on a real release (the empty tag
+# from a prerelease is dropped).
+dockers_v2:
+  - id: lith
+    images:
+      - ghcr.io/scttfrdmn/lith
+    ids: [lith]
+    dockerfile: Dockerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    extra_files:
+      - LICENSE
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.title: lith
+      org.opencontainers.image.description: Read-only FUSE-over-S3 filesystem and NFSv3 gateway
+      org.opencontainers.image.source: https://github.com/scttfrdmn/lith
+      org.opencontainers.image.url: https://github.com/scttfrdmn/lith
+      org.opencontainers.image.documentation: https://scttfrdmn.github.io/lith/
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.licenses: Apache-2.0
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
