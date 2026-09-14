@@ -14,8 +14,8 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.19.1
 	github.com/prometheus/client_golang v1.24.1
-	github.com/spf13/cobra v1.8.1
-	github.com/spf13/pflag v1.0.5
+	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.9
 	github.com/willscott/go-nfs v0.0.4
 	github.com/zeebo/xxh3 v1.0.2
 )
