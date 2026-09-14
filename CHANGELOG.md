@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-14
+
+**Published datasets: pack and publish once, mount it anywhere by name.** A
+CargoShip-published dataset is a versioned prefix with an atomic `CURRENT`
+pointer; `lith mount s3://bucket/dataset@current` resolves the pointer and mounts
+the current immutable version — no index file to track, and two uncoordinated
+readers of the same name serve byte-identical namespaces. This is the seam
+between CargoShip and lith closed on lith's side.
+
+### Added
+
+- **Pointer-based mounts — `s3://bucket/dataset@current` / `@<version-id>`**
+  ([#167](https://github.com/scttfrdmn/lith/issues/167)/[#169](https://github.com/scttfrdmn/lith/issues/169)):
+  resolve the atomic `CURRENT` pointer to a published version's prebuilt index and
+  mount it; a bare `s3://bucket/prefix` (no `@`) is unchanged. The `CURRENT` parser
+  is hardened (#101 discipline: 64 KiB cap checked before decode, every field
+  validated, unknown-fields/trailing rejected, never panics; fuzzed from a real
+  pointer) and **fails closed** (#141): a missing, malformed, or dangling pointer —
+  or one whose index came from a chunkless (unmountable) manifest — is a hard error
+  naming the key, never a fallback to listing (0 `ListObjectsV2`).
+- **`lith refresh <mountpoint>`**
+  ([#170](https://github.com/scttfrdmn/lith/issues/170)): re-read `CURRENT` and, if
+  a new version was published, **atomically hot-swap** the mount's index. Explicit —
+  lith never polls. An open handle keeps the version it was opened against (versions
+  are immutable, so its objects still exist), so an in-flight read stays consistent;
+  only new lookups see the new version. Inodes are path-hashed, so a file in both
+  versions keeps its inode across a swap — a cached `(dev, ino)` in `find`/`rsync`
+  stays valid.
+- **Pointer-based NFS gateway — `lith serve nfs s3://bucket/dataset@current`**
+  ([#171](https://github.com/scttfrdmn/lith/issues/171)): serves a published dataset
+  by name. The gateway does **not** hot-swap — a version change would `STALE` every
+  NFS handle and NFSv3 is stateless — so a version-changing `refresh` is refused with
+  an actionable message (restart the gateway to adopt); a same-version refresh is a
+  no-op.
+- **`pkg/lithindex`** ([#168](https://github.com/scttfrdmn/lith/issues/168)): a
+  public, cross-repo package to build a lith index from a CargoShip 2.1 manifest —
+  the producer-side library behind `cargoship publish` (cargoship#560). Its exported
+  API is a compatibility surface, kept minimal.
+- **`--log-level` on `mount` and `serve nfs`**
+  ([#155](https://github.com/scttfrdmn/lith/issues/155)): `debug`/`info`/`warn`/`error`.
+
+### Fixed
+
+- **Byte-precise Parquet projection over-fetch**
+  ([#125](https://github.com/scttfrdmn/lith/issues/125)): the demand path missed the
+  `ProjectionCoalesceGap` cap that #153 wired to the plan path — on a fat NIC its
+  concurrency-derived gap swept the non-projected columns between projected ones;
+  now capped, and the fill metric splits `demand-batch` from `plan` so the two are no
+  longer conflated ([#153](https://github.com/scttfrdmn/lith/issues/153)/[#156](https://github.com/scttfrdmn/lith/issues/156)).
+  The projection learner now records columns by read-range overlap, not start offset,
+  so `id`-at-offset-0 and coalesced reads are learned correctly
+  ([#154](https://github.com/scttfrdmn/lith/issues/154)/[#157](https://github.com/scttfrdmn/lith/issues/157)).
+  `--footer-tier2` stays **experimental, clustered-projections-only**: the measured
+  floor for a spread projection is pyarrow's own bytes, and streaming wins on time.
+
+### Docs
+
+- **Published datasets** page
+  ([#172](https://github.com/scttfrdmn/lith/issues/172)): what a published dataset
+  is, publish/mount-by-name, pointer semantics, `refresh`, and the FUSE-mount-vs-NFS-
+  gateway asymmetry; plus a "Copy or mount?" one-liner (*pack and publish once; mount
+  it anywhere by name*).
+
+### Known limits
+
+`lith refresh` hot-swaps a single-client FUSE mount; the NFS gateway adopts a new
+version by restart (NFSv3 statelessness makes a live swap unsafe). `--footer-tier2`
+remains experimental (clustered projections only).
+
 ## [0.4.0] - 2026-09-13
 
 **The NFS gateway: one node mounts, a cluster shares.** `lith serve nfs` exports a
@@ -580,7 +649,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/scttfrdmn/lith/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/lith/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.2
 [0.3.1]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.1
