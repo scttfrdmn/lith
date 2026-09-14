@@ -203,7 +203,25 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		closeIdx func() error
 		manifest string // set for a --cargoship mount (recorded, shown by `lith mounts`)
 	)
-	if f.cargoship != "" {
+	// Pointer-based mount (#167): s3://bucket/dataset@current or @<version-id>.
+	// Resolve the published version's prebuilt index and mount the archive's own
+	// file tree (root ""), not the S3 dataset prefix. The @ref is stripped from
+	// the prefix here; a plain prefix (dataset == prefix, ref == "") is unchanged.
+	dataset, ref := splitPointerRef(prefix)
+	rootPrefix := prefix
+	if ref != "" {
+		if f.cargoship != "" || f.indexFile != "" {
+			return fmt.Errorf("s3://…@%s is mutually exclusive with --cargoship and --index-file", ref)
+		}
+		var vid string
+		ix, vid, err = resolvePointer(ctx, client, bucket, dataset, ref)
+		if err != nil {
+			return err // fail closed: no fallback to listing (#141)
+		}
+		rootPrefix = ""
+		manifest = "s3://" + bucket + "/" + dataset + "@" + ref
+		log.Info("mounted published dataset", "dataset", dataset, "ref", ref, "version", vid, "keys", ix.Len())
+	} else if f.cargoship != "" {
 		// Fail-closed CargoShip mount: build the archive index in-process from the
 		// manifest. A resolution failure returns an error here — it must NEVER fall
 		// through to loadOrBuildIndex's whole-bucket listing (#137 auto-list footgun).
@@ -234,7 +252,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// pass-through (it was built at the prefix); for a loaded index built at or
 	// above the prefix, it is a sub-root view — so one whole-bucket index can
 	// back many prefix mounts (#90). Rejects a prefix the index cannot serve.
-	root, err := ix.Root(prefix)
+	root, err := ix.Root(rootPrefix)
 	if err != nil {
 		return err
 	}

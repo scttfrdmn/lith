@@ -47,6 +47,7 @@ type serveFlags struct {
 	noPortmap      bool
 	noSign         bool
 	reqPays        bool
+	logLevel       string
 }
 
 func newServeCmd() *cobra.Command {
@@ -94,6 +95,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.endpoint, "endpoint", "", "override the S3 endpoint")
 	fl.BoolVar(&f.pathStyle, "path-style", false, "use path-style S3 addressing")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
+	fl.StringVar(&f.logLevel, "log-level", "info", "log verbosity: debug, info, warn, error")
 	fl.DurationVar(&f.clientIdle, "client-idle", 5*time.Minute, "release a client's readahead share after this idle time")
 	fl.BoolVar(&f.noPortmap, "no-portmap", true, "do not register with rpcbind; clients mount with an explicit port (mountport=)")
 	fl.BoolVar(&f.noSign, "no-sign-request", false, "anonymous S3 requests (public buckets)")
@@ -102,7 +104,8 @@ func newServeNFSCmd() *cobra.Command {
 }
 
 func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) error {
-	log := newLogger()
+	log := newLoggerAt(parseLogLevel(f.logLevel))
+	slog.SetDefault(log) // so package-level slog.Debug diagnostics honor --log-level
 	if f.cargoship != "" && f.indexFile != "" {
 		return fmt.Errorf("--cargoship and --index-file are mutually exclusive")
 	}

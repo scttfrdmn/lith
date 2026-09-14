@@ -1,0 +1,11 @@
+{
+  "schema": "cargoship.current/1",
+  "version_id": "20260913T213513Z-13de9c",
+  "manifest_key": "lith-bench/published/smoke/v/20260913T213513Z-13de9c/uploads/20260913-8cbf0a0b/manifest.json.gz",
+  "index_key": "lith-bench/published/smoke/v/20260913T213513Z-13de9c/index.lith",
+  "index_sha256": "5c2324ae6e94c29a162fed5f1a2c52c180f6b1ff47995d7270e680142b0e73a8",
+  "created": "2026-09-13T21:35:50Z",
+  "file_count": 4,
+  "total_bytes": 204965,
+  "previous_version_id": "20260913T213437Z-487888"
+}
