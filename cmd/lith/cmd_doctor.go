@@ -210,16 +210,25 @@ func doctorBucket(ctx context.Context, d *doctor, f *doctorFlags, s3c *s3.Client
 	// probe, unlike an anonymous HeadBucket which 403s on public buckets.
 	bregion, err := manager.GetBucketRegion(ctx, s3c, bucket)
 	if err != nil {
+		// Classify by smithy code where available, then by the (wrapped) error
+		// string — manager.GetBucketRegion wraps the underlying S3 error, so the
+		// APIError code is not always reachable via errors.As.
+		code := ""
 		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NotFound" || strings.Contains(apiErr.ErrorCode(), "NoSuchBucket")) {
+		if errors.As(err, &apiErr) {
+			code = apiErr.ErrorCode()
+		}
+		es := err.Error()
+		switch {
+		case code == "NotFound" || strings.Contains(code, "NoSuchBucket") ||
+			strings.Contains(es, "NoSuchBucket") || strings.Contains(es, "bucket not found") || strings.Contains(es, "status code: 404"):
 			d.add(fail, "bucket", fmt.Sprintf("%q does not exist", bucket), "check the bucket name")
-			return
-		}
-		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "Forbidden" || apiErr.ErrorCode() == "AccessDenied") {
+		case code == "Forbidden" || code == "AccessDenied" ||
+			strings.Contains(es, "AccessDenied") || strings.Contains(es, "Forbidden") || strings.Contains(es, "status code: 403"):
 			d.add(fail, "bucket", fmt.Sprintf("access denied to %q", bucket), "check the credentials/policy, or --no-sign-request for a public bucket")
-			return
+		default:
+			d.add(fail, "bucket", fmt.Sprintf("cannot reach %q: %v", bucket, err), "check network/credentials")
 		}
-		d.add(fail, "bucket", fmt.Sprintf("cannot reach %q: %v", bucket, err), "check network/credentials")
 		return
 	}
 	clientRegion := f.region
