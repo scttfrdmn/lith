@@ -66,6 +66,9 @@ than mounted empty. `lith index inspect` prints the index's `root:`.
 | `lith index build --shard` | — | List sub-prefixes concurrently (repeatable) to speed a build over a wide namespace. |
 | `lith index build --page-size` | `1000` | `ListObjectsV2` page size. |
 | `lith index refresh` | — | Re-list the bucket and rewrite the index when keys have changed (lith never mutates the bucket; the index is a private cache). |
+| `lith index build --keys` | — | Build from an explicit key list (one key per line; optional `\t<size>\t<mtime>`), for buckets that are GET-public but **deny `ListObjectsV2`** (Common Crawl `cc-index`, `nyc-tlc`). Keys lacking size/mtime are `HeadObject`-ed. |
+| `lith index build --keys-from-manifest` | — | Same, but the key list is fetched from an `s3://` URL or local path (`.gz` transparent). |
+| `lith index build --keys-allow-missing` | off | Skip keys that `HeadObject` reports 403/404 instead of failing the build. |
 
 ## Access
 
@@ -96,5 +99,48 @@ Off by default; enable only if you have measured a win on your own workload.
 
 | flag | default | why |
 |---|---|---|
-| `--footer-tier2` | `false` | **Experimental.** Byte-precise projection fetch for footer-family containers (Parquet/ORC/Arrow/zip) — a touched Parquet row group's projected column chunks, or a read zip entry + the next few in directory order ([#108](https://github.com/scttfrdmn/lith/issues/108)). **Measured slower than the default whole-file streaming on every tested instance class** (in-region, sessions 29–32): on a fat pipe a whole-file stream is a handful of GETs at line rate, while byte-precise fetch pays a round-trip per column chunk through a filesystem that sees reads one at a time. The substrate (sparse fills, coalescing, concurrency-aware parallel dispatch) is correct and tested; the remaining precision work is [#125](https://github.com/scttfrdmn/lith/issues/125). Leave off unless a small NIC + a very narrow projection makes bytes-saved outweigh round-trips. Tier 1 (footer + head prefetch on open) always runs regardless. |
+| `--footer-tier2` | `false` | **Experimental, clustered projections only.** Byte-precise projection fetch for footer-family containers (Parquet/ORC/Arrow/zip) — a touched Parquet row group's projected column chunks, or a read zip entry + the next few in directory order ([#108](https://github.com/scttfrdmn/lith/issues/108)). Measured (sessions 29–43): it **wins on bytes for a *clustered* projection** (adjacent columns — ~10× fewer bytes than whole-file streaming) but **loses on wall-clock for a *spread* projection**, where the achievable floor is the reader's own footprint (pyarrow fetches ~the same bytes) and a whole-file stream is faster on a fat pipe (a handful of GETs at line rate vs a round-trip per column region). So it is off by default and stays experimental. Leave off unless you have a clustered projection where bytes-saved is the goal. Tier 1 (footer + head prefetch on open) always runs regardless. |
 | `--coalesce-gap` | `0` (derived) | Largest gap between two projection/demand fill ranges still merged into one range GET (the byte-precise fill path; only active with `--footer-tier2`). `0` derives it from the device: **NIC baseline × measured first-byte latency ÷ usable concurrency**, clamped to `[256 KiB, 64 MiB]` — a round-trip's worth of bytes amortized across the concurrent requests in flight ([#124](https://github.com/scttfrdmn/lith/issues/124)/[#31](https://github.com/scttfrdmn/lith/issues/31)). Set a fixed size to override the derivation. |
+
+## Archives and published datasets
+
+Mount a [CargoShip](cargoship.md) archive, or a [published dataset](published-datasets.md) by name.
+
+| flag | default | why |
+|---|---|---|
+| `--cargoship` | — | Mount/serve a CargoShip 2.1 archive: build the index in-process from this manifest `s3://` URL and present the archive's original file tree (reads fetch only the covering zstd frame(s)). Fails closed — a manifest that cannot be resolved is an error, never a fallback to listing. |
+| `s3://bucket/dataset@current` / `@<version>` | — | A published-dataset pointer mount (no flag): resolve the atomic `CURRENT` pointer (or a pinned version) and mount its prebuilt index. See [Published datasets](published-datasets.md). |
+| `lith refresh <mountpoint>` | — | Re-read `CURRENT` and hot-swap a FUSE mount to a new version (explicit; no polling). The gateway does not hot-swap — restart it to adopt a new version. |
+
+## Gateway (`lith serve nfs`)
+
+| flag | default | why |
+|---|---|---|
+| `--listen` | `:2049` | Listen address for the NFSv3 + embedded MOUNT service. Clients mount with an explicit `port=`/`mountport=`. |
+| `--client-idle` | — | Evict a client's per-client read-ahead state after it has been idle this long. |
+| `--no-portmap` | off | Do not register with portmap/rpcbind (clients pass an explicit port). |
+
+## Operational and diagnostics
+
+| flag / command | default | why |
+|---|---|---|
+| `--log-level` | `info` | Log verbosity: `debug`/`info`/`warn`/`error` (on `mount` and `serve nfs`). `debug` surfaces the format-plan diagnostics. |
+| `--daemon` | off | `lith mount` forks into the background once the mount is ready. |
+| `lith doctor [s3://…] --mountpoint` | — | Diagnose whether lith will work here — credentials, bucket access/region, LIST, FUSE, and the given `--mountpoint` (exists, a dir, owned by you, empty). Exits non-zero on any failure. See [the doctor](#the-doctor). |
+| `lith mounts --prune` | off | List active mounts; `--prune` drops stale records whose process is gone. |
+| `lith umount --all` / `--force` / `--timeout` | — | Unmount one, or `--all`; `--force` lazy-unmounts a busy mount; `--timeout` bounds the wait. |
+
+### The doctor
+
+`lith doctor` runs the checks above (add a bucket to include bucket/region/LIST/pointer checks, `--index-file` to validate an index) and prints each as `PASS`/`FAIL`/`N/A` with a one-line fix. Run it first on a new box — it catches the failures that otherwise surface as a cryptic mount error (wrong region, a root-owned mountpoint, a LIST-denied bucket, missing FUSE).
+
+## Benchmark (`lith bench`)
+
+| flag | default | why |
+|---|---|---|
+| `--against` | — | Comparison reader to run alongside (e.g. `mountpoint-s3`) for an apples-to-apples table. |
+| `--pattern` | — | Access pattern to exercise (`seq`, random, projection, …). |
+| `--ops` / `--runs` | — | Operations per run / number of runs. |
+| `--readers` | `1` | Concurrent readers (multi-reader mode; requires `--objects`). |
+| `--objects` | — | Comma-separated keys for multi-reader mode. |
+| `--cache-dir` | `$TMPDIR` | Directory for the bench block cache. |
