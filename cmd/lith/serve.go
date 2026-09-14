@@ -128,8 +128,19 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	}
 
 	var met *metrics.Metrics
+	// Start the metrics + health server BEFORE loading the index, so an orchestrator
+	// probing /readyz during a slow index load sees 503 (with a reason) and flips to
+	// 200 only once the gateway is actually serving.
+	ready := newReadiness("starting: loading index")
 	if f.metrics != "" {
 		met = metrics.New()
+		msrv := &http.Server{Addr: f.metrics, Handler: newMetricsMux(met, ready), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Warn("metrics server", "err", err)
+			}
+		}()
+		defer func() { _ = msrv.Close() }()
 	}
 
 	// Load the index and derive the handle root id (first 8 bytes of a stable
@@ -225,18 +236,6 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	}
 	defer bs.Close()
 
-	if f.metrics != "" {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", met.Handler())
-		msrv := &http.Server{Addr: f.metrics, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-		go func() {
-			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Warn("metrics server", "err", err)
-			}
-		}()
-		defer func() { _ = msrv.Close() }()
-	}
-
 	ln, err := net.Listen("tcp", f.listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", f.listen, err)
@@ -273,6 +272,7 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		}()
 	}
 
+	ready.set(true, "gateway serving")
 	return lithnfs.Serve(ctx, ln, lithnfs.Config{
 		Index: reader, Store: bs, RootID: rootID, ClientIdle: f.clientIdle, Metrics: met, Logger: log,
 	})
