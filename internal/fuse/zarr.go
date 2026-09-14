@@ -89,7 +89,7 @@ func (f *rawFS) consolidatedGrid(dir string) *fzarr.Grid {
 	cur := dir
 	for i := 0; i < 16; i++ {
 		rel := path.Join(cur, ".zmetadata")
-		if fi, err := f.ix.Stat("/" + rel); err == nil && !fi.IsDir && fi.Size > 0 && fi.Size < fzarr.MaxConsolidatedBytes {
+		if fi, err := f.index().Stat("/" + rel); err == nil && !fi.IsDir && fi.Size > 0 && fi.Size < fzarr.MaxConsolidatedBytes {
 			root, found = cur, true
 			break
 		}
@@ -113,11 +113,11 @@ func (f *rawFS) consolidatedGrid(dir string) *fzarr.Grid {
 	}
 
 	rel := path.Join(root, ".zmetadata")
-	fi, err := f.ix.Stat("/" + rel)
+	fi, err := f.index().Stat("/" + rel)
 	if err != nil {
 		return nil
 	}
-	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.index().ETagHashOf("/" + rel)}
 	body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size)
 	if err != nil {
 		return nil
@@ -141,12 +141,12 @@ func (f *rawFS) consolidatedGrid(dir string) *fzarr.Grid {
 // zarrayGrid reads and parses <dir>/.zarray (the per-array fallback).
 func (f *rawFS) zarrayGrid(dir string) *fzarr.Grid {
 	rel := path.Join(dir, ".zarray") // "" dir -> ".zarray"
-	fi, err := f.ix.Stat("/" + rel)
+	fi, err := f.index().Stat("/" + rel)
 	if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size >= fzarr.MaxConsolidatedBytes {
 		return nil
 	}
 	f.met.FormatDetect("zarr")
-	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+	key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.index().ETagHashOf("/" + rel)}
 	body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size)
 	if err != nil {
 		return nil
@@ -222,11 +222,11 @@ func (f *rawFS) maybeZarrReadahead(relPath string) bool {
 	issued := 0
 	for _, c := range todo {
 		rel := path.Join(dir, fzarr.FormatCoords(c))
-		fi, err := f.ix.Stat("/" + rel)
+		fi, err := f.index().Stat("/" + rel)
 		if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size > f.cfg.SmallFile {
 			continue
 		}
-		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.index().ETagHashOf("/" + rel)}
 		if !f.prefetchWhole(key, fi.Size) {
 			break // budget exhausted: the rest is offered again as chunks are consumed
 		}
@@ -254,11 +254,11 @@ func (f *rawFS) zarrTier1(dir string, coords, last []int, grid *fzarr.Grid) bool
 		return false // ambiguous -> key-order readahead (#63)
 	}
 	for _, rel := range planZarrChunks(dir, coords, last, grid, f.cfg.SiblingReadahead) {
-		fi, err := f.ix.Stat("/" + rel)
+		fi, err := f.index().Stat("/" + rel)
 		if err != nil || fi.IsDir || fi.Size <= 0 || fi.Size > f.cfg.SmallFile {
 			continue
 		}
-		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.ix.ETagHashOf("/" + rel)}
+		key := blockstore.Key{Key: f.objectKey(rel), ETagHash: f.index().ETagHashOf("/" + rel)}
 		if !f.prefetchWhole(key, fi.Size) {
 			break
 		}

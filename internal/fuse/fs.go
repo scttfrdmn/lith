@@ -180,11 +180,26 @@ type cargoPart struct {
 	uncompTotal int64 // chunk uncompressed total (objSize for the block store)
 }
 
+// liveIndex wraps the index.Reader so it can be swapped atomically (#167).
+type liveIndex struct{ r index.Reader }
+
+// IndexSwapper is implemented by the live filesystem: SwapIndex atomically
+// replaces the index used for future lookups (refresh, #167). Open handles keep
+// the index they resolved against, so in-flight reads are unaffected.
+type IndexSwapper interface {
+	SwapIndex(r index.Reader)
+}
+
 type rawFS struct {
 	fuse.RawFileSystem // default (ENOSYS) for anything not overridden
 
-	cfg       Config
-	ix        index.Reader
+	cfg Config
+	// ix is the live index, held atomically so `lith refresh` (#167) can swap it
+	// for a new published version under concurrent FUSE lookups. Reads go through
+	// index(); the swap only affects SUBSEQUENT lookups/opens — an open handle
+	// keeps the backing it captured (h.key, incl. the CargoShip frame table), so an
+	// in-flight read completes against its own version's (immutable) objects.
+	ix        atomic.Pointer[liveIndex]
 	store     *blockstore.BlockStore
 	met       *metrics.Metrics
 	blockSize int64
@@ -217,7 +232,6 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 	f := &rawFS{
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
 		cfg:           cfg,
-		ix:            cfg.Index,
 		store:         cfg.Store,
 		met:           cfg.Metrics,
 		blockSize:     cfg.Store.BlockSize(),
@@ -237,8 +251,17 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 	if f.sibPendingCap < 64 {
 		f.sibPendingCap = 64
 	}
+	f.ix.Store(&liveIndex{r: cfg.Index})
 	return f
 }
+
+// index returns the live index reader. Every lookup/open path reads through it so
+// a concurrent SwapIndex is safe.
+func (f *rawFS) index() index.Reader { return f.ix.Load().r }
+
+// SwapIndex atomically replaces the index used for future lookups (#167 refresh).
+// Open handles are unaffected — they captured their backing at open time.
+func (f *rawFS) SwapIndex(r index.Reader) { f.ix.Store(&liveIndex{r: r}) }
 
 func (f *rawFS) observe(op string, start time.Time) {
 	f.met.ObserveFUSE(op, time.Since(start).Seconds())
@@ -310,7 +333,7 @@ func (f *rawFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		return fuse.ENOENT
 	}
 	childPath := joinPath(parent.path, name)
-	fi, err := f.ix.Stat("/" + childPath)
+	fi, err := f.index().Stat("/" + childPath)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -330,7 +353,7 @@ func (f *rawFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 	if !ok {
 		return fuse.ENOENT
 	}
-	fi, err := f.ix.Stat("/" + n.path)
+	fi, err := f.index().Stat("/" + n.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -346,7 +369,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	if !ok {
 		return fuse.ENOENT
 	}
-	fi, err := f.ix.Stat("/" + n.path)
+	fi, err := f.index().Stat("/" + n.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -358,7 +381,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 		return fuse.Status(syscall.EROFS)
 	}
 	h := &fileHandle{
-		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.ix.ETagHashOf("/" + n.path)},
+		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
 		pf:   newPFWrapper(f.maxReadahead()),
 	}
@@ -371,7 +394,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// CargoShip-backed file (#94): its bytes live in packed `.tar.zst` chunks.
 	// Resolve the read-mapping and stream the covering chunk region; a cargo
 	// handle uses none of the object-key readahead paths below.
-	if b, ok := f.ix.BackingOf("/" + n.path); ok {
+	if b, ok := f.index().BackingOf("/" + n.path); ok {
 		for _, p := range b.Parts {
 			h.cargo = append(h.cargo, cargoPart{
 				key: blockstore.Key{Key: p.ChunkKey, ETagHash: p.ChunkETagHash,
@@ -638,7 +661,7 @@ func (f *rawFS) maybeSiblingReadahead(relPath string) {
 	if f.cfg.SiblingReadahead <= 0 || f.cfg.Limits == nil {
 		return
 	}
-	pos, ok := f.ix.Position("/" + relPath)
+	pos, ok := f.index().Position("/" + relPath)
 	if !ok {
 		return
 	}
@@ -665,7 +688,7 @@ func (f *rawFS) maybeSiblingReadahead(relPath string) {
 		if s.Size <= 0 || s.Size > f.cfg.SmallFile {
 			continue // only whole-fetch genuinely small siblings
 		}
-		key := blockstore.Key{Key: f.ix.Prefix() + s.Key, ETagHash: s.ETagHash}
+		key := blockstore.Key{Key: f.index().Prefix() + s.Key, ETagHash: s.ETagHash}
 		if !f.prefetchWhole(key, s.Size) {
 			break // budget exhausted: stop before starving handle readahead
 		}
@@ -782,7 +805,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 	if !ok || !n.isDir {
 		return fuse.ENOTDIR
 	}
-	self, err := f.ix.Stat("/" + n.path)
+	self, err := f.index().Stat("/" + n.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -799,7 +822,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 		if cursor == 1 {
 			parentIno := self.Ino
 			if pn, ok := f.resolve(n.parent); ok {
-				if pfi, e := f.ix.Stat("/" + pn.path); e == nil {
+				if pfi, e := f.index().Stat("/" + pn.path); e == nil {
 					parentIno = pfi.Ino
 				}
 			}
@@ -818,7 +841,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 
 	rc := cursor - 2
 	for {
-		ents, next, err := f.ix.Readdir("/"+n.path, rc, 1)
+		ents, next, err := f.index().Readdir("/"+n.path, rc, 1)
 		if err != nil {
 			return fuse.ENOENT
 		}
@@ -838,7 +861,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 			}
 			childPath := joinPath(n.path, e.Name)
 			f.register(e.Ino, childPath, input.NodeId, e.IsDir)
-			if fi, e2 := f.ix.Stat("/" + childPath); e2 == nil {
+			if fi, e2 := f.index().Stat("/" + childPath); e2 == nil {
 				eo.NodeId = fi.Ino
 				eo.Generation = 1
 				eo.SetEntryTimeout(oneYear)
@@ -862,20 +885,20 @@ func (f *rawFS) ReleaseDir(input *fuse.ReleaseIn) {}
 // space (it is read-only).
 func (f *rawFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
 	const bsize = 4096
-	total := uint64(f.ix.TotalSize())
+	total := uint64(f.index().TotalSize())
 	out.Bsize = bsize
 	out.Frsize = bsize
 	out.Blocks = (total + bsize - 1) / bsize
 	out.Bfree = 0
 	out.Bavail = 0
-	out.Files = uint64(f.ix.Len())
+	out.Files = uint64(f.index().Len())
 	out.Ffree = 0
 	out.NameLen = 255
 	return fuse.OK
 }
 
 func (f *rawFS) objectKey(relPath string) string {
-	return f.ix.Prefix() + relPath
+	return f.index().Prefix() + relPath
 }
 
 func (f *rawFS) maxReadahead() int64 {

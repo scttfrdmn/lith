@@ -60,8 +60,8 @@ func (f *rawFS) maybeBgzfReadahead(relPath string, h *fileHandle, size int64) bo
 		f.met.FormatDetect("bgzf")
 		f.prefetchByteRange(h.key, 0, size, size) // the whole (small) index
 		f.met.FormatIndexPrefetchBytes(size)
-		if dfi, err := f.ix.Stat("/" + dataRel); err == nil && !dfi.IsDir {
-			dkey := blockstore.Key{Key: f.objectKey(dataRel), ETagHash: f.ix.ETagHashOf("/" + dataRel)}
+		if dfi, err := f.index().Stat("/" + dataRel); err == nil && !dfi.IsDir {
+			dkey := blockstore.Key{Key: f.objectKey(dataRel), ETagHash: f.index().ETagHashOf("/" + dataRel)}
 			f.prefetchByteRange(dkey, 0, headerBytes(dfi.Size), dfi.Size) // data header
 		}
 		return true
@@ -77,7 +77,7 @@ func (f *rawFS) maybeBgzfReadahead(relPath string, h *fileHandle, size int64) bo
 		if c.Kind == bgzf.KindNone {
 			continue
 		}
-		if fi, err := f.ix.Stat("/" + c.Key); err == nil && !fi.IsDir {
+		if fi, err := f.index().Stat("/" + c.Key); err == nil && !fi.IsDir {
 			idxRel, kind = c.Key, c.Kind
 			break
 		}
@@ -119,12 +119,12 @@ func (f *rawFS) bgzfDataFor(relPath string) (string, bool) {
 		}
 		base := relPath[:len(relPath)-len(e.suffix)] // "x.bam.bai" -> "x.bam"
 		if bgzf.IsDataFile(base) {
-			if fi, err := f.ix.Stat("/" + base); err == nil && !fi.IsDir {
+			if fi, err := f.index().Stat("/" + base); err == nil && !fi.IsDir {
 				return base, true
 			}
 		}
 		for _, de := range e.dataExts { // "x.bai" -> "x.bam"
-			if fi, err := f.ix.Stat("/" + base + de); err == nil && !fi.IsDir {
+			if fi, err := f.index().Stat("/" + base + de); err == nil && !fi.IsDir {
 				return base + de, true
 			}
 		}
@@ -145,9 +145,9 @@ func (f *rawFS) bgzfRangesFor(idxRel string, kind bgzf.IndexKind, dataSize int64
 	f.bgzf.mu.Unlock()
 
 	var ranges []bgzf.Range
-	fi, err := f.ix.Stat("/" + idxRel)
+	fi, err := f.index().Stat("/" + idxRel)
 	if err == nil && !fi.IsDir && fi.Size > 0 && fi.Size <= bgzf.MaxIndexBytes {
-		key := blockstore.Key{Key: f.objectKey(idxRel), ETagHash: f.ix.ETagHashOf("/" + idxRel)}
+		key := blockstore.Key{Key: f.objectKey(idxRel), ETagHash: f.index().ETagHashOf("/" + idxRel)}
 		if body, err := f.store.GetRange(f.ctx, key, 0, fi.Size, fi.Size); err == nil {
 			switch kind {
 			case bgzf.KindBAI:

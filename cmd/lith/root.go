@@ -25,6 +25,7 @@ func newRootCmd() *cobra.Command {
 		newBenchCmd(),
 		newMountsCmd(),
 		newUmountCmd(),
+		newRefreshCmd(),
 	)
 	return root
 }

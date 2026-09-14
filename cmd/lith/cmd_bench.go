@@ -240,7 +240,7 @@ func mountObjects(ctx context.Context, client s3client.API, bs *blockstore.Block
 		return "", nil, nil, err
 	}
 	cfg := &fusefs.Config{Index: ix, Store: bs, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), MaxReadahead: maxReadahead, PrefetchStats: stats, Metrics: met}
-	srv, err := fusefs.Mount(mnt, *cfg, fusefs.MountOptions{FsName: "lith-bench"})
+	srv, _, err := fusefs.Mount(mnt, *cfg, fusefs.MountOptions{FsName: "lith-bench"})
 	if err != nil {
 		_ = os.RemoveAll(mnt)
 		return "", nil, nil, fmt.Errorf("bench mount: %w", err)
