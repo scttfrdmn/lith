@@ -18,6 +18,10 @@ rsize=1048576,wsize=1048576,nconnect=4,actimeo=600 <gateway-ip>:/ /mnt/data
 `--disk-cache` is not optional for a gateway: size it to the working set so a
 re-run and a restart serve from local disk instead of re-fetching S3.
 
+Running the gateway as a container (Kubernetes, systemd) with the health probes
+and volumes wired? See [Running in a container](running-in-a-container.md) —
+that is the image's main use.
+
 ## The one rule: does the cluster share data?
 
 The gateway is a **funnel** — every client's bytes cross one node's NIC. That

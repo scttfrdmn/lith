@@ -60,3 +60,26 @@ jobs:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
         run: go build -trimpath -o /dev/null ./cmd/lith
+
+  docker:
+    name: docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # Build the binary into the same os/arch layout goreleaser (dockers_v2)
+      # hands the Dockerfile, then build the image without pushing — a PR that
+      # breaks the image (bad COPY, base bump) fails here, before any tag is cut.
+      - name: build binary into context
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p linux/amd64
+          go build -trimpath -o linux/amd64/lith ./cmd/lith
+      - name: docker build (no push)
+        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t lith:ci .
