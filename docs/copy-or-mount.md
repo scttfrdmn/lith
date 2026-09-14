@@ -140,6 +140,7 @@ widens with:**
 - **Fan-out.** N nodes each stage their shard; lith mounts the same index N times
   and moves no bulk data (see [Meet a deadline](deadline.md)).
 - **Pack small files once.** Many small objects read cold pay a round-trip each; pack them with [CargoShip](cargoship.md) and mount the archive as a tree, and lith streams a few framed chunks instead — 600 small files walk in 0.34 s / 8 GETs vs 2.56 s / 604 GETs native (see [CargoShip archives](cargoship.md)).
+- **Pack and publish once; mount it anywhere by name.** `cargoship publish` writes a versioned dataset with an atomic pointer, and `lith mount s3://bucket/dataset@current` mounts it — no index file to track, and two machines mounting the same name serve byte-identical namespaces (see [Published datasets](published-datasets.md)).
 - **Round-trips, not bytes.** In-region, round-trips cost time; bytes don't. A
   reader that saves bytes by fetching a precise slice can still lose to a
   whole-file stream if it pays more round-trips to do it (see Parquet, above).
