@@ -39,9 +39,10 @@ archives:
 
 # Distroless multi-arch image, built from the same binaries as the archives
 # above (ids: [lith]) — not a second build path. dockers_v2 builds both
-# platforms and pushes one manifest per tag. Tags: the exact version and the
-# floating major.minor always; `latest` only on a real release (the empty tag
-# from a prerelease is dropped).
+# platforms and pushes one manifest per tag. A prerelease gets ONLY its exact
+# version tag: the floating `major.minor` and `latest` must keep pointing at the
+# latest STABLE release, so both are guarded by `{{ if not .Prerelease }}` (the
+# empty tag a prerelease yields is dropped).
 dockers_v2:
   - id: lith
     images:
@@ -55,7 +56,7 @@ dockers_v2:
       - LICENSE
     tags:
       - "{{ .Version }}"
-      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
       - "{{ if not .Prerelease }}latest{{ end }}"
     labels:
       org.opencontainers.image.title: lith
@@ -68,9 +69,46 @@ dockers_v2:
       org.opencontainers.image.created: "{{ .Date }}"
       org.opencontainers.image.licenses: Apache-2.0
 
+# Linux packages (.deb / .rpm) from the SAME binaries as the archives and image
+# — goreleaser bundles nfpm, so no extra tooling is needed, and both arches come
+# from the build's goarch list. They attach to the release and enter checksums.txt.
+nfpms:
+  - id: lith
+    package_name: lith
+    ids: [lith]
+    formats: [deb, rpm]
+    maintainer: "Scott A Friedman <scttfrdmn@users.noreply.github.com>"
+    description: "Read-only FUSE-over-S3 filesystem and NFSv3 gateway."
+    homepage: "https://github.com/scttfrdmn/lith"
+    license: "Apache-2.0"
+    bindir: /usr/bin
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
+
+# An SBOM per archive and per package, via syft (installed in release.yml).
+sboms:
+  - id: archives
+    artifacts: archive
+  - id: packages
+    artifacts: package
+
+# Keyless cosign signature over checksums.txt (Sigstore/OIDC) — signing the
+# checksums transitively covers every artifact via its listed sha256. Requires
+# cosign on PATH and id-token: write, both set in release.yml.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "--yes"
+    output: true
 
 changelog:
   disable: true
