@@ -41,6 +41,17 @@ type doctorFlags struct {
 	mountpoint string
 	allowOther bool
 	nicGbps    float64
+	// Alternate index sources. If any is set (or the target carries an @ref), a
+	// LIST denial is not fatal — the build won't call ListObjectsV2.
+	keys             string
+	keysFromManifest string
+	cargoship        string
+}
+
+// usesAltSource reports whether the invocation declares an index source other
+// than a bucket LIST (so a LIST denial is genuinely not applicable).
+func (f *doctorFlags) usesAltSource(ref string) bool {
+	return ref != "" || f.keys != "" || f.keysFromManifest != "" || f.cargoship != ""
 }
 
 // checkStatus is the outcome of one diagnostic.
@@ -118,6 +129,9 @@ uses lith's own credential/endpoint resolution.`,
 	fl.StringVar(&f.mountpoint, "mountpoint", "", "check this mountpoint (exists, a dir, owned by you, empty)")
 	fl.BoolVar(&f.allowOther, "allow-other", false, "also check /etc/fuse.conf user_allow_other")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps")
+	fl.StringVar(&f.keys, "keys", "", "index source: a key-list file (a LIST denial is then not fatal)")
+	fl.StringVar(&f.keysFromManifest, "keys-from-manifest", "", "index source: keys from a manifest (a LIST denial is then not fatal)")
+	fl.StringVar(&f.cargoship, "cargoship", "", "index source: a CargoShip manifest URL (a LIST denial is then not fatal)")
 	return cmd
 }
 
@@ -152,16 +166,13 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 		}
 	}
 
-	// --- bucket existence + region + LIST access ---
+	// --- bucket existence + region + LIST access, through the SAME factory the
+	// mount uses, so doctor refuses exactly what mount would (e.g. a signed
+	// request to an http:// endpoint) and the requester-pays header reaches the
+	// probes (#194). A diagnostic that built its own client could pass on a
+	// configuration the real client refuses. ---
 	if target != "" && cfgErr == nil {
-		s3c := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			o.UsePathStyle = f.pathStyle
-			if f.endpoint != "" {
-				o.BaseEndpoint = aws.String(f.endpoint)
-			}
-		})
-		doctorBucket(ctx, d, f, s3c, awsCfg, bucket)
-		doctorList(ctx, d, s3c, bucket, prefix)
+		doctorBucketAndList(ctx, d, f, awsCfg, bucket, prefix, ref)
 	}
 
 	// --- FUSE preconditions ---
@@ -204,59 +215,88 @@ func doctorAWSConfig(ctx context.Context, f *doctorFlags) (aws.Config, error) {
 	return awsconfig.LoadDefaultConfig(ctx, opts...)
 }
 
-func doctorBucket(ctx context.Context, d *doctor, f *doctorFlags, s3c *s3.Client, awsCfg aws.Config, bucket string) {
-	// GetBucketRegion works signed or anonymous and returns the bucket's real
-	// region (or a clear not-found/denied error) — the reliable existence+region
-	// probe, unlike an anonymous HeadBucket which 403s on public buckets.
-	bregion, err := manager.GetBucketRegion(ctx, s3c, bucket)
+// doctorBucketAndList builds the client through the production factory
+// (s3client.New), so its refusals — the non-HTTPS-endpoint guard above all —
+// become check failures with the factory's own message, and the requester-pays
+// header reaches the probes. New succeeding already proves the bucket is
+// reachable and resolves its region.
+func doctorBucketAndList(ctx context.Context, d *doctor, f *doctorFlags, awsCfg aws.Config, bucket, prefix, ref string) {
+	client, err := newS3Client(ctx, s3client.Config{
+		Bucket: bucket, Region: f.region, NoSignRequest: f.noSign,
+		RequesterPays: f.reqPays, Endpoint: f.endpoint, PathStyle: f.pathStyle,
+	})
 	if err != nil {
-		// Classify by smithy code where available, then by the (wrapped) error
-		// string — manager.GetBucketRegion wraps the underlying S3 error, so the
-		// APIError code is not always reachable via errors.As.
-		code := ""
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			code = apiErr.ErrorCode()
-		}
-		es := err.Error()
-		switch {
-		case code == "NotFound" || strings.Contains(code, "NoSuchBucket") ||
-			strings.Contains(es, "NoSuchBucket") || strings.Contains(es, "bucket not found") || strings.Contains(es, "status code: 404"):
-			d.add(fail, "bucket", fmt.Sprintf("%q does not exist", bucket), "check the bucket name")
-		case code == "Forbidden" || code == "AccessDenied" ||
-			strings.Contains(es, "AccessDenied") || strings.Contains(es, "Forbidden") || strings.Contains(es, "status code: 403"):
-			d.add(fail, "bucket", fmt.Sprintf("access denied to %q", bucket), "check the credentials/policy, or --no-sign-request for a public bucket")
-		default:
-			d.add(fail, "bucket", fmt.Sprintf("cannot reach %q: %v", bucket, err), "check network/credentials")
-		}
+		classifyBucketClientError(d, bucket, err)
 		return
 	}
-	clientRegion := f.region
-	if clientRegion == "" {
-		clientRegion = "us-east-1"
+
+	// Region-mismatch diagnostic: cross-region reads are slow and cost egress.
+	// Only meaningful against real S3 (a custom --endpoint has no AWS region to
+	// compare), and the endpoint already passed the factory's HTTPS guard above.
+	regionNote := ""
+	if f.endpoint == "" {
+		if bregion, rerr := manager.GetBucketRegion(ctx, s3.NewFromConfig(awsCfg), bucket); rerr == nil && bregion != "" {
+			if f.region != "" && f.region != bregion {
+				d.add(fail, "bucket region",
+					fmt.Sprintf("bucket %q is in %s but the client is set to %s — cross-region reads are slow and cost egress", bucket, bregion, f.region),
+					fmt.Sprintf("run the client in %s, or pass --region %s", bregion, bregion))
+				return
+			}
+			regionNote = ", region " + bregion
+		}
 	}
-	if f.endpoint == "" && f.region != "" && bregion != "" && clientRegion != bregion {
-		d.add(fail, "bucket region",
-			fmt.Sprintf("bucket %q is in %s but the client is set to %s — cross-region reads are slow and cost egress", bucket, bregion, clientRegion),
-			fmt.Sprintf("run the client in %s, or pass --region %s", bregion, bregion))
-		return
-	}
-	d.add(pass, "bucket", fmt.Sprintf("%q reachable, region %s", bucket, bregion), "")
+	d.add(pass, "bucket", fmt.Sprintf("%q reachable%s", bucket, regionNote), "")
+	doctorList(ctx, d, client, prefix, f.usesAltSource(ref))
 }
 
-func doctorList(ctx context.Context, d *doctor, s3c *s3.Client, bucket, prefix string) {
-	one := int32(1)
-	_, err := s3c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix, MaxKeys: &one})
-	if err != nil {
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "AccessDenied" || apiErr.ErrorCode() == "Forbidden") {
-			d.add(na, "list", "ListObjectsV2 denied (not fatal)", "build the index from a key list: --keys <file> / --keys-from-manifest (Common Crawl, nyc-tlc)")
+// classifyBucketClientError reports a factory failure with its own message. The
+// HTTPS-endpoint guard is reported as an endpoint failure (the case the mount
+// path refuses); not-found / access-denied / unreachable map to a bucket
+// failure, classified by the wrapped error string.
+func classifyBucketClientError(d *doctor, bucket string, err error) {
+	es := err.Error()
+	switch {
+	case strings.Contains(es, "non-HTTPS"):
+		d.add(fail, "endpoint", es, "use an https:// endpoint, or pass --no-sign-request for anonymous access")
+	case strings.Contains(es, "NoSuchBucket") || strings.Contains(es, "bucket not found") || strings.Contains(es, "status code: 404"):
+		d.add(fail, "bucket", fmt.Sprintf("%q does not exist", bucket), "check the bucket name")
+	case strings.Contains(es, "AccessDenied") || strings.Contains(es, "Forbidden") || strings.Contains(es, "status code: 403"):
+		d.add(fail, "bucket", fmt.Sprintf("access denied to %q", bucket), "check the credentials/policy, or --no-sign-request for a public bucket")
+	default:
+		d.add(fail, "bucket", fmt.Sprintf("cannot reach %q: %v", bucket, err), "check network/credentials/endpoint")
+	}
+}
+
+// doctorList probes a one-key LIST through the production client (so
+// requester-pays applies). A denial is a FAILURE — the mount's default build
+// path needs ListBucket — unless the invocation declares an alternate index
+// source (@ref / --keys / --keys-from-manifest / --cargoship), in which case
+// LIST is genuinely not applicable.
+func doctorList(ctx context.Context, d *doctor, client s3client.API, prefix string, altSource bool) {
+	if _, err := client.ListObjectsV2(ctx, prefix, "", 1); err != nil {
+		if isAccessDenied(err) {
+			if altSource {
+				d.add(na, "list", "ListObjectsV2 denied — using an explicit key source instead", "")
+				return
+			}
+			d.add(fail, "list", "ListObjectsV2 denied", "grant s3:ListBucket, or build from an explicit source: --keys / --keys-from-manifest / --cargoship (then LIST is not needed)")
 			return
 		}
 		d.add(fail, "list", "ListObjectsV2 failed: "+err.Error(), "check the prefix/credentials")
 		return
 	}
 	d.add(pass, "list", "ListObjectsV2 ok", "")
+}
+
+// isAccessDenied reports whether err is an S3 access-denial, by smithy code or
+// by the wrapped error string (the client wraps the SDK error).
+func isAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "AccessDenied" || apiErr.ErrorCode() == "Forbidden") {
+		return true
+	}
+	es := err.Error()
+	return strings.Contains(es, "AccessDenied") || strings.Contains(es, "Forbidden") || strings.Contains(es, "status code: 403")
 }
 
 func doctorFUSE(d *doctor, f *doctorFlags) {
@@ -329,9 +369,9 @@ func doctorPointer(ctx context.Context, d *doctor, f *doctorFlags, bucket, datas
 	var indexKey, wantSHA, manifestKey string
 	if ref == "current" {
 		curKey := path.Join(dataset, "CURRENT")
-		data, _, err := client.GetRange(ctx, curKey, 0, 0)
+		data, err := readPointerObject(ctx, client, curKey)
 		if err != nil {
-			d.add(fail, "CURRENT", "GET "+curKey+": "+err.Error(), "publish the dataset, or check the prefix")
+			d.add(fail, "CURRENT", err.Error(), "publish the dataset, or check the prefix")
 			return
 		}
 		cur, err := pointer.Parse(data)

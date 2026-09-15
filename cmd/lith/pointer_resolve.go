@@ -39,11 +39,9 @@ func resolvePointer(ctx context.Context, client s3client.API, bucket, dataset, r
 	switch ref {
 	case "current":
 		curKey := path.Join(dataset, "CURRENT")
-		// GetRange with 0, 0 reads the whole (small) pointer object into memory. This deliberately bypasses
-		// the block cache, which is for the mounted data path, not control objects.
-		data, _, err := client.GetRange(ctx, curKey, 0, 0)
+		data, err := readPointerObject(ctx, client, curKey)
 		if err != nil {
-			return nil, "", fmt.Errorf("resolve @current: GET pointer %q: %w", curKey, err)
+			return nil, "", fmt.Errorf("resolve @current: %w", err)
 		}
 		cur, err := pointer.Parse(data)
 		if err != nil {
@@ -81,6 +79,23 @@ func resolvePointer(ctx context.Context, client s3client.API, bucket, dataset, r
 		return nil, "", fmt.Errorf("resolve @%s: index %q is empty (a chunkless manifest yields no files) — refusing to mount an empty namespace", ref, indexKey)
 	}
 	return ix, versionID, nil
+}
+
+// readPointerObject fetches a CURRENT pointer object bounded AT THE NETWORK: it
+// requests one byte past MaxPointerBytes, so a hostile or corrupt pointer is
+// never fully read into memory (the old code read the whole object, then let
+// pointer.Parse reject it after the fact — the "refused unread" property was not
+// true in transit). An object at or over the cap is refused, naming the key and
+// the cap (#195).
+func readPointerObject(ctx context.Context, client s3client.API, key string) ([]byte, error) {
+	data, _, err := client.GetRange(ctx, key, 0, pointer.MaxPointerBytes+1)
+	if err != nil {
+		return nil, fmt.Errorf("GET pointer %q: %w", key, err)
+	}
+	if len(data) > pointer.MaxPointerBytes {
+		return nil, fmt.Errorf("pointer %q exceeds the %d-byte cap (read bounded at the network)", key, pointer.MaxPointerBytes)
+	}
+	return data, nil
 }
 
 func sha256Sum(b []byte) []byte {
