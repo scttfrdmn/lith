@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-14
+
+**lith 1.0 — feature-complete for its thesis.** lith is read-only by definition
+and cloud-native by thesis: it presents any S3 bucket as a read-only filesystem
+in its native key layout, serving metadata locally at zero S3 operations, on one
+node (FUSE) or across a cluster (the NFS gateway). With 1.0 the capabilities are
+complete *for that thesis* — any POSIX tool reads any bucket, native layout or a
+CargoShip/published dataset, with format-aware I/O, and a stranger reaches a
+working mount in five minutes. Past 1.0, work is extension, not completion; what
+lith does and deliberately does not do is published on the
+**[Scope page](https://scttfrdmn.github.io/lith/scope/)**. This release is the
+operability-and-honesty pass on top of the v0.5.0 feature set: first-run
+diagnostics, health endpoints, a container image, and docs that provably match
+the binary.
+
+### Added
+
+- **`lith doctor`** ([#176](https://github.com/scttfrdmn/lith/issues/176)):
+  first-run diagnostics — eight checks (credentials, bucket + region, `LIST`
+  permission, FUSE, mountpoint, NIC, the `@current` pointer, the index file),
+  each `PASS`/`FAIL`/`N/A` with a one-line fix, non-zero exit on any failure,
+  run through lith's own credential and endpoint resolution so "doctor OK" means
+  "mount works." Verified by induction — every check broken on purpose and
+  confirmed caught, which is how the `GetBucketRegion` error-wrapping
+  misclassification was found and fixed before shipping.
+- **Health endpoints — `/healthz` and `/readyz`**
+  ([#177](https://github.com/scttfrdmn/lith/issues/177)): liveness and readiness
+  on the metrics server. The gateway starts the health server *before* the index
+  load, so `/readyz` returns `503` with a reason until it is serving and `200`
+  after — wire both to an orchestrator.
+- **Distroless container image — `ghcr.io/scttfrdmn/lith`**
+  ([#178](https://github.com/scttfrdmn/lith/issues/178)): multi-arch
+  (`linux/amd64` + `linux/arm64`), built by the release workflow from the *same*
+  binaries as the tarballs and published to GHCR in the same gated run — no
+  second build path. The image is for the gateway (`serve nfs` is a userspace
+  server needing no privileges); `doctor` and `index build` run in it too. See
+  [Running in a container](https://scttfrdmn.github.io/lith/running-in-a-container/).
+- **Flag-documentation CI guard — `TestKnobsDocumentsEveryFlag`**
+  ([#179](https://github.com/scttfrdmn/lith/issues/179)): fails CI if any command
+  flag is missing from `docs/knobs.md`, so the documentation cannot drift from
+  the binary.
+- **[Scope page](https://scttfrdmn.github.io/lith/scope/)**
+  ([#182](https://github.com/scttfrdmn/lith/issues/182)): what lith is for, the
+  two-category boundary (writes are out *by definition*; everything else is
+  deferred, each with the named signal that reopens it), and where lith is the
+  wrong tool.
+
+### Changed
+
+- `docs/knobs.md` now documents every shipped flag; the `--footer-tier2` help
+  is reconciled to the measured truth (experimental, clustered-projection only)
+  ([#179](https://github.com/scttfrdmn/lith/issues/179)).
+- The five-minute Start-here walk is re-verified end-to-end on a clean box and
+  gains `lith doctor` as its pre-flight step
+  ([#180](https://github.com/scttfrdmn/lith/issues/180)).
+- `docs/not.md` is folded into the Scope page; the published `/not/` URL now
+  redirects there.
+
+### Removed
+
+- Dead code ([#45](https://github.com/scttfrdmn/lith/issues/45)/[#46](https://github.com/scttfrdmn/lith/issues/46)):
+  the unused `--disk-path` bench flag, a `benchBucket` global, an unused return
+  value, a duplicate `*metrics.Metrics` handle, and Go-1.22 loop-variable copies.
+  (`s3client.GetRange` was kept — it has production callers via pointer
+  resolution — and documented, [#44](https://github.com/scttfrdmn/lith/issues/44).)
+
+### Upgrade
+
+- **No index rebuild required.** The index format is unchanged since v0.5.0;
+  existing `--index-file` artifacts and published datasets mount as-is. lith
+  reads **Linux only** — there are no macOS or Windows builds — and remains
+  read-only: every mutating operation returns `EROFS`.
+
 ## [0.5.0] - 2026-09-14
 
 **Published datasets: pack and publish once, mount it anywhere by name.** A
@@ -649,7 +722,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/scttfrdmn/lith/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/scttfrdmn/lith/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/lith/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/scttfrdmn/lith/compare/v0.3.0...v0.3.2
