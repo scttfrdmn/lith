@@ -8,7 +8,9 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -168,6 +170,10 @@ type fileHandle struct {
 	// chunks, and a read maps to frame range GETs on those chunks. A cargo handle
 	// bypasses the bgzf/footer/sibling readahead paths entirely.
 	cargo []cargoPart
+	// lastReadEnd is the byte offset just past the previous read on this handle,
+	// for the M16 step-1b detector-gap characterization/rule (byte gap = off -
+	// lastReadEnd). Atomic because the kernel issues a handle's reads concurrently.
+	lastReadEnd atomic.Int64
 }
 
 // cargoPart is one contiguous run of a virtual file's bytes in a packed chunk,
@@ -209,6 +215,12 @@ type rawFS struct {
 	// the kernel's entry/attr/page caches for entries that changed between
 	// versions. nil before Init and in unit tests that never mount.
 	server *fuse.Server
+
+	// pfTrace, when non-nil (env LITH_PF_TRACE=<path>), receives one CSV line per
+	// read of what the prefetch detector saw — the M16 step-1b characterization.
+	// nil in production; no cost when unset.
+	pfTrace   *os.File
+	pfTraceMu sync.Mutex
 
 	mu      sync.RWMutex
 	nodes   map[uint64]*node
@@ -257,7 +269,21 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		f.sibPendingCap = 64
 	}
 	f.ix.Store(&liveIndex{r: cfg.Index})
+	if p := os.Getenv("LITH_PF_TRACE"); p != "" {
+		if tf, err := os.Create(p); err == nil {
+			f.pfTrace = tf
+			_, _ = fmt.Fprintln(tf, "key,off,len,blk,gap,state_before,state_after,peak_window")
+		}
+	}
 	return f
+}
+
+// tracePF writes one characterization row (M16 step 1b). Serialized because the
+// kernel issues a handle's reads concurrently.
+func (f *rawFS) tracePF(key string, off, length, blk, gap int64, before, after prefetch.State, peak int64) {
+	f.pfTraceMu.Lock()
+	_, _ = fmt.Fprintf(f.pfTrace, "%s,%d,%d,%d,%d,%s,%s,%d\n", key, off, length, blk, gap, before, after, peak)
+	f.pfTraceMu.Unlock()
 }
 
 // index returns the live index reader. Every lookup/open path reads through it so
@@ -713,6 +739,21 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// (a whole-block window would re-fetch the columns the plan skips; #118).
 	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		blk := off / f.blockSize
+		// M16 step 1b characterization (env-gated, no classification change): record
+		// exactly what the detector sees per read — byte gap from the previous read
+		// on this handle, block index, and the state transition — to see whether an
+		// HDF5 metadata walk is being misread as Sequential and by which rule.
+		if f.pfTrace != nil {
+			gap := off - h.lastReadEnd.Load()
+			before := h.pf.state()
+			pbs := h.pf.observe(blk, f.perHandleWindow())
+			f.tracePF(h.key.Key, off, end-off, blk, gap, before, h.pf.state(), h.pf.peakWindow())
+			for _, pb := range pbs {
+				go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+			}
+			h.lastReadEnd.Store(end)
+			return res, fuse.OK
+		}
 		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
