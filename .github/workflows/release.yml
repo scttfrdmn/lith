@@ -7,41 +7,25 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  # Re-run the full CI gate for the tagged commit. A tag pushed to a commit that
-  # does not pass vet + lint + `go test -race` must produce no release assets, so
-  # goreleaser depends on this job (a tag push does not itself trigger ci.yml,
-  # which runs on branch pushes and PRs).
+  # The release gate is the SAME reusable gate branch CI runs — vet, lint,
+  # test -race, govulncheck, fuzz, dual-arch build, docker build (#199). A tag
+  # pushed to a commit that does not pass the full gate produces no release
+  # assets, because goreleaser depends on this job. (A tag push does not itself
+  # trigger ci.yml, which runs on branch pushes and PRs.)
   gate:
-    name: gate (vet, lint, test -race)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
-        with:
-          go-version-file: go.mod
-          check-latest: true
-      - name: go vet
-        run: go vet ./...
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9  # v8
-        with:
-          version: v2.13.2
-      - name: go test -race
-        run: go test -race ./...
+    uses: ./.github/workflows/gate.yml
 
   goreleaser:
     needs: gate
     runs-on: ubuntu-latest
-    # packages: write lets goreleaser push the distroless image to GHCR in the
-    # same gated run as the binaries — an image never ships without the gate.
     permissions:
-      contents: write
-      packages: write
+      contents: write      # create the release and upload assets
+      packages: write      # push the distroless image to GHCR
+      id-token: write      # keyless cosign signing + provenance (OIDC)
+      attestations: write  # SLSA build-provenance attestation
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
@@ -58,6 +42,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # cosign (keyless signing) and syft (SBOM generation) must be on PATH for
+      # the goreleaser `signs` and `sboms` blocks.
+      - name: install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+      - name: install syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26  # v0.24.2
       - name: goreleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6
         with:
@@ -65,3 +55,15 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # SLSA build-provenance for every shipped artifact (binaries, tarballs,
+      # deb/rpm, checksums), attached to the GitHub attestations store and
+      # verifiable with `gh attestation verify`.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/lith_*_linux_*.tar.gz
+            dist/lith_linux_*
+            dist/*.deb
+            dist/*.rpm
+            dist/checksums.txt

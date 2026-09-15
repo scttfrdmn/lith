@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The single source of truth for "does this commit pass?", called by both
+# branch CI (ci.yml, on push/PR) and the release gate (release.yml, on a tag).
+# There is exactly one definition of the gate, so a tag runs precisely what a PR
+# runs — no more "the release gate is a subset of CI" drift (#199).
+name: gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9  # v8
+        with:
+          version: v2.13.2
+      - name: go test -race
+        run: go test -race ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: fuzz the index parser (60s; committed corpus also runs above)
+        run: go test -run '^$' -fuzz 'FuzzParseIndex$' -fuzztime 60s ./internal/index/
+      - name: fuzz the bgzf index parsers (60s; committed corpora also run above)
+        run: |
+          go test -run '^$' -fuzz 'FuzzParseTBI$' -fuzztime 20s ./internal/format/bgzf/
+          go test -run '^$' -fuzz 'FuzzParseCRAI$' -fuzztime 20s ./internal/format/bgzf/
+          go test -run '^$' -fuzz 'FuzzParseBAI$' -fuzztime 20s ./internal/format/bgzf/
+      - name: fuzz the footer parsers (60s; committed corpora also run above)
+        run: |
+          go test -run '^$' -fuzz 'FuzzParseParquetFooter$' -fuzztime 30s ./internal/format/footer/
+          go test -run '^$' -fuzz 'FuzzParseZipCentralDir$' -fuzztime 30s ./internal/format/footer/
+
+  build:
+    name: build ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o /dev/null ./cmd/lith
+
+  docker:
+    name: docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # Build the binary into the same os/arch layout goreleaser (dockers_v2)
+      # hands the Dockerfile, then build the image without pushing — a PR that
+      # breaks the image (bad COPY, base bump) fails here, before any tag is cut.
+      - name: build binary into context
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p linux/amd64
+          go build -trimpath -o linux/amd64/lith ./cmd/lith
+      - name: docker build (no push)
+        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t lith:ci .

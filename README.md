@@ -68,8 +68,30 @@ curl -L https://github.com/scttfrdmn/lith/releases/latest/download/lith_linux_am
 sudo mv lith /usr/local/bin/
 ```
 
-Versioned `.tar.gz` archives are on the [releases](https://github.com/scttfrdmn/lith/releases)
-page. Or, with Go: `go install github.com/scttfrdmn/lith/cmd/lith@latest`.
+Versioned `.tar.gz` archives, **`.deb`/`.rpm` packages**, and a container image
+(`ghcr.io/scttfrdmn/lith`) are on the [releases](https://github.com/scttfrdmn/lith/releases)
+page — grab the `.deb`/`.rpm` for your architecture, e.g. `sudo dpkg -i lith_*_linux_amd64.deb`
+(or `sudo rpm -i lith_*_linux_amd64.rpm`). Or, with Go:
+`go install github.com/scttfrdmn/lith/cmd/lith@latest`.
+
+### Verifying a release
+
+Every release ships a `checksums.txt` with a **keyless cosign signature**
+(`checksums.txt.sig` + `checksums.txt.pem`), an **SBOM** per artifact, and a
+**SLSA build-provenance attestation**. To verify:
+
+```
+# the checksums signature (identity = the release workflow's OIDC identity)
+cosign verify-blob checksums.txt \
+  --signature checksums.txt.sig --certificate checksums.txt.pem \
+  --certificate-identity-regexp 'https://github.com/scttfrdmn/lith/.github/workflows/.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# then confirm your download against the (now-trusted) checksums
+sha256sum -c checksums.txt --ignore-missing
+
+# build provenance for any downloaded artifact
+gh attestation verify lith_linux_amd64 --repo scttfrdmn/lith
+```
 
 ## Commands
 

@@ -25,7 +25,11 @@ chmod +x lith && sudo mv lith /usr/local/bin/
 lith version
 ```
 
-Or, with Go installed: `go install github.com/scttfrdmn/lith/cmd/lith@latest`.
+Or, with Go installed: `go install github.com/scttfrdmn/lith/cmd/lith@latest`. The
+releases page also has `.deb`/`.rpm` packages (`sudo dpkg -i lith_*_linux_amd64.deb`)
+and a container image (`ghcr.io/scttfrdmn/lith`). Each release is checksummed,
+cosign-signed, and carries an SBOM + build provenance — see
+[Verifying a release](https://github.com/scttfrdmn/lith#verifying-a-release).
 
 ## 1.5. Check your setup (`lith doctor`)
 
