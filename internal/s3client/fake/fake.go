@@ -72,6 +72,14 @@ func (s *Server) GetCallCount() int {
 	return s.GetCalls
 }
 
+// GetByteCount returns the total bytes requested via GetRange/GetRangeReader
+// under lock, safe to read while fetches are in flight.
+func (s *Server) GetByteCount() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.GetBytes
+}
+
 // Put stores an object with the given key, contents, and modification time.
 func (s *Server) Put(key string, data []byte, modified time.Time) {
 	s.mu.Lock()

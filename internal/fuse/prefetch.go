@@ -33,6 +33,14 @@ func (w *pfWrapper) open(maxWindow int64) []int64 {
 	return w.pf.Open()
 }
 
+// state reports the handle's detected access pattern (for the demand-path
+// byte-exact decision, #210/M16). Serialized with the concurrent reads.
+func (w *pfWrapper) state() prefetch.State {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.State()
+}
+
 func (w *pfWrapper) resets() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
