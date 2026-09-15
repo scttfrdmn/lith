@@ -89,9 +89,9 @@ const chunk = blockstore.ChunkSize // 1 MiB
 // leaving the handle confirmed non-sequential. Returns after the state is Random.
 func driveRandom(t *testing.T, raw *rawFS, node, fh uint64) {
 	t.Helper()
-	readAt(t, raw, node, fh, 0, 4<<10)         // cold
-	readAt(t, raw, node, fh, 30*chunk, 4<<10)  // out-of-band jump → pending
-	readAt(t, raw, node, fh, 5*chunk, 4<<10)   // second jump, no progress → Random
+	readAt(t, raw, node, fh, 0, 4<<10)        // cold
+	readAt(t, raw, node, fh, 30*chunk, 4<<10) // out-of-band jump → pending
+	readAt(t, raw, node, fh, 5*chunk, 4<<10)  // second jump, no progress → Random
 	h := raw.handleOf(fh)
 	if got := h.pf.state(); got != prefetch.Random {
 		t.Fatalf("expected Random posture after the jumps, got %v", got)
@@ -212,7 +212,7 @@ func TestConcurrentExtentAndWholeFill(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); readAt(t, raw, nodeR, fhR, 45*chunk+7, 1<<10) }()  // byte-exact of chunk 45
+	go func() { defer wg.Done(); readAt(t, raw, nodeR, fhR, 45*chunk+7, 1<<10) }()       // byte-exact of chunk 45
 	go func() { defer wg.Done(); readAt(t, raw, nodeS, fhS, 45*chunk+300<<10, 4<<10) }() // whole chunk 45
 	wg.Wait()
 }
