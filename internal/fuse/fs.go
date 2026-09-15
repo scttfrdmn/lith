@@ -675,6 +675,19 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// bytes (#118). Every other handle — plain, or a streaming footer handle on
 		// a fat pipe — streams whole chunks.
 		sequential := h.footerKind == footer.FormatNone || h.footerStream
+		// #210/M16 step 1: a confirmed-random handle doing a small read fetches only
+		// its 64 KiB extents, not the whole 1 MiB chunk — the scattered-metadata case
+		// (HDF5/NetCDF-4 open reads hundreds of tiny fields spread across the object).
+		// Streaming/sequential handles keep whole chunks and are byte-identical to
+		// before, because a streaming handle never reaches Random; footer tier-2 is
+		// already byte-exact (sequential==false) and untouched. The detector still
+		// governs posture (it is not consulted to *change* the plan, only to pick the
+		// fetch granularity for a demand read the plan does not cover).
+		if sequential && h.pf.state() == prefetch.Random {
+			if t := f.byteExactThreshold(); t > 0 && end-off <= t {
+				sequential = false
+			}
+		}
 		chunk, err := f.store.Chunk(f.ctx, h.key, ci, h.size, lo, hi, sequential)
 		if err != nil {
 			return nil, fuse.EIO
@@ -1026,6 +1039,39 @@ func (f *rawFS) maxReadahead() int64 {
 		return f.cfg.MaxReadahead
 	}
 	return 32
+}
+
+// byteExactThreshold is the largest demand read that a confirmed-random handle
+// fetches byte-exact (only its 64 KiB extents) instead of pulling the whole
+// 1 MiB chunk (#210/M16 step 1). Derived from the device, not tuned: a
+// mispredicted byte-exact fetch costs at most one extra round-trip if the handle
+// later reads an adjacent extent, worth ~NIC×TTFB bytes of transfer, so that
+// product is the size below which fetching only the read's extents is the safe
+// bet. Clamped to [ExtentSize, ChunkSize]:
+//   - fat pipe: NIC×TTFB exceeds a chunk, clamps to ChunkSize, so every
+//     sub-chunk random read goes byte-exact — the transfer saving is ~free and
+//     the Random posture already guards the clustering risk;
+//   - thin pipe: the product shrinks, keeping larger reads whole-chunk so a
+//     mispredicted extent re-fetch does not cross a slow link.
+//
+// Returns 0 (⇒ never byte-exact, whole-chunk preserved) when there is no device
+// info — behavior-preserving for callers without a Limits policy.
+func (f *rawFS) byteExactThreshold() int64 {
+	if f.cfg.Limits == nil {
+		return 0
+	}
+	dev := f.cfg.Limits.Device()
+	if dev.NICBytesPerSec <= 0 || dev.TTFB <= 0 {
+		return 0
+	}
+	rt := int64(float64(dev.NICBytesPerSec) * dev.TTFB.Seconds())
+	if rt < blockstore.ExtentSize {
+		rt = blockstore.ExtentSize
+	}
+	if rt > blockstore.ChunkSize {
+		rt = blockstore.ChunkSize
+	}
+	return rt
 }
 
 // perHandleWindow is the readahead window (blocks) each open handle may use so
