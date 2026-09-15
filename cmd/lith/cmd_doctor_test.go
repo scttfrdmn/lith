@@ -4,10 +4,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/scttfrdmn/lith/internal/s3client"
 )
 
 func TestHasUncommented(t *testing.T) {
@@ -89,5 +94,45 @@ func TestDoctorFailAccumulates(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "fix: do x") {
 		t.Errorf("a fail must print its fix; got %q", buf.String())
+	}
+}
+
+// denyingList is an s3client.API whose LIST returns an access denial.
+type denyingList struct{ s3client.API }
+
+func (denyingList) ListObjectsV2(_ context.Context, _, _ string, _ int32) (s3client.ListPage, error) {
+	return s3client.ListPage{}, fmt.Errorf("api error AccessDenied: access denied")
+}
+
+// TestDoctorListDenialClassification: a LIST denial is a FAIL by default (the
+// mount's default build path needs ListBucket), but N/A when the invocation
+// declares an alternate index source (#194).
+func TestDoctorListDenialClassification(t *testing.T) {
+	c := denyingList{}
+	bare := &doctor{out: io.Discard}
+	doctorList(context.Background(), bare, c, "p/", false)
+	if !bare.failed {
+		t.Error("LIST denial without an alternate source must FAIL")
+	}
+	alt := &doctor{out: io.Discard}
+	doctorList(context.Background(), alt, c, "p/", true)
+	if alt.failed {
+		t.Error("LIST denial with --keys/@ref/etc must be N/A, not FAIL")
+	}
+}
+
+// TestDoctorAltSource: the alt-source signal fires for @ref and each flag.
+func TestDoctorAltSource(t *testing.T) {
+	if (&doctorFlags{}).usesAltSource("") {
+		t.Error("plain invocation should not claim an alternate source")
+	}
+	if !(&doctorFlags{}).usesAltSource("current") {
+		t.Error("@current is an alternate source")
+	}
+	if !(&doctorFlags{keys: "k.txt"}).usesAltSource("") {
+		t.Error("--keys is an alternate source")
+	}
+	if !(&doctorFlags{cargoship: "s3://b/m.json"}).usesAltSource("") {
+		t.Error("--cargoship is an alternate source")
 	}
 }

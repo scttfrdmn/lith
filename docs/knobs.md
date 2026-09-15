@@ -116,9 +116,8 @@ Mount a [CargoShip](cargoship.md) archive, or a [published dataset](published-da
 
 | flag | default | why |
 |---|---|---|
-| `--listen` | `:2049` | Listen address for the NFSv3 + embedded MOUNT service. Clients mount with an explicit `port=`/`mountport=`. |
-| `--client-idle` | — | Evict a client's per-client read-ahead state after it has been idle this long. |
-| `--no-portmap` | off | Do not register with portmap/rpcbind (clients pass an explicit port). |
+| `--listen` | `:2049` | Listen address for the NFSv3 + embedded MOUNT service. The gateway never registers with portmap/rpcbind; clients mount with an explicit `port=`/`mountport=`. |
+| `--client-idle` | `5m` | Release a mounted client's share of the read-ahead budget after it has been idle (since its last MOUNT) this long. |
 
 ## Operational and diagnostics
 

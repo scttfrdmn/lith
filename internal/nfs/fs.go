@@ -37,20 +37,49 @@ type roFS struct {
 // stateless read path; the shared block cache still serves both via
 // singleflight. See the PR notes.)
 type seqState struct {
-	mu       sync.Mutex
-	lastEnd  int64 // end offset of the previous read
-	frontier int64 // next block index not yet prefetched
+	mu        sync.Mutex
+	lastEnd   int64     // end offset of the previous read
+	frontier  int64     // next block index not yet prefetched
+	lastTouch time.Time // for LRU eviction of the states map (#197)
 }
+
+// maxSeqStates bounds the per-path sequential-read state map so a long-lived
+// gateway that opens millions of distinct files does not leak memory (#197). The
+// state is a pure prefetch optimization: evicting an entry only resets one file's
+// readahead frontier (recreated on its next open), never affects correctness.
+const maxSeqStates = 8192
 
 func (f *roFS) stateFor(p string) *seqState {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s := f.states[p]
-	if s == nil {
-		s = &seqState{}
-		f.states[p] = s
+	if s := f.states[p]; s != nil {
+		s.lastTouch = time.Now()
+		return s
+	}
+	if len(f.states) >= maxSeqStates {
+		f.evictOldestLocked()
+	}
+	s := &seqState{lastTouch: time.Now()}
+	f.states[p] = s
+	if f.cfg.Metrics != nil {
+		f.cfg.Metrics.NFSSeqStates(len(f.states))
 	}
 	return s
+}
+
+// evictOldestLocked drops the least-recently-touched state. The caller holds
+// f.mu. An in-flight reader keeps its own *seqState pointer, so eviction is safe.
+func (f *roFS) evictOldestLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for k, s := range f.states {
+		if oldestKey == "" || s.lastTouch.Before(oldest) {
+			oldestKey, oldest = k, s.lastTouch
+		}
+	}
+	if oldestKey != "" {
+		delete(f.states, oldestKey)
+	}
 }
 
 var _ billy.Filesystem = (*roFS)(nil)

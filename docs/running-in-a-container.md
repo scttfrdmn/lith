@@ -10,7 +10,7 @@ docker run --rm ghcr.io/scttfrdmn/lith:latest version
 docker run --rm ghcr.io/scttfrdmn/lith:latest doctor s3://1000genomes --no-sign-request
 ```
 
-Tags: the exact version (`0.5.0`), the floating `major.minor` (`0.5`), and
+Tags: the exact version (`1.0.0`), the floating `major.minor` (`1.0`), and
 `latest` (real releases only, never a prerelease). The image runs as a non-root
 user (uid 65532); mounted volumes must be writable by it.
 
@@ -66,7 +66,7 @@ spec:
     spec:
       containers:
         - name: lith
-          image: ghcr.io/scttfrdmn/lith:0.5
+          image: ghcr.io/scttfrdmn/lith:1.0
           args:
             - serve
             - nfs

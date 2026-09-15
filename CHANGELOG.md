@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-14
+
+Hardening release from an external review of the v1.0.0 tag. No features. The
+headline is a correctness fix: **`lith refresh` could return stale data** — a
+failing-first integration test through a real FUSE mount confirmed it before the
+fix. If you use `lith refresh`, upgrade.
+
+### Fixed
+
+- **`lith refresh` did not invalidate the kernel cache, so a reopen after a
+  refresh could return the OLD version's size and bytes**
+  ([#193](https://github.com/scttfrdmn/lith/issues/193)). The swap replaced an
+  in-memory pointer, but the mount's one-year attribute/entry timeouts and
+  `FOPEN_KEEP_CACHE` meant the kernel served a reopen from its cached
+  previous-version attrs and pages — userspace never saw the read. **A
+  failing-first integration test through a real mount confirmed the bug** (a
+  reopen returned 4 KiB of the old content when the new version was 8 KiB of
+  new content). The fix drives `notifyInvalInode`/`notifyInvalEntry` from a diff
+  of the old and new index on swap; files unchanged between versions stay
+  cached. (Verified by the same test passing post-fix, on a real kernel.)
+- **`lith doctor` bypassed the production S3 client**
+  ([#194](https://github.com/scttfrdmn/lith/issues/194)): it could sign a
+  request to a non-HTTPS `--endpoint` — the exact case the mount path refuses —
+  and so could report success on a configuration the real client rejects. doctor
+  now builds its client through the same factory `mount` uses: a signed
+  non-HTTPS endpoint is a check failure with the factory's own message,
+  `--requester-pays` reaches the bucket and LIST probes, and a LIST denial is a
+  **failure** (N/A only when `--keys` / `--keys-from-manifest` / `--cargoship` /
+  `@ref` declares an alternate source).
+- **The `CURRENT` pointer read was not bounded at the network**
+  ([#195](https://github.com/scttfrdmn/lith/issues/195)): it read the whole
+  object into memory before the 64 KiB cap applied. It now requests
+  `MaxPointerBytes+1` and refuses an oversized pointer, naming the key and the
+  cap — bounded in transit, not after the fact.
+- **NFS gateway handle identity**
+  ([#197](https://github.com/scttfrdmn/lith/issues/197)): `--cargoship` and
+  auto-list now derive the handle root id from the index's own content, like
+  `@version` and `--index-file` already did, so a rebuilt namespace at the same
+  location returns `NFS3ERR_STALE` instead of silently reinterpreting old handles.
+
+### Changed
+
+- **NFS gateway `seqState` is bounded** (LRU, 8192 entries) with a
+  `lith_nfs_seq_states` gauge — it was an unbounded per-path map that leaked over
+  a long-lived gateway ([#197](https://github.com/scttfrdmn/lith/issues/197)).
+  Eviction only resets one file's readahead, never correctness.
+- **The gateway readahead window is described honestly** — in code and docs — as
+  a **mount-registration-based share** of the global budget, not a measured
+  per-client fair share (go-nfs's read path carries no per-op client identity)
+  ([#197](https://github.com/scttfrdmn/lith/issues/197)).
+- **Removed the cosmetic `--no-portmap` flag** from `serve nfs`
+  ([#197](https://github.com/scttfrdmn/lith/issues/197)): only its default
+  behavior ever existed. The gateway never registers with rpcbind; clients mount
+  with an explicit port. No behavior change.
+- **The 1.x index compatibility contract is published** on the
+  [Scope page](https://scttfrdmn.github.io/lith/scope/) and enforced by golden
+  fixtures ([#196](https://github.com/scttfrdmn/lith/issues/196)): every lith 1.x
+  reader reads every index produced by lith 1.0.x. Stale "no compatibility
+  promise before v1" language removed from the source, CONTRIBUTING, and design.
+- **Documentation sweep** ([#198](https://github.com/scttfrdmn/lith/issues/198)):
+  the README lists `serve`/`refresh`/`doctor` and the cluster/container/published/
+  CargoShip pages and drops "Linux only (for v0.x)"; SECURITY.md drops "pre-1.0".
+  The drift guard is extended beyond flags: CI now also fails on a command
+  missing from the README summary, pre-1.0 status language, or a stale pre-1.0
+  image tag / URL in any user-facing doc.
+
+### Security
+
+- **`lith doctor` no longer signs requests to a non-HTTPS endpoint**
+  ([#194](https://github.com/scttfrdmn/lith/issues/194)) — the diagnostic path
+  now enforces the same cleartext-credential guard as the mount path.
+- **The NFS gateway's security boundary is stated plainly**
+  ([#197](https://github.com/scttfrdmn/lith/issues/197)): it is the network
+  perimeter. The gateway advertises `AUTH_UNIX`/`AUTH_NULL` and does not verify
+  client identity, so any host that can reach its port has read access — restrict
+  it with a security group / trusted subnet. Now documented in SECURITY.md and
+  the cluster page.
+
 ## [1.0.0] - 2026-09-14
 
 **lith 1.0 — feature-complete for its thesis.** lith is read-only by definition
@@ -722,7 +800,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/scttfrdmn/lith/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/scttfrdmn/lith/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/scttfrdmn/lith/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/lith/compare/v0.3.2...v0.4.0

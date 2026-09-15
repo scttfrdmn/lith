@@ -163,3 +163,19 @@ working mount in five minutes. Past 1.0, work is extension, not completion; a
 new format plane or the write plane makes lith do *more*, not make it *finished*,
 because for its thesis it already is. The road there, and what is shipped, is the
 [1.0 tracker](https://github.com/scttfrdmn/lith/issues/175).
+
+## Compatibility
+
+The index is a durable artifact now, not a private cache: a published dataset
+pins its index by sha, CargoShip writes indexes that lith reads, and
+`pkg/lithindex` is a public build surface. So the format carries a promise:
+
+> **Every lith 1.x reader reads every index produced by lith 1.0.x and
+> `pkg/lithindex` 1.x.** A newer index format may be introduced within 1.x only
+> if readers retain support for all earlier 1.x formats.
+
+This is enforced mechanically: golden index images produced by 1.0.x (native,
+`--keys`, and CargoShip-backed) are committed to the test suite, and a test
+opens all three. That test failing is the signal that a change broke the
+promise. The index remains lith-private in the sense that nothing is written to
+your bucket — but once produced, an index a 1.x tool wrote, a 1.x tool reads.

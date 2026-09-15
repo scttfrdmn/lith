@@ -9,6 +9,9 @@ coverage.*
 # Local index files and caches
 *.lith
 *.lithidx
+# ...but the committed golden 1.0.x index fixtures are tracked (the 1.x
+# compatibility guard, #196). Regenerate only for a deliberate format change.
+!/internal/index/testdata/golden/*.lith
 /cache/
 
 # Host-specific NIC baseline cache (code writes nic-<uid>.json)

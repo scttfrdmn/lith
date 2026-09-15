@@ -205,6 +205,11 @@ type rawFS struct {
 	blockSize int64
 	ctx       context.Context
 
+	// server is captured in Init; SwapIndex (#167 refresh) uses it to invalidate
+	// the kernel's entry/attr/page caches for entries that changed between
+	// versions. nil before Init and in unit tests that never mount.
+	server *fuse.Server
+
 	mu      sync.RWMutex
 	nodes   map[uint64]*node
 	handles map[uint64]*fileHandle
@@ -259,9 +264,126 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 // a concurrent SwapIndex is safe.
 func (f *rawFS) index() index.Reader { return f.ix.Load().r }
 
-// SwapIndex atomically replaces the index used for future lookups (#167 refresh).
-// Open handles are unaffected — they captured their backing at open time.
-func (f *rawFS) SwapIndex(r index.Reader) { f.ix.Store(&liveIndex{r: r}) }
+// Init captures the fuse.Server so SwapIndex can drive kernel cache
+// invalidation. go-fuse calls it once, during the mount handshake.
+func (f *rawFS) Init(server *fuse.Server) { f.server = server }
+
+// SwapIndex atomically replaces the index used for future lookups (#167 refresh)
+// and then invalidates the kernel caches for entries that changed between the
+// old and new version. Without that invalidation the mount's one-year entry and
+// attribute timeouts and FOPEN_KEEP_CACHE would serve a reopen from the kernel's
+// cached OLD-version attrs and pages — userspace would never see the read, and
+// `lith refresh` would silently return stale data (#193). Open handles are
+// unaffected — they captured their backing at open time.
+//
+// The diff is driven off the nodes the kernel actually knows about (those it has
+// looked up), so an unchanged file is never invalidated — refresh keeps the
+// cache it exists to preserve.
+func (f *rawFS) SwapIndex(r index.Reader) {
+	old := f.ix.Load().r
+	f.ix.Store(&liveIndex{r: r})
+	f.invalidateOnSwap(old, r)
+}
+
+// invalidateOnSwap tells the kernel to drop its cached view of every known entry
+// whose identity changed between old and new. It must run OUTSIDE f.mu: a notify
+// can re-enter the filesystem (Lookup), so it snapshots the node table under the
+// lock and then notifies without it.
+func (f *rawFS) invalidateOnSwap(old, updated index.Reader) {
+	srv := f.server
+	if srv == nil {
+		return // not mounted (unit tests) — nothing cached in a kernel
+	}
+	type snap struct {
+		ino, parent uint64
+		path        string
+		isDir       bool
+	}
+	f.mu.RLock()
+	snaps := make([]snap, 0, len(f.nodes))
+	for ino, n := range f.nodes {
+		snaps = append(snaps, snap{ino: ino, parent: n.parent, path: n.path, isDir: n.isDir})
+	}
+	f.mu.RUnlock()
+
+	for _, s := range snaps {
+		if s.isDir {
+			// A directory's cached attrs and readdir listing must be dropped only
+			// if its child set changed (add/remove/type-flip). A child whose
+			// content changed is handled by that child's own file node below, so
+			// the dir listing itself is still valid — don't churn it.
+			if dirIdentity(old, s.path) != dirIdentity(updated, s.path) {
+				srv.InodeNotify(s.ino, 0, 0)
+			}
+			continue
+		}
+		if fileChanged(old, updated, s.path) {
+			// InodeNotify(ino,0,0) invalidates attrs and (len<=0 → to EOF) the
+			// whole page cache; EntryNotify drops the parent's name→ino dentry so
+			// a reopen re-looks-up (covering a removed or type-changed entry).
+			srv.InodeNotify(s.ino, 0, 0)
+			srv.EntryNotify(s.parent, baseName(s.path))
+		}
+	}
+}
+
+// fileChanged reports whether a file at path differs between two index versions:
+// gone, resized, or different content (ETag). Identical files are left cached.
+func fileChanged(old, updated index.Reader, path string) bool {
+	nf, nerr := updated.Stat(path)
+	if nerr != nil {
+		return true // removed in the new version
+	}
+	of, oerr := old.Stat(path)
+	if oerr != nil {
+		return true // appeared or type-changed
+	}
+	if of.Size != nf.Size {
+		return true
+	}
+	return old.ETagHashOf(path) != updated.ETagHashOf(path)
+}
+
+// dirIdentity folds a directory's child set (name + inode) into one value so a
+// swap can tell whether entries were added, removed, or type-flipped. Content
+// changes to existing children don't move it — those are handled per-file.
+func dirIdentity(r index.Reader, dir string) uint64 {
+	h := uint64(1469598103934665603) // FNV-1a offset basis
+	fold := func(b []byte) {
+		for _, c := range b {
+			h ^= uint64(c)
+			h *= 1099511628211
+		}
+	}
+	var cursor uint64
+	for {
+		ents, next, err := r.Readdir(dir, cursor, 4096)
+		if err != nil {
+			break
+		}
+		for _, e := range ents {
+			fold([]byte(e.Name))
+			var ino [8]byte
+			for i := 0; i < 8; i++ {
+				ino[i] = byte(e.Ino >> (8 * i))
+			}
+			fold(ino[:])
+		}
+		if next == 0 || len(ents) == 0 {
+			break
+		}
+		cursor = next
+	}
+	return h
+}
+
+// baseName returns the last "/"-separated component of a lith relative path.
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
 
 func (f *rawFS) observe(op string, start time.Time) {
 	f.met.ObserveFUSE(op, time.Since(start).Seconds())

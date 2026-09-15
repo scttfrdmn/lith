@@ -91,11 +91,29 @@ For a shared, read-only S3 dataset across a cluster, the gateway is the cheapest
 and simplest of the three; for read-write scratch or POSIX-complete semantics,
 EFS/FSx remain the right tools.
 
-## Limits (v0.4)
+## Limits
 
 NFSv3 only (no NFSv4 state/delegations/ACLs); **read-only** (every mutating op is
-`NFS3ERR_ROFS`); `AUTH_UNIX` with squash, **no Kerberos**; file handles are
-`(index-sha, inode)` — stable across a restart against the same index, `STALE`
-against a rebuilt one; per-**path** (not per-client) sequential state, a
-limitation of go-nfs's stateless read path that does not affect throughput or the
-measured fair-share spread.
+`NFS3ERR_ROFS`); file handles are `(index-content-sha, inode)` — stable across a
+restart against the same index, `STALE` against a rebuilt one; per-**path** (not
+per-client) sequential state, a limitation of go-nfs's stateless read path that
+does not affect throughput.
+
+**No rpcbind.** The gateway never registers with portmap/rpcbind; clients mount
+with an explicit port (`port=`/`mountport=`), as the recipe above shows. That is
+the contract, not a toggle.
+
+**The readahead window is a registration-based share, not a measured fair share.**
+The prefetch budget is divided by the number of currently-mounted (not-idle)
+clients, which bounds total in-flight prefetch by the global budget. Because
+go-nfs's read path carries no per-operation client identity, "active" means
+"mounted and not idle since its last MOUNT" — a client streaming after its idle
+expiry is not in the denominator. It is a sound global bound, not a per-client
+guarantee.
+
+**Security boundary: the network perimeter, not per-client S3 authorization.**
+The gateway advertises `AUTH_UNIX` (client-asserted, unverified uid/gid, with
+squash) and `AUTH_NULL`, and does not check client identity — any host that can
+reach the port gets read access to the export. Put the gateway on a trusted
+network (security group / subnet) and treat reachability as the authorization
+boundary; there is **no Kerberos** and no per-client S3-credential mapping.

@@ -35,8 +35,10 @@ template has a checkbox for this.
 ## Versioning
 
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html). Releases are
-tagged `vX.Y.Z`. The index file format is lith-private and versioned; it carries
-no compatibility promise before v1.
+tagged `vX.Y.Z`. The index file format is lith-private and versioned, with a 1.x
+compatibility promise: every lith 1.x reader reads every index produced by lith
+1.0.x and `pkg/lithindex` 1.x (see [docs/scope.md](docs/scope.md); golden
+fixtures under `internal/index/testdata/golden` enforce it).
 
 ## Before you push
 
