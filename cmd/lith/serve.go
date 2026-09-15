@@ -46,7 +46,6 @@ type serveFlags struct {
 	pathStyle      bool
 	metrics        string
 	clientIdle     time.Duration
-	noPortmap      bool
 	noSign         bool
 	reqPays        bool
 	logLevel       string
@@ -99,7 +98,6 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log verbosity: debug, info, warn, error")
 	fl.DurationVar(&f.clientIdle, "client-idle", 5*time.Minute, "release a client's readahead share after this idle time")
-	fl.BoolVar(&f.noPortmap, "no-portmap", true, "do not register with rpcbind; clients mount with an explicit port (mountport=)")
 	fl.BoolVar(&f.noSign, "no-sign-request", false, "anonymous S3 requests (public buckets)")
 	fl.BoolVar(&f.reqPays, "requester-pays", false, "add the requester-pays header")
 	return cmd
@@ -240,8 +238,10 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", f.listen, err)
 	}
+	// The gateway never registers with rpcbind/portmap — clients mount with an
+	// explicit port (see the recipe below). That is the contract, not a toggle.
 	log.Info("lith NFSv3 gateway", "listen", f.listen, "bucket", bucket, "prefix", prefix,
-		"keys", reader.Len(), "root_id", fmt.Sprintf("%x", rootID), "portmap", !f.noPortmap)
+		"keys", reader.Len(), "root_id", fmt.Sprintf("%x", rootID), "portmap", false)
 	fmt.Fprintf(os.Stderr, "mount with: sudo mount -t nfs -o vers=3,proto=tcp,port=%s,mountport=%s,nolock <host>:/ /mnt\n", portOf(f.listen), portOf(f.listen))
 
 	// Gateway refresh (#167): unlike a single-client FUSE mount, the gateway does
@@ -329,9 +329,7 @@ func loadServeIndex(ctx context.Context, f *serveFlags, client s3client.API, buc
 		if err != nil {
 			return nil, nil, rootID, err
 		}
-		sum := sha256.Sum256([]byte("cargoship:" + bucket + "/" + manKey))
-		copy(rootID[:], sum[:8])
-		return ix, nil, rootID, nil
+		return ix, nil, indexContentRootID(ix), nil
 	default:
 		ix, err := index.BuildFromList(ctx, client, index.ListOptions{
 			Options: index.Options{Bucket: bucket, Prefix: prefix, Logger: log},
@@ -340,10 +338,22 @@ func loadServeIndex(ctx context.Context, f *serveFlags, client s3client.API, buc
 		if err != nil {
 			return nil, nil, rootID, err
 		}
-		sum := sha256.Sum256([]byte("list:" + bucket + "/" + prefix))
-		copy(rootID[:], sum[:8])
-		return ix, nil, rootID, nil
+		return ix, nil, indexContentRootID(ix), nil
 	}
+}
+
+// indexContentRootID derives the 8-byte handle root id from the index's own
+// content (its marshaled image), so a rebuilt namespace at the same location
+// yields a different id and stale client handles go NFS3ERR_STALE rather than
+// being silently reinterpreted against a different tree (#197). Marshal is
+// deterministic, so the id is stable across a gateway restart on the same index.
+// (Published @ref mode derives from the immutable version id, and --index-file
+// from the file bytes — both already content identities.)
+func indexContentRootID(ix *index.Index) [8]byte {
+	var rootID [8]byte
+	sum := sha256.Sum256(ix.Marshal())
+	copy(rootID[:], sum[:8])
+	return rootID
 }
 
 func portOf(listen string) string {

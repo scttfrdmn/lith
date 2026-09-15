@@ -51,6 +51,7 @@ type Metrics struct {
 	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
 	fillInflPk  prometheus.Gauge       // high-water mark of fill-batch runs in flight (#31)
 	nfsClients  prometheus.Gauge       // active NFS gateway clients (#143)
+	nfsSeqState prometheus.Gauge       // per-path sequential-read states held (#197)
 	nfsOps      *prometheus.CounterVec // NFS ops by op= (#143)
 	nfsReadByte prometheus.Counter     // bytes served over NFS READ (#143)
 	backFrames  prometheus.Counter     // CargoShip frames fetched (#94)
@@ -164,6 +165,9 @@ func New() *Metrics {
 		nfsClients: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "lith_nfs_clients", Help: "Active NFS gateway clients (#143).",
 		}),
+		nfsSeqState: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "lith_nfs_seq_states", Help: "Per-path sequential-read states currently held by the gateway (#197).",
+		}),
 		nfsOps: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_nfs_ops_total", Help: "NFS gateway operations by type (#143).",
 		}, []string{"op"}),
@@ -195,7 +199,7 @@ func New() *Metrics {
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
-		m.nfsClients, m.nfsOps, m.nfsReadByte)
+		m.nfsClients, m.nfsSeqState, m.nfsOps, m.nfsReadByte)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_distinct_bytes_read",
 		Help: "Distinct object bytes read through the mount, from per-object touched-extent bitmaps. " +
@@ -461,6 +465,14 @@ func (m *Metrics) BackingFramesFetched(n int64) {
 func (m *Metrics) NFSClients(delta int) {
 	if m != nil {
 		m.nfsClients.Add(float64(delta))
+	}
+}
+
+// NFSSeqStates sets the gauge of per-path sequential-read states the gateway
+// currently holds (#197). Nil-safe.
+func (m *Metrics) NFSSeqStates(n int) {
+	if m != nil {
+		m.nfsSeqState.Set(float64(n))
 	}
 }
 

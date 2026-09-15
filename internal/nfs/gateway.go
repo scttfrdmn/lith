@@ -25,6 +25,7 @@ import (
 // at the call sites.
 type Metrics interface {
 	NFSClients(delta int)
+	NFSSeqStates(n int)
 	NFSOp(op string)
 	NFSReadBytes(n int64)
 }
@@ -56,8 +57,12 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config) error {
 	return gonfs.Serve(ln, h)
 }
 
-// server holds the shared gateway state: the client registry (for the fair-share
-// window and the clients gauge) and the derived readahead window.
+// server holds the shared gateway state: the client registry (for the readahead
+// window and the clients gauge) and the derived readahead window. The registry
+// tracks MOUNT registrations, not per-operation activity — go-nfs's stateless
+// read path does not carry a client identity — so the window below is a
+// mount-registration-based share of the global budget, not a measured per-client
+// fair share (#197).
 type server struct {
 	cfg     Config
 	mu      sync.Mutex
@@ -116,9 +121,12 @@ func (s *server) activeClients() int {
 }
 
 // windowBlocks is the per-read-stream readahead window: the mount-wide prefetch
-// budget in blocks divided by the active client count, floored at 2 blocks so a
-// single stream always gets some readahead. One client alone gets the whole
-// budget; N clients each get 1/N (the session-12 fair share, one level up).
+// budget in blocks divided by the count of currently-registered (mounted,
+// not-idle) clients, floored at 2 blocks so a single stream always gets some
+// readahead. One client alone gets the whole budget; N registered clients each
+// get 1/N. This bounds total in-flight prefetch by the global budget; it is a
+// registration-based share, not a measured per-client fair share (a client
+// streaming after its idle expiry is absent from the denominator).
 func (s *server) windowBlocks() int64 {
 	budget := s.cfg.Store.PrefetchBudgetBlocks()
 	if budget < 2 {
