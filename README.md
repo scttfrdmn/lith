@@ -76,14 +76,13 @@ page — grab the `.deb`/`.rpm` for your architecture, e.g. `sudo dpkg -i lith_*
 
 ### Verifying a release
 
-Every release ships a `checksums.txt` with a **keyless cosign signature**
-(`checksums.txt.sig` + `checksums.txt.pem`), an **SBOM** per artifact, and a
-**SLSA build-provenance attestation**. To verify:
+Every release ships a `checksums.txt` with a **keyless cosign signature bundle**
+(`checksums.txt.bundle`), an **SBOM** per artifact, and a **SLSA build-provenance
+attestation**. To verify:
 
 ```
 # the checksums signature (identity = the release workflow's OIDC identity)
-cosign verify-blob checksums.txt \
-  --signature checksums.txt.sig --certificate checksums.txt.pem \
+cosign verify-blob checksums.txt --bundle checksums.txt.bundle \
   --certificate-identity-regexp 'https://github.com/scttfrdmn/lith/.github/workflows/.+' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 # then confirm your download against the (now-trusted) checksums
