@@ -15,15 +15,19 @@ type pfWrapper struct {
 	pf *prefetch.Prefetcher
 }
 
-func newPFWrapper(maxReadahead int64) *pfWrapper {
-	return &pfWrapper{pf: prefetch.New(maxReadahead)}
+func newPFWrapper(maxReadahead, blockSize int64) *pfWrapper {
+	pf := prefetch.New(maxReadahead)
+	// A read landing more than one block past the previous is a seek, not
+	// sequential progress, however in-band it looks (#210/M16 1b).
+	pf.SetGapMax(blockSize)
+	return &pfWrapper{pf: pf}
 }
 
-func (w *pfWrapper) observe(block, maxWindow int64) []int64 {
+func (w *pfWrapper) observe(block, byteGap, maxWindow int64) []int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pf.SetMax(maxWindow)
-	return w.pf.Observe(block)
+	return w.pf.Observe(block, byteGap)
 }
 
 func (w *pfWrapper) open(maxWindow int64) []int64 {

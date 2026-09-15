@@ -14,6 +14,8 @@
 // rather than collapsing it — the full re-ramp was the #49 lone-survivor tail.
 package prefetch
 
+import "math"
+
 // State is the detected access pattern for a file handle.
 type State int
 
@@ -68,6 +70,7 @@ type Prefetcher struct {
 	cursor    int64 // highest block demanded
 	frontier  int64 // next block index not yet dispatched
 	pending   bool  // an unexplained jump is outstanding (one more seeks -> random)
+	seqGapMax int64 // largest byte gap that still counts as sequential (#210/M16 1b); MaxInt64 = off
 
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
@@ -85,12 +88,31 @@ func (p *Prefetcher) Resets() int64 { return p.resetRandom }
 func (p *Prefetcher) PeakWindow() int64 { return p.peakWindow }
 
 // New returns a Prefetcher with the given max readahead window in blocks
-// (values < 2 are raised to 2).
+// (values < 2 are raised to 2). The byte-gap gate is off by default (seqGapMax =
+// MaxInt64); call SetGapMax to enable it.
 func New(maxReadahead int64) *Prefetcher {
 	if maxReadahead < initialWindow {
 		maxReadahead = initialWindow
 	}
-	return &Prefetcher{maxReadahead: maxReadahead, state: Cold}
+	return &Prefetcher{maxReadahead: maxReadahead, state: Cold, seqGapMax: math.MaxInt64}
+}
+
+// SetGapMax sets the largest byte gap between consecutive reads that still counts
+// as sequential progress (#210/M16 1b). The FUSE layer sets it to the block size:
+// a read landing more than one block past the previous is a seek, not a stream,
+// however in-band it looks in block space. n<=0 disables the gate (MaxInt64).
+func (p *Prefetcher) SetGapMax(n int64) {
+	if n <= 0 {
+		n = math.MaxInt64
+	}
+	p.seqGapMax = n
+}
+
+func absInt64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // State returns the current detected pattern.
@@ -122,10 +144,19 @@ func (p *Prefetcher) Open() []int64 {
 	return blockRange(0, initialWindow)
 }
 
-// Observe records a demand read at blockIdx and returns the block indices to
-// dispatch now (the frontier advance), empty when the frontier already leads
-// far enough.
-func (p *Prefetcher) Observe(blockIdx int64) []int64 {
+// Observe records a demand read at blockIdx, byteGap bytes from the end of the
+// previous read on this handle, and returns the block indices to dispatch now
+// (the frontier advance), empty when the frontier already leads far enough.
+//
+// byteGap distinguishes a stream from a scattered walk that the block-space
+// in-band test alone cannot (#210/M16 1b): a metadata walk reads kilobytes at
+// offsets megabytes apart, so its reads land in adjacent 8 MiB blocks (d==1) or
+// inside the grown reorder band and were misread as sequential. A read whose
+// |gap| exceeds seqGapMax is not sequential progress however in-band it looks —
+// it falls through to the seek path. Contiguous streams (gap≈0) and kernel
+// reorder (gap ≪ block) are unaffected; seqGapMax defaults to "off" (MaxInt64)
+// so a caller that does not set it keeps the pre-1b behavior.
+func (p *Prefetcher) Observe(blockIdx, byteGap int64) []int64 {
 	if !p.haveLast {
 		p.haveLast = true
 		p.lastBlock = blockIdx
@@ -156,8 +187,11 @@ func (p *Prefetcher) Observe(blockIdx int64) []int64 {
 		return nil
 	}
 
-	// Sequential progress: a unit step, or a read within the reorder band.
-	if d == 1 || p.inBand(blockIdx) {
+	// Sequential progress: a unit step, or a read within the reorder band — but
+	// only if the read is byte-contiguous. A large byte gap is a seek even when it
+	// lands in an adjacent block or the grown band (#210/M16 1b: the scattered
+	// metadata walk).
+	if (d == 1 || p.inBand(blockIdx)) && absInt64(byteGap) <= p.seqGapMax {
 		if p.state == Sequential {
 			p.window = min(p.window*2, p.maxReadahead)
 		} else {

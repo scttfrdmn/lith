@@ -22,7 +22,7 @@ func TestSequentialFrontierLeadsNoDup(t *testing.T) {
 	dispatched := append([]int64{}, p.Open()...) // [0,1]
 
 	for blk := int64(0); blk <= 40; blk++ {
-		got := p.Observe(blk)
+		got := p.Observe(blk, 0)
 		// The frontier must lead the cursor by at least the current window.
 		if p.frontier-blk < p.window {
 			t.Fatalf("after read %d: frontier %d - cursor %d = %d < window %d",
@@ -49,7 +49,7 @@ func TestSequentialWindowGrowsGeometrically(t *testing.T) {
 	p.Open()
 	var windows []int64
 	for blk := int64(0); blk <= 6; blk++ {
-		p.Observe(blk)
+		p.Observe(blk, 0)
 		windows = append(windows, p.window)
 	}
 	// window: 2,4,8,16,32,32,32 (capped at maxReadahead=32)
@@ -63,10 +63,10 @@ func TestStridedPredictsNext(t *testing.T) {
 	p := New(32)
 	// delta 5: confirmed on the second delta, then predicts one block ahead.
 	got := [][]int64{
-		p.Observe(0),  // cold: establish last
-		p.Observe(5),  // first delta 5, not confirmed
-		p.Observe(10), // confirmed -> predict 15
-		p.Observe(15), // predict 20
+		p.Observe(0, 0),  // cold: establish last
+		p.Observe(5, 0),  // first delta 5, not confirmed
+		p.Observe(10, 0), // confirmed -> predict 15
+		p.Observe(15, 0), // predict 20
 	}
 	want := [][]int64{nil, nil, {15}, {20}}
 	if !reflect.DeepEqual(got, want) {
@@ -81,7 +81,7 @@ func TestRandomDispatchesNothing(t *testing.T) {
 	p := New(32)
 	seq := []int64{0, 7, 2, 9, 1}
 	for i, b := range seq {
-		if got := p.Observe(b); len(got) != 0 && i > 0 {
+		if got := p.Observe(b, 0); len(got) != 0 && i > 0 {
 			// After the first (which just records), random reads dispatch nothing.
 			if p.State() == Random {
 				t.Errorf("random read %d dispatched %v", b, got)
@@ -96,8 +96,8 @@ func TestRandomDispatchesNothing(t *testing.T) {
 func TestReReadSameBlockNoop(t *testing.T) {
 	p := New(32)
 	p.Open()
-	p.Observe(0)
-	if got := p.Observe(0); got != nil {
+	p.Observe(0, 0)
+	if got := p.Observe(0, 0); got != nil {
 		t.Errorf("re-read same block dispatched %v, want nil", got)
 	}
 }
@@ -113,7 +113,7 @@ func sumDispatched(p *Prefetcher, reads []int64) (int, map[int64]bool) {
 	}
 	add(p.Open())
 	for _, b := range reads {
-		add(p.Observe(b))
+		add(p.Observe(b, 0))
 	}
 	return len(set), set
 }
@@ -135,7 +135,7 @@ func TestInBandReorderNoHalving(t *testing.T) {
 		if !covered[b] {
 			t.Fatalf("read block %d was uncovered (prefetch did not lead)", b)
 		}
-		for _, d := range pr.Observe(b) {
+		for _, d := range pr.Observe(b, 0) {
 			covered[d] = true
 		}
 	}
@@ -163,10 +163,10 @@ func TestSingleSeekHalvesOnce(t *testing.T) {
 	p := New(32)
 	p.Open()
 	for b := int64(0); b <= 20; b++ {
-		p.Observe(b)
+		p.Observe(b, 0)
 	}
 	winBefore := p.window
-	got := p.Observe(200)
+	got := p.Observe(200, 0)
 	if p.Halvings() != 1 {
 		t.Fatalf("halvings = %d, want 1", p.Halvings())
 	}
@@ -187,8 +187,8 @@ func TestSingleSeekHalvesOnce(t *testing.T) {
 		t.Fatalf("seek re-ramped from 0: frontier=%d dispatch=%v", p.frontier, got)
 	}
 	winAfterSeek := p.window
-	p.Observe(201)
-	p.Observe(202)
+	p.Observe(201, 0)
+	p.Observe(202, 0)
 	if p.window <= winAfterSeek {
 		t.Fatalf("window did not grow after seek: %d -> %d", winAfterSeek, p.window)
 	}
@@ -203,19 +203,19 @@ func TestDoubleSeekRandomThenRecover(t *testing.T) {
 	p := New(32)
 	p.Open()
 	for b := int64(0); b <= 20; b++ {
-		p.Observe(b)
+		p.Observe(b, 0)
 	}
-	p.Observe(200) // first seek
-	p.Observe(400) // second seek, no progress between
+	p.Observe(200, 0) // first seek
+	p.Observe(400, 0) // second seek, no progress between
 	if p.State() != Random {
 		t.Fatalf("state after double seek = %v, want Random", p.State())
 	}
 	if p.Resets() != 1 {
 		t.Fatalf("resets = %d, want 1", p.Resets())
 	}
-	p.Observe(401)
-	p.Observe(402)
-	p.Observe(403)
+	p.Observe(401, 0)
+	p.Observe(402, 0)
+	p.Observe(403, 0)
 	if p.State() != Sequential {
 		t.Fatalf("state after recovery = %v, want Sequential", p.State())
 	}
@@ -227,10 +227,10 @@ func TestDoubleSeekRandomThenRecover(t *testing.T) {
 func TestStrideUnchanged(t *testing.T) {
 	p := New(32)
 	got := [][]int64{
-		p.Observe(0),  // establish
-		p.Observe(8),  // first delta 8, unconfirmed
-		p.Observe(16), // confirmed -> predict 24
-		p.Observe(24), // predict 32
+		p.Observe(0, 0),  // establish
+		p.Observe(8, 0),  // first delta 8, unconfirmed
+		p.Observe(16, 0), // confirmed -> predict 24
+		p.Observe(24, 0), // predict 32
 	}
 	want := [][]int64{nil, nil, {24}, {32}}
 	if !reflect.DeepEqual(got, want) {
