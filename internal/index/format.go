@@ -27,9 +27,11 @@ func inBounds(blen, at, size int) bool {
 	return at >= 0 && size >= 0 && at <= blen && size <= blen-at
 }
 
-// The on-disk index format is lith-private and versioned. It carries no
-// compatibility promise before v1 (see the pinned Design issue, §10). Numeric
-// arrays are stored in host byte order so a built index can be memory-mapped
+// The on-disk index format is lith-private (nothing is written to the bucket)
+// but versioned with a 1.x compatibility promise: every lith 1.x reader reads
+// every index produced by lith 1.0.x (see docs/scope.md; the golden fixtures in
+// testdata/golden enforce it). Numeric arrays are stored in host byte order so a
+// built index can be memory-mapped
 // and queried without copying; a mismatched byte order is rejected on load.
 //
 // v2 adds the directory table (sorted dir paths, per-directory inodes and
