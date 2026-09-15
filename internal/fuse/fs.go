@@ -531,7 +531,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead()),
+		pf:   newPFWrapper(f.maxReadahead(), f.blockSize),
 	}
 	f.mu.Lock()
 	fh := f.nextFh
@@ -739,24 +739,24 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// (a whole-block window would re-fetch the columns the plan skips; #118).
 	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		blk := off / f.blockSize
-		// M16 step 1b characterization (env-gated, no classification change): record
-		// exactly what the detector sees per read — byte gap from the previous read
-		// on this handle, block index, and the state transition — to see whether an
-		// HDF5 metadata walk is being misread as Sequential and by which rule.
+		// Byte gap from the previous read on this handle: a large gap is a seek even
+		// when it lands in an adjacent block or the grown reorder band, so the
+		// detector does not grow the readahead window for a scattered metadata walk
+		// (#210/M16 1b). The env-gated trace (LITH_PF_TRACE) records what the
+		// detector saw for the 1b characterization; nil in production.
+		gap := off - h.lastReadEnd.Load()
+		var before prefetch.State
 		if f.pfTrace != nil {
-			gap := off - h.lastReadEnd.Load()
-			before := h.pf.state()
-			pbs := h.pf.observe(blk, f.perHandleWindow())
-			f.tracePF(h.key.Key, off, end-off, blk, gap, before, h.pf.state(), h.pf.peakWindow())
-			for _, pb := range pbs {
-				go f.store.Prefetch(f.ctx, h.key, pb, h.size)
-			}
-			h.lastReadEnd.Store(end)
-			return res, fuse.OK
+			before = h.pf.state()
 		}
-		for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
+		pbs := h.pf.observe(blk, gap, f.perHandleWindow())
+		if f.pfTrace != nil {
+			f.tracePF(h.key.Key, off, end-off, blk, gap, before, h.pf.state(), h.pf.peakWindow())
+		}
+		for _, pb := range pbs {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
+		h.lastReadEnd.Store(end)
 	}
 	return res, fuse.OK
 }

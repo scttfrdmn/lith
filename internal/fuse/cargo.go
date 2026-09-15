@@ -38,7 +38,10 @@ func (f *rawFS) readCargo(h *fileHandle, off, end int64) ([]byte, error) {
 // uncompressed stream from the block this read reached.
 func (f *rawFS) cargoReadahead(h *fileHandle, p cargoPart, chunkOff int64) {
 	blk := chunkOff / f.blockSize
-	for _, pb := range h.pf.observe(blk, f.perHandleWindow()) {
+	// gap 0: the CargoShip path reads a decoded frame stream, not scattered
+	// object metadata — the #210/M16-1b byte-gap gate is for plain-file walks, so
+	// cargo keeps its existing whole-block readahead unchanged.
+	for _, pb := range h.pf.observe(blk, 0, f.perHandleWindow()) {
 		pb := pb
 		go f.store.Prefetch(f.ctx, p.key, pb, p.uncompTotal)
 	}
