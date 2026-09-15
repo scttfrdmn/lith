@@ -7,6 +7,8 @@ edit_uri: edit/main/docs/
 
 theme:
   name: material
+  logo: assets/lith-logo.png
+  favicon: assets/lith-logo.png
   # No CDN dependency: use the system font stack. To self-host Atkinson
   # Hyperlegible later, drop its .woff2 into docs/stylesheets/ and add an
   # @font-face rule to extra.css (see the note there); leave font: false so

@@ -1,5 +1,9 @@
 # lith
 
+<p align="center">
+  <img src="docs/assets/lith-hero.png" alt="lith — read-only data access for S3: mount locally, serve a cluster, read only what you touch" width="900">
+</p>
+
 Read-only, high-performance POSIX filesystem over an existing S3 bucket in its
 native key layout.
 
