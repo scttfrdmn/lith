@@ -49,7 +49,7 @@ Whether lith is for you — and where it is the wrong tool — is
 
 - **Not writable.** No writes, ever — not "writes disabled", writes *absent*.
 - **Not a re-layout.** It does not own or rewrite the bucket's object format.
-- **Linux only** (for v0.x). It relies on FUSE; macOS/Windows are out of scope.
+- **Linux only.** It relies on FUSE; macOS/Windows are out of scope.
 
 ## Install
 
@@ -70,10 +70,13 @@ page. Or, with Go: `go install github.com/scttfrdmn/lith/cmd/lith@latest`.
 ## Commands
 
 ```
-lith mount   s3://bucket[/prefix] /mnt/point [flags]   # mount as a read-only filesystem
+lith mount   s3://bucket[/prefix][@current|@<ver>] /mnt/point [flags]  # mount as a read-only filesystem
+lith serve   nfs s3://bucket[/prefix][@current] [flags]  # NFSv3 gateway: one node serves a cluster
 lith umount  /mnt/point [--all] [--force]              # unmount (SIGTERM, then fusermount fallback)
 lith mounts                                            # list live lith mounts (and stale records)
+lith refresh /mnt/point                                # hot-swap a @current mount to a newly published version
 lith index   build|refresh|inspect s3://bucket[/prefix] --index-file F
+lith doctor  [s3://bucket[/prefix][@ref]]              # diagnose whether lith will work here
 lith bench   s3://bucket/key --pattern seq|rand4k|stride [--against PATH]
 lith version                                            # version, commit, build date
 ```
@@ -99,11 +102,15 @@ Full docs — how to use lith, when to use it, and when not to — are at
 **[scttfrdmn.github.io/lith](https://scttfrdmn.github.io/lith/)**:
 
 - **[Start here](https://scttfrdmn.github.io/lith/)** — five minutes to a first result on a public bucket.
+- **[What lith is for](https://scttfrdmn.github.io/lith/scope/)** — whether lith fits, the two-category boundary, and where it is the wrong tool.
 - **[Copy or mount?](https://scttfrdmn.github.io/lith/copy-or-mount/)** — the decision, with the measured crossover by access shape.
 - **[Sizing the node](https://scttfrdmn.github.io/lith/sizing/)** — NIC, RAM, NVMe, and lith's own CPU cost; the per-class matrix.
 - **[Meet a deadline](https://scttfrdmn.github.io/lith/deadline/)** — fan-out: wider is sooner *and* cheaper with a mount.
+- **[CargoShip archives](https://scttfrdmn.github.io/lith/cargoship/)** — mounting packed CargoShip 2.1 archives.
+- **[Published datasets](https://scttfrdmn.github.io/lith/published-datasets/)** — `@current` pointer mounts and `lith refresh`.
+- **[Serving a cluster](https://scttfrdmn.github.io/lith/serving-a-cluster/)** — the NFSv3 gateway: one node serves N.
+- **[Running in a container](https://scttfrdmn.github.io/lith/running-in-a-container/)** — the distroless image and the gateway in Kubernetes.
 - **[Knobs](https://scttfrdmn.github.io/lith/knobs/)** — every flag, grouped by the trade it makes.
-- **[What lith is for](https://scttfrdmn.github.io/lith/scope/)** — whether lith fits, the two-category boundary, and where it is the wrong tool.
 
 Benchmark data lives in [`bench/results/`](bench/results/); the S3 client
 ceiling can be reproduced independently with `cmd/lith-s3bench`.

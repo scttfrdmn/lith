@@ -2,8 +2,7 @@
 
 ## Supported versions
 
-lith is pre-1.0. Security fixes are made against the latest tagged release and
-`main`.
+Security fixes are made against the latest tagged 1.x release and `main`.
 
 ## Reporting a vulnerability
 
@@ -21,7 +20,13 @@ informed of progress.
 lith is read-only and writes nothing to the bucket. It does read S3 credentials
 from the standard AWS credential chain (unless `--no-sign-request` is used) and
 writes a local index and block cache to disk; the cache is not encrypted at rest
-(out of scope for v0.x).
+(see the [Scope page](https://scttfrdmn.github.io/lith/scope/) — cache
+encryption reopens on a compliance requirement).
+
+The NFS gateway's access-control boundary is the network perimeter: it
+advertises `AUTH_UNIX`/`AUTH_NULL` and does not verify client identity, so any
+host that can reach its port has read access to the export. Restrict it with a
+security group / trusted subnet.
 
 Operator responsibilities and trust boundaries:
 
