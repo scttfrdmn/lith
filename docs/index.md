@@ -1,5 +1,7 @@
 # Start here
 
+![lith — read-only data access for S3: mount locally, serve a cluster, read only what you touch](assets/lith-hero.png)
+
 Five minutes from nothing to a real answer, against a public Registry of Open
 Data bucket. You need a Linux box (lith uses FUSE) and `samtools` for the last
 step. Nothing is written to the bucket; nothing but an index file is written
