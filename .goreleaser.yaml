@@ -39,9 +39,10 @@ archives:
 
 # Distroless multi-arch image, built from the same binaries as the archives
 # above (ids: [lith]) — not a second build path. dockers_v2 builds both
-# platforms and pushes one manifest per tag. Tags: the exact version and the
-# floating major.minor always; `latest` only on a real release (the empty tag
-# from a prerelease is dropped).
+# platforms and pushes one manifest per tag. A prerelease gets ONLY its exact
+# version tag: the floating `major.minor` and `latest` must keep pointing at the
+# latest STABLE release, so both are guarded by `{{ if not .Prerelease }}` (the
+# empty tag a prerelease yields is dropped).
 dockers_v2:
   - id: lith
     images:
@@ -55,7 +56,7 @@ dockers_v2:
       - LICENSE
     tags:
       - "{{ .Version }}"
-      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
       - "{{ if not .Prerelease }}latest{{ end }}"
     labels:
       org.opencontainers.image.title: lith
