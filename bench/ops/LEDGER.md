@@ -46,3 +46,23 @@ ALD2). Two known, benign deltas:
 - **CT GETs a few percent high on long runs:** the widened window catches
   async-prefetch GETs issued during the run but after lith's metric snapshot
   (taken at read-return). A snapshot-timing artifact, not a counter defect.
+
+## Two hazards the tool now guards against (#225)
+
+Both were mis-diagnosed as a "principal-filter divergence" in #220; the fix
+made the report trustworthy for load-bearing measurements.
+
+- **The bucket tally is now deduped per event.** A single S3 data event carries
+  **multiple resource ARNs** — the object *and* the bucket (confirmed on a real
+  event: `AWS::S3::Bucket` + `AWS::S3::Object`, both matching `:s3:::`). The old
+  per-resource tally therefore double-counted (7 GETs showed as ~15 "buckets" —
+  the #220 "divergence"). `ops-report.py` now counts each bucket at most once per
+  record, so the bucket tally equals the GET count again and is a real cross-check.
+- **Delivery-completeness guard.** CloudTrail delivers S3 data events in batches
+  minutes after the fact, so a parse run before the window's tail is delivered
+  **silently under-counts** (a fresh 4-GET window read GET=0 immediately, GET=4
+  once delivered). `ops-report.py` now blocks until a log file is delivered dated
+  past `end + --delivery-lag` (default 600 s) and **fails loudly (exit 2)** on
+  timeout rather than report low. Pass `--no-wait` only to re-parse old windows.
+  This is the settle-window lesson generalized: delivery timing is where this
+  instrument is fragile, so make completeness a precondition, not a hope.
