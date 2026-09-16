@@ -1,0 +1,23 @@
+workload,binary,source,get,list,bytes,distinct_bytes,amplification_x,reduction_pct,notes
+# M16 step 1b (#213/#214): detector gap-aware sequential classification, on the three #210 gcgrid objects
+# (staged same-account) read via h5py metadata traversal through a lith mount, cold, us-east-1 c8gd.2xlarge.
+# before = efcbdf6 (M16 step 1, no 1b); after = e203b55 (with 1b). source=cloudtrail is the neutral
+# CloudTrail S3 data-event ledger (GetObject count, additionalEventData.bytesTransferredOut); source=lith is
+# lith's own metrics for the same window. amplification_x = bytes / distinct_bytes. reduction_pct = after vs before.
+A1,before,cloudtrail,95,1,676529370,3407872,198,,
+A1,after,cloudtrail,67,1,186451162,3407872,55,-72.4,
+A1,before,lith,95,1,676528128,3407872,198,,exact GET match; bytes off ~1.2KB = LIST response in CT bytesOut
+A1,after,lith,67,1,186449920,3407872,55,-72.4,exact GET match
+A3dyn,before,cloudtrail,461,1,3740512409,3538944,1057,,
+A3dyn,after,cloudtrail,88,1,293464581,3538944,83,-92.2,
+A3dyn,before,lith,452,1,3699376128,3538944,1045,,CT +2% GET: widened window caught trailing async-prefetch after lith's snapshot
+A3dyn,after,lith,86,1,288817152,3538944,82,-92.2,
+ALD2,before,cloudtrail,2,1,13666648,524288,26,,parts-fetched whole; detector fix does not apply
+ALD2,after,cloudtrail,3,1,13666648,524288,26,0,
+ALD2,before,lith,2,1,13665406,524288,26,,
+ALD2,after,lith,3,1,13665406,524288,26,0,
+# Regression (mirror guard): S1 = streaming the whole 1 GB A1 object. Must be byte-identical before/after.
+S1,before,cloudtrail,121,1,1011310650,1002962944,1,,~1 block of prefetch jitter vs after (not a detector-fix effect)
+S1,after,cloudtrail,121,1,1002922042,1002962944,1,,
+S1,before,lith,120,1,1002920800,1002962944,1,,lith byte-identical before==after (1002920800); mirror guard holds
+S1,after,lith,121,1,1002920800,1002962944,1,,
