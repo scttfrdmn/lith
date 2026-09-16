@@ -777,6 +777,14 @@ func (f *rawFS) maybePartsFetch(h *fileHandle) {
 	if threshold <= 0 || h.size > threshold {
 		return
 	}
+	// #229: a whole-file parts fetch is a broad commit — do not make it at open,
+	// before the access pattern is known. Wait until the coverage signal confirms
+	// the handle tiles (Established): a file a reader streams whole establishes in
+	// ~2 reads and is then parts-fetched as before; a sub-file reader (a hyperslab,
+	// a footer probe) never establishes and is served precise, never whole-fetched.
+	if !h.pf.isEstablished() {
+		return
+	}
 	h.smallMu.Lock()
 	if h.smallDone {
 		h.smallMu.Unlock()

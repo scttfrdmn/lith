@@ -43,6 +43,15 @@ func (w *pfWrapper) observe(block, off, length, byteGap, maxWindow int64) []int6
 	return w.pf.Observe(block, off, length, byteGap)
 }
 
+// isEstablished reports whether the handle's access pattern is known to tile —
+// the #229 gate the open-time parts-fetch consults before committing a broad
+// whole-file fetch. Serialized with the concurrent reads.
+func (w *pfWrapper) isEstablished() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.Established()
+}
+
 func (w *pfWrapper) open(maxWindow int64) []int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

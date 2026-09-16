@@ -87,6 +87,15 @@ type Prefetcher struct {
 	covMin    float64
 	covSpans  []covSpan // ring of the last covWindow reads (byte ranges)
 
+	// established (#229) is the single signal all three broad-fetch entry points
+	// gate on: the open-time ramp, the readahead-window growth, and open-time
+	// parts-fetch (the last in the FUSE layer, via Established()). It is true once
+	// the coverage signal has confirmed the access tiles — never before, so a
+	// handle whose pattern is not yet known is served precise (byte-exact /
+	// single-chunk) and commits no broad fetch. It reverts to false when coverage
+	// collapses (a stream that becomes a walk), inheriting the #221 transition.
+	established bool
+
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
@@ -201,6 +210,27 @@ func absInt64(x int64) int64 {
 // State returns the current detected pattern.
 func (p *Prefetcher) State() State { return p.state }
 
+// covReads is the minimum reads before coverage can judge tiling (#229). Below
+// it the trailing window is too short to separate a stream from a walk, so the
+// handle is treated as not-yet-established and served precise.
+const covReads = 3
+
+// coverageOK reports whether the coverage signal confirms tiling: the gate is on,
+// enough reads have accumulated to judge, and the trailing coverage clears the
+// threshold. cov is the ratio just returned by recordRead.
+func (p *Prefetcher) coverageOK(cov float64) bool {
+	if p.covMin <= 0 {
+		return true // gate disabled: behaviour-preserving
+	}
+	return len(p.covSpans) >= covReads && cov >= p.covMin
+}
+
+// Established reports whether the access pattern is known to tile — the single
+// gate the FUSE layer's open-time parts-fetch (#69/#220) and initial ramp (#228)
+// consult before committing any broad fetch (#229). False until the coverage
+// signal confirms tiling; false again if it later collapses.
+func (p *Prefetcher) Established() bool { return p.established }
+
 // SetMax updates the readahead window cap (in blocks). The FUSE layer lowers it
 // when many handles are open so their windows share the prefetch budget (#55).
 // The current window is clamped down to the new cap; the floor is initialWindow.
@@ -214,13 +244,22 @@ func (p *Prefetcher) SetMax(n int64) {
 	}
 }
 
-// Open dispatches the initial readahead window (blocks [0, initialWindow)),
-// assuming reads begin near the start of the file. It must be called once,
-// before the first Observe, for files worth prefetching.
+// Open sets up the handle but dispatches NO prefetch (#229): the initial ramp is
+// a broad fetch, and the policy commits none until the access pattern is known to
+// tile. The ramp begins from the first read that establishes coverage (read ~2),
+// via Observe. With the coverage gate disabled it still dispatches the initial
+// window, preserving the pre-#229 open-time ramp.
 func (p *Prefetcher) Open() []int64 {
 	p.haveLast = true
 	p.lastBlock = -1 // so the first read at block 0 registers as sequential (d=1)
 	p.state = Cold
+	p.established = false
+	if p.covMin > 0 {
+		p.window = 0
+		p.cursor = -1
+		p.frontier = 0
+		return nil
+	}
 	p.window = initialWindow
 	p.cursor = -1
 	p.frontier = initialWindow
@@ -276,17 +315,34 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 	// lands in an adjacent block or the grown band (#210/M16 1b: the scattered
 	// metadata walk).
 	if (d == 1 || p.inBand(blockIdx)) && absInt64(byteGap) <= p.seqGapMax {
-		if p.state == Sequential {
-			p.window = min(p.window*2, p.maxReadahead)
-		} else {
-			p.state = Sequential
-			p.window = initialWindow
-		}
 		p.pending = false
 		p.lastDelta = 1
 		if blockIdx > p.cursor {
 			p.cursor = blockIdx
 		}
+		// #229: recognize contiguous progress always, but commit a broad fetch
+		// (the readahead ramp) only once coverage confirms the access tiles. Until
+		// then the handle is provisional — the read is served precise and nothing
+		// is dispatched — and a contiguous read whose window is still full of an
+		// earlier scattered walk de-establishes rather than ramping.
+		if !p.coverageOK(cov) {
+			p.established = false
+			if p.state == Sequential {
+				p.state = Cold
+			}
+			p.window = 0
+			p.frontier = p.cursor + 1
+			return nil
+		}
+		if p.state == Sequential {
+			p.window = min(p.window*2, p.maxReadahead)
+		} else {
+			p.state = Sequential
+			if p.window < initialWindow {
+				p.window = initialWindow
+			}
+		}
+		p.established = true
 		if p.window > p.peakWindow {
 			p.peakWindow = p.window
 		}
@@ -312,6 +368,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		}
 		p.lowCoverage++
 		p.state = Random
+		p.established = false // #229: a scattered landing de-establishes the handle
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx
@@ -322,6 +379,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// A second unexplained jump with no sequential progress between: stop
 		// prefetching until a sequential run resumes.
 		p.state = Random
+		p.established = false
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx
