@@ -1,0 +1,38 @@
+shape,source,get,list,s3_bytes,distinct_bytes,amplification_x,fill_whole,fill_demand,fill_plan,fill_demand_batch,pf_cold_pct,pf_seq_pct,pf_strided_pct,pf_random_pct,uncovered,pf_used,pf_issued,wall_s,notes
+# M17-A access-shape sweep (#216): ten real tools, ten real access shapes through a lith mount, cold,
+# us-east-1, c8gd.2xlarge, lith @1396875, default flags (mem-cache 25% RAM, disk-cache off, block 8MiB,
+# small-file 4MiB, parts-max 64MiB). amplification_x = s3_bytes / distinct_bytes (bytes fetched / bytes the
+# tool touched). fill_* = lith_fill_bytes_total{kind}. pf_*_pct = detector state distribution over the run
+# (LITH_PF_TRACE 'after' column). source=lith is lith's own counters; source=cloudtrail is the neutral
+# account-level CloudTrail S3 data-event ledger for the same window (bench/ops/LEDGER.md, 25s settle).
+#
+# DATASETS. Real public in-region (us-east-1, anonymous): grib_idx = NOAA GFS pgrb2 0p25 f000 (507 MB) + real
+# .idx; netcdf4_hyperslab = NOAA GOES-16 ABI-L2-CMIPF C01 granule (30 MB); mmap_random = 1000genomes
+# human_g1k_v37.fasta.gz (892 MB); concurrent_handles = the same GFS grib. Staged same-account (bench bucket,
+# signed; content synthetic but format-valid — read by the real tool, and the access SHAPE is format-driven,
+# not content-driven): cog (rasterio COG 58 MB), fits (astropy 256 MB image), webdataset (400-sample tar),
+# sqlite (300k-row indexed db), zip (500-entry store), tinyfiles (300x 8 KB). Staging reason: all public COG
+# buckets are us-west-2 (cross-region banned); no in-region public tar/sqlite/zip.
+#
+# CAVEATS. tinyfiles amp<1 is a distinct_bytes_read block-rounding artifact (300 files counted at 64 KiB min =
+# 19.7 MB vs 2.46 MB actually fetched); the honest measure there is s3_bytes=2.46 MB = exactly 300x8 KiB, one
+# GET/file, zero prefetch waste. sqlite amp 1.0 is honest: the 28 MB db was parts-fetched whole AND the wide
+# range-scan queries genuinely touched all of it. mmap_random amp 1.92 by bytes/distinct, but the tool touched
+# only ~3000 4 KiB pages (~12 MB) => ~66x over user-bytes; that is the 8 MiB-block floor under random page
+# faults, and the detector correctly stayed 98% random, so it is not filed as a defect.
+#
+# FINDINGS FILED (characterize-only, M16 discipline): #220 parts-fetch whole-loads files <=64 MiB (netcdf4 92x,
+# cog 22x, zip 3.3x) -- NEW class, fires at open before the detector. #221 grib .idx 8x -- SAME class as M16 but
+# sub-block gaps evade the gap-gate. #222 fits cutout 4.76x -- Strided branch, M16 fix does not apply.
+grib_idx,lith,60,0,93879370,11534336,8.14,78643200,15236170,0,0,0,43,15,41,49,4,78,2.61,FINDING #221: 12 scattered fields; sub-8MiB gaps stay Sequential -> whole-block readahead
+netcdf4_hyperslab,lith,5,0,30318035,327680,92.52,29269459,1048576,0,0,0,0,0,0,1,3,29,0.30,FINDING #220: 30MB GOES nc parts-fetched whole for a 327KB slab
+mmap_random,lith,1957,0,790233088,410910720,1.92,438304768,351928320,0,0,0,1,0,98,1884,241,418,83.97,note: detector correct (98% random); 8MiB-block floor under 4KB faults; not filed
+concurrent_handles,lith,140,0,507293397,507183104,1.00,458600149,48693248,0,0,15,85,0,0,74,441,441,1.35,CLEAN: 8 handles on one 507MB object; per-handle detector not confused
+cog_overview_window,lith,8,0,57904201,2621440,22.09,56855625,1048576,0,0,0,0,0,0,1,6,56,0.59,FINDING #220: 58MB COG parts-fetched whole for a 2.6MB overview+window
+fits_header_cutout,lith,22,0,78643200,16515072,4.76,66060288,12582912,0,0,19,81,0,0,14,5,64,1.01,FINDING #222: 256MB FITS; 512x512 cutout detected Strided -> block readahead
+webdataset_stream,lith,3,0,16803840,16842752,1.00,16803840,0,0,0,0,0,0,0,0,16,17,0.35,CLEAN: sequential tar; amp 1.0
+zip_seek_to_end,lith,9,0,10052022,3014656,3.33,7274496,2711990,65536,0,0,0,0,0,3,9,10,0.22,FINDING #220: 10MB zip parts-fetched whole; zip plane engaged (fill_plan 64KiB)
+tinyfiles_random,lith,300,0,2457600,19660800,0.12,0,2457600,0,0,0,0,0,0,300,0,300,14.35,CLEAN (bytes): 300 GETs = 300x8KiB exact; amp<1 is a distinct-counting artifact
+sqlite_random,lith,5,0,28401664,28442624,1.00,27353088,1048576,0,0,0,0,0,0,1,28,28,1.03,honest 1.0: 28MB db parts-fetched whole AND wide range-scans touched all of it
+cog_overview_window,cloudtrail,8,0,57904201,,,,,,,,,,,,,,,ledger cross-check: GET and bytes match lith exactly (57904201 both)
+sqlite_random,cloudtrail,5,0,28401664,,,,,,,,,,,,,,,ledger cross-check: GET and bytes match lith exactly (28401664 both)
