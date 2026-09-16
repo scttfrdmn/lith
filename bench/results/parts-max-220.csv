@@ -1,0 +1,22 @@
+shape,binary,parts_max,get,s3_bytes,distinct_bytes,amplification_x,wall_s_median,notes
+# #220 sub-64-MiB whole-fetch: main (parts-max 64MiB) vs option-2 (derived parts-max = NIC×TTFB clamped
+# to [--small-file,64MiB] = 18,750,000 B on this box). c8gd.2xlarge, us-east-1, cold, lith main e45e82f.
+# amplification_x = s3_bytes / distinct_bytes. wall = median of 3 runs. VERDICT: option 2 does NOT reduce
+# the witnesses — the whole-file fetch is over-determined (parts-fetch at open on main; the detector's
+# seek-readahead re-anchoring Sequential and prefetching 2 blocks per landing on opt2, prefetch.go:228-241).
+# The byte amplification is the #221 detector mechanism, not parts-fetch. Ledger cross-check (neutral
+# CloudTrail): 15 bench GetObjects across both cog runs = lith's 8(main)+7(opt2); both whole-fetched.
+# --- WITNESSES (files in the (18.75,64]MiB band where option 2 changes behavior; zip <18.75MiB unchanged) ---
+netcdf4_hyperslab,main,64MiB,5,30318035,327680,92.52,0.289,GOES-16 nc 30.3MB; parts-fetch whole at open; detector never observes
+netcdf4_hyperslab,opt2,18.75MB,5,30360128,957907,92.52,0.347,no parts-fetch; detector observes 10 reads ALL sequential (gaps to 30MB) -> readahead refills; amp unchanged; wall worse
+cog_overview_window,main,64MiB,8,57906007,2621440,22.09,0.333,COG 57.9MB; parts-fetch whole at open (128-way parallel)
+cog_overview_window,opt2,18.75MB,7,57906007,2621440,22.09,0.526,no parts-fetch; overview scatters across file -> detector readahead refills whole; amp unchanged; WALL REGRESSED 1.6x (lost parts parallelism)
+zip_seek_to_end,main,64MiB,6,10052022,3014656,3.33,0.200,10MB < 18.75MB -> parts-fetched in BOTH
+zip_seek_to_end,opt2,18.75MB,6,10052022,3014656,3.33,0.214,unchanged (still parts-fetched); amp/bytes identical by construction
+# --- GUARDS (pass/fail: byte-identical required) ---
+A1_cargoship_treewalk,main,64MiB,13,13718909,,,1.056,1985-file CargoShip walk (find -exec cat); frames 4.7/8.9MB < 18.75MB
+A1_cargoship_treewalk,opt2,18.75MB,13,13718909,,,0.574,PASS: byte-identical + GET-identical (frames still whole-fetched)
+S1_stream,main,64MiB,61,507162325,,,1.306,507MB GFS grib full sequential stream (>64MiB, parts-fetch N/A)
+S1_stream,opt2,18.75MB,61,507162325,,,1.245,PASS: byte-identical (parts-fetch never applied)
+# --- DERIVED parts-max across instance sizes (NIC baseline × 40ms TTFB, clamped [4MiB,64MiB]) ---
+# c8g.large 0.937Gbps -> 4.69MB | c8gd.2xlarge 3.75Gbps -> 18.75MB | c8g.16xlarge 30Gbps -> 150MB capped to 64MiB
