@@ -749,7 +749,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		if f.pfTrace != nil {
 			before = h.pf.state()
 		}
-		pbs := h.pf.observe(blk, gap, f.perHandleWindow())
+		pbs := h.pf.observe(blk, off, end-off, gap, f.perHandleWindow())
 		if f.pfTrace != nil {
 			f.tracePF(h.key.Key, off, end-off, blk, gap, before, h.pf.state(), h.pf.peakWindow())
 		}

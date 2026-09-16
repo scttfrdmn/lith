@@ -14,7 +14,10 @@
 // rather than collapsing it — the full re-ramp was the #49 lone-survivor tail.
 package prefetch
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // State is the detected access pattern for a file handle.
 type State int
@@ -72,11 +75,27 @@ type Prefetcher struct {
 	pending   bool  // an unexplained jump is outstanding (one more seeks -> random)
 	seqGapMax int64 // largest byte gap that still counts as sequential (#210/M16 1b); MaxInt64 = off
 
+	// Coverage gate (#221): a stream's reads *tile* — over a trailing window they
+	// cover most of the span between them — while a scattered walk (a metadata
+	// traversal, a GRIB .idx field sweep, a COG overview) leaves most of the span
+	// untouched, however sequential its block deltas look. When coverage over the
+	// last covWindow reads falls below covMin, the handle is punctate and is forced
+	// Random so the seek path stops re-anchoring Sequential and prefetching two
+	// blocks at every landing (which refilled whole sub-64-MiB objects, #220).
+	// covMin<=0 disables the gate (behaviour-preserving default).
+	covWindow int
+	covMin    float64
+	covSpans  []covSpan // ring of the last covWindow reads (byte ranges)
+
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
 	peakWindow  int64 // largest window ever reached
+	lowCoverage int64 // reads forced Random by the coverage gate (#221)
 }
+
+// covSpan is one read's byte range [off, end).
+type covSpan struct{ off, end int64 }
 
 // Halvings reports how many times a seek halved the window.
 func (p *Prefetcher) Halvings() int64 { return p.halvings }
@@ -95,6 +114,70 @@ func New(maxReadahead int64) *Prefetcher {
 		maxReadahead = initialWindow
 	}
 	return &Prefetcher{maxReadahead: maxReadahead, state: Cold, seqGapMax: math.MaxInt64}
+}
+
+// SetCoverage enables the #221 coverage gate: over a trailing window of `window`
+// reads, Sequential requires that the union of the reads' byte ranges covers at
+// least `minRatio` of the span they touch. window<=1 or minRatio<=0 disables it.
+// The characterization (#221) put streams at coverage >= 0.89 (W=16) and every
+// scattered walk (netcdf4 0.002, GRIB 0.025, COG 0.069) at <= 0.07, so a wide
+// window is required — a small one lets field-internal reads tile locally — and
+// 0.5 sits in the middle of that order-of-magnitude margin.
+func (p *Prefetcher) SetCoverage(window int, minRatio float64) {
+	if window <= 1 || minRatio <= 0 {
+		window, minRatio = 0, 0
+	}
+	p.covWindow = window
+	p.covMin = minRatio
+	p.covSpans = nil
+}
+
+// LowCoverage reports how many reads the coverage gate forced Random (#221).
+func (p *Prefetcher) LowCoverage() int64 { return p.lowCoverage }
+
+// recordRead pushes a read's byte range into the trailing ring and returns the
+// coverage ratio (union of ranges / total span) over the window. Returns 1.0
+// when the gate is disabled or fewer than 3 reads have been seen (too little to
+// judge; the initial ramp is left to the normal state machine).
+func (p *Prefetcher) recordRead(off, length int64) float64 {
+	if p.covWindow <= 1 || length <= 0 {
+		return 1.0
+	}
+	p.covSpans = append(p.covSpans, covSpan{off, off + length})
+	if len(p.covSpans) > p.covWindow {
+		p.covSpans = p.covSpans[len(p.covSpans)-p.covWindow:]
+	}
+	if len(p.covSpans) < 3 {
+		return 1.0
+	}
+	lo, hi := p.covSpans[0].off, p.covSpans[0].end
+	for _, s := range p.covSpans[1:] {
+		if s.off < lo {
+			lo = s.off
+		}
+		if s.end > hi {
+			hi = s.end
+		}
+	}
+	span := hi - lo
+	if span <= 0 {
+		return 1.0
+	}
+	// Union of the (unsorted, possibly overlapping) ranges.
+	sp := append([]covSpan(nil), p.covSpans...)
+	sort.Slice(sp, func(i, j int) bool { return sp[i].off < sp[j].off })
+	var union int64
+	cs, ce := sp[0].off, sp[0].end
+	for _, s := range sp[1:] {
+		if s.off > ce {
+			union += ce - cs
+			cs, ce = s.off, s.end
+		} else if s.end > ce {
+			ce = s.end
+		}
+	}
+	union += ce - cs
+	return float64(union) / float64(span)
 }
 
 // SetGapMax sets the largest byte gap between consecutive reads that still counts
@@ -156,7 +239,8 @@ func (p *Prefetcher) Open() []int64 {
 // it falls through to the seek path. Contiguous streams (gap≈0) and kernel
 // reorder (gap ≪ block) are unaffected; seqGapMax defaults to "off" (MaxInt64)
 // so a caller that does not set it keeps the pre-1b behavior.
-func (p *Prefetcher) Observe(blockIdx, byteGap int64) []int64 {
+func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
+	cov := p.recordRead(off, length)
 	if !p.haveLast {
 		p.haveLast = true
 		p.lastBlock = blockIdx
@@ -214,6 +298,26 @@ func (p *Prefetcher) Observe(blockIdx, byteGap int64) []int64 {
 
 	// Out of band: a seek.
 	p.lastDelta = d
+	// Coverage gate (#221): a seek landing whose trailing coverage is low is a
+	// scattered walk (metadata traversal, GRIB .idx field sweep, COG overview),
+	// not a stream taking one jump. Do NOT optimistically re-anchor Sequential and
+	// prefetch two blocks at the landing — that re-anchor, fired at every landing,
+	// refilled whole sub-64-MiB objects (#220). Go Random and dispatch nothing; a
+	// walk that later tiles re-establishes Sequential via the contiguous branch
+	// above once coverage recovers. Streams never trip this (coverage ~1, and they
+	// rarely reach the seek path at all). Disabled by default (covMin<=0).
+	if p.covMin > 0 && cov < p.covMin {
+		if p.state != Random {
+			p.resetRandom++
+		}
+		p.lowCoverage++
+		p.state = Random
+		p.pending = false
+		p.window = 0
+		p.cursor = blockIdx
+		p.frontier = blockIdx
+		return nil
+	}
 	if p.pending {
 		// A second unexplained jump with no sequential progress between: stop
 		// prefetching until a sequential run resumes.
