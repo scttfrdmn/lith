@@ -89,7 +89,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size (1MiB-64MiB)")
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.smallFile, "small-file", "4MiB", "fetch files at or below this size whole on first read")
-	fl.StringVar(&f.partsMax, "parts-max", "64MiB", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block)")
+	fl.StringVar(&f.partsMax, "parts-max", "auto", "fetch files at or below this size whole as concurrent block-sized range parts on first read (0 disables; a single GET below one block). \"auto\" derives it from NIC baseline × first-byte latency, clamped to [--small-file, 64MiB]: a fat pipe fetches whole cheaply, a thin pipe keeps sub-file reads byte-exact (#220)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between two format-plan/demand fill ranges merged into one range GET (#124); 0 = derive from the NIC baseline × measured first-byte latency, clamped to [256KiB, 64MiB]")
 	fl.StringVar(&f.bgzfWholeFileMax, "bgzf-whole-file-max", "512MiB", "for a bgzf data file (BAM/CRAM/VCF.gz) with an index sibling, prefetch it whole on open when at or below this size; above it, prefetch only the index-resolved slice ranges (#107)")
 	fl.BoolVar(&f.footerTier2, "footer-tier2", false, "experimental, clustered projections only — byte-precise Parquet/zip projection fetch (#108). Wins on bytes for a clustered projection (~10× vs streaming) but loses on wall-clock for a spread one, where streaming on a fat pipe is faster (#125); off by default. Tier-1 footer+head prefetch always runs regardless")
@@ -167,9 +167,15 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if err != nil {
 		return err
 	}
-	partsMax, err := parseSize(f.partsMax)
-	if err != nil {
-		return err
+	// partsMax "auto" (the default) is resolved from the device once the NIC
+	// baseline is known (below); a negative sentinel carries "derive" until then.
+	// An explicit size (or 0 to disable) is honored as given.
+	var partsMax int64 = -1
+	if f.partsMax != "auto" {
+		partsMax, err = parseSize(f.partsMax)
+		if err != nil {
+			return err
+		}
 	}
 	bgzfWholeFileMax, err := parseSize(f.bgzfWholeFileMax)
 	if err != nil {
@@ -291,6 +297,30 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// median of measured fills). 40 ms is a typical in-region S3 first byte.
 	nicBytesPerSec := int64(nic.BaselineGbps * 1e9 / 8)
 	ttfbSeed := 40 * time.Millisecond
+	// Resolve --parts-max=auto (#220): whole-fetching a small object at open is
+	// right when fetching it costs about one round-trip anyway, and wrong when the
+	// app wants a slice — and size alone cannot tell those apart. The size below
+	// which the whole-fetch is ~one round-trip is the bandwidth-delay product,
+	// NIC baseline × first-byte latency (the same arithmetic as byteExactThreshold,
+	// one layer up). Clamp to [--small-file, 64MiB]: the floor keeps genuinely
+	// small files (the CargoShip tree walk) whole; the cap never exceeds the former
+	// fixed default, so a fat pipe stays aggressive and a thin pipe — where the
+	// whole-fetch actually costs wall-clock — keeps sub-file reads byte-exact.
+	if partsMax < 0 {
+		const partsMaxCap = 64 << 20
+		derived := int64(float64(nicBytesPerSec) * ttfbSeed.Seconds())
+		if derived < smallFile {
+			derived = smallFile
+		}
+		if derived > partsMaxCap {
+			derived = partsMaxCap
+		}
+		partsMax = derived
+		log.Info("parts-max", "bytes", partsMax, "source", "device-derived (NIC baseline × TTFB, clamped)",
+			"nic_bytes_per_s", nicBytesPerSec, "ttfb_seed", ttfbSeed)
+	} else {
+		log.Info("parts-max", "bytes", partsMax, "source", "--parts-max")
+	}
 	// Default the readahead window to the bandwidth-delay product so a single
 	// reader can fill the NIC on a cold read (#56).
 	f.maxReadahead = effectiveReadahead(f.maxReadahead, inflight, blockSize)
