@@ -71,6 +71,19 @@ streams the rest; a byte-precise projection path exists behind
 [#108](https://github.com/scttfrdmn/lith/issues/108),
 [#122](https://github.com/scttfrdmn/lith/issues/122)). <!-- number: apps.csv in-region 4xl, sessions 29-32 -->
 
+**`mmap` of a large object, walked randomly** — a `bwa`/`samtools` reference
+index the tool memory-maps and page-faults through. **Copy it local, or use the
+gateway / EFS — do not mmap it over a plain mount.** A random page fault is a
+*synchronous, serial* round-trip: the faulting thread blocks on one S3 GET, and
+the next fault cannot start until it returns. 3,000 random faults over an 892 MB
+index cost **~14 s** even in the best case and there is no readahead that helps —
+random access is by definition unpredictable. This is why the cookbook's `bwa`
+recipe puts the index on EFS. (lith fetches those faults byte-exact, which
+*minimizes bytes* but *maximizes round-trips*, so it is slower here than a
+coarser whole-block fetch would be — the opposite of the selective-read case,
+and the reason this shape is on the copy side of the line;
+[#232](https://github.com/scttfrdmn/lith/issues/232).)
+
 ## The crossover, measured
 
 Cost to result, **copy → compute** vs **mount with lith**, across the EBS-only
