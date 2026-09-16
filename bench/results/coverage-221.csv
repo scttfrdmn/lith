@@ -1,0 +1,24 @@
+shape,binary,parts_max,get,s3_bytes,distinct_bytes,amplification_x,wall_s_median,notes
+# #221 coverage-gated Sequential vs main. c8gd.2xlarge, us-east-1, cold, main e45e82f / branch 006a65f.
+# amplification = s3_bytes / distinct. Coverage gate: W=16 trailing reads, seq re-anchor requires coverage>=0.5.
+# VERDICT: the coverage rule is correct and fixes the LARGE-file walk (grib -33% bytes) but the sub-64-MiB
+# witnesses are over-determined by THREE mechanisms — parts-fetch (fires at open, pre-empts the detector), the
+# seek-readahead re-anchor (what #221 fixes), and the initial optimistic ramp (Open + first read prefetch
+# blocks 0-2 before the walk is visible). #221 alone reaches only the middle one.
+# --- WITNESSES, main vs c221 (parts-fetch at default 64MiB) ---
+grib,main,64MiB,60,93879370,11534336,8.14,2.94,507MB (>64MiB so parts-fetch N/A) — detector-governed
+grib,c221,64MiB,69,62749770,11534336,5.44,3.14,-33% bytes; coverage stops cross-field re-anchoring; GETs 60->69 (byte-exact trade)
+netcdf4,main,64MiB,5,30318035,327680,92.52,0.28,30MB <=64MiB: parts-fetched whole at open
+netcdf4,c221,64MiB,5,30318035,327680,92.52,0.25,UNCHANGED — parts-fetch pre-empts the detector; coverage never engages
+cog,main,64MiB,8,57904203,2621440,22.09,0.39,58MB <=64MiB: parts-fetched whole at open
+cog,c221,64MiB,8,57904203,2621440,22.09,0.39,UNCHANGED — parts-fetch pre-empts the detector
+# --- WITNESSES with parts-fetch DISABLED (the #220-subsumed question: detector fixed, does parts-fetch still front-run?) ---
+netcdf4,main,off,6,30318035,327680,92.52,0.38,parts-off: detector refills whole file (the #220 finding)
+netcdf4,c221,off,4,26123731,327680,79.72,0.42,coverage stops re-anchor BUT initial ramp fetched blocks 0-2 (~24MB) before the walk was visible
+cog,main,off,7,57904203,2621440,22.09,0.66,parts-off: detector refills whole file
+cog,c221,off,9,42991616,2621440,16.40,0.72,coverage helps (-26% bytes) but overview scatters + initial ramp -> residual
+# --- GUARDS (byte-identical required) ---
+A1_cargoship,main,64MiB,13,13718909,,,,1985-file CargoShip tree walk (find -exec cat)
+A1_cargoship,c221,64MiB,12,13718909,,,,PASS byte-identical; GET 13->12 (no-worse); cargo path never trips coverage
+S1_stream,main,64MiB,61,507162325,,,,507MB full sequential stream
+S1_stream,c221,64MiB,61,507162325,,,,PASS byte-identical (a stream never trips the coverage gate)
