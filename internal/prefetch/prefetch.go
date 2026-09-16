@@ -337,9 +337,18 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		if p.state == Sequential {
 			p.window = min(p.window*2, p.maxReadahead)
 		} else {
+			// #229: on establishment jump straight to the full window rather than
+			// re-ramping from 2. A genuine stream/copy pays only the first ~2 precise
+			// reads; without this it also pays a geometric re-ramp (many small GETs,
+			// an underfed NIC on the cold read — the #56 concern), which regressed
+			// sequential copies. A handle that establishes then immediately seeks (a
+			// per-field walk) reverts on the next landing, so the full window is
+			// dispatched at most once per established run.
 			p.state = Sequential
-			if p.window < initialWindow {
-				p.window = initialWindow
+			if p.covMin > 0 {
+				p.window = p.maxReadahead
+			} else {
+				p.window = initialWindow // gate off: pre-#229 geometric ramp
 			}
 		}
 		p.established = true
