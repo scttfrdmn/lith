@@ -99,7 +99,7 @@ func TestPrefetchAheadCoversDemand(t *testing.T) {
 	}
 
 	for d := int64(0); d <= 20; d++ {
-		nb := pf.Observe(d, 0)
+		nb := pf.Observe(d, 0, 0, 0)
 		dispatch(nb)
 		waitStarted(nb) // frontier GETs are in flight before we read behind them
 		before := rec.uncov()

@@ -15,8 +15,17 @@ bandwidth on bytes you won't use.
 | `--block-size` | `8MiB` | The fill/readahead unit — a run of 1 MiB cache chunks coalesced into one range GET. 8 MiB balances round-trip amortization against over-fetch. |
 | `--max-range` | `64MiB` | Caps how many contiguous blocks coalesce into a single GET, so one fill can't monopolize a connection. |
 | `--small-file` | `4MiB` | Files at or below this are fetched whole on first read — one GET beats seeking within a tiny object. |
-| `--parts-max` | `auto` | Files up to this are fetched whole as **concurrent block-sized range parts** on first read (v0.2, [#69](https://github.com/scttfrdmn/lith/issues/69)); below one block it's a single GET. This is what lets a 31 MB granule beat `aws s3 cp`. `auto` derives it from the NIC baseline × first-byte latency, clamped to `[--small-file, 64MiB]` ([#220](https://github.com/scttfrdmn/lith/issues/220)): a fat pipe fetches whole cheaply, a thin pipe keeps a sub-file read (a hyperslab, a COG window) byte-exact instead of pulling the whole object. An explicit size overrides; `0` disables. |
+| `--parts-max` | `auto` | Files up to this are fetched whole as **concurrent block-sized range parts** — but only **once the access pattern proves it tiles** ([#229](https://github.com/scttfrdmn/lith/issues/229)): a sequential reader establishes within the first couple of reads and then gets the whole-file parts fetch (what lets a 31 MB granule beat `aws s3 cp`); a reader that only wants a slice (a hyperslab, a footer probe) never establishes and is served byte-exact instead of pulling the whole object. The size threshold is `auto` — derived from NIC baseline × first-byte latency, clamped to `[--small-file, 64MiB]` ([#220](https://github.com/scttfrdmn/lith/issues/220)): a fat pipe would fetch whole cheaply, a thin pipe keeps a sub-file read byte-exact. An explicit size overrides; `0` disables. |
 | `--bgzf-whole-file-max` | `512MiB` | For a bgzf-family data file (BAM/CRAM/VCF.gz/BCF) that has a coordinate-index sibling (`.bai`/`.tbi`/`.csi`/`.crai`), files at or below this are fetched whole through the parts path when the index opens — a region-indexed scan (e.g. `tabix` over many regions) touches nearly every block, so the whole-file working set makes cold ≈ warm (v0.3, [#107](https://github.com/scttfrdmn/lith/issues/107)). Above it, tier-2 prefetches only the index-resolved slices/chunks. `0` disables whole-file prefetch. The handle keeps its adaptive readahead window either way — the plan only *adds* ranges. |
+
+**Cold-start cost of "prove it first" ([#229](https://github.com/scttfrdmn/lith/issues/229)).** lith will not fetch
+broadly (whole-file parts, or wide readahead) until a handle's reads show they tile — the first couple of reads are
+served precise. This is what keeps a hyperslab or a footer probe from pulling a whole object. The cost lands on the
+opposite case: a **cold sequential read of a mid-size file** (a `cat`/`cp` off the mount) pays roughly one extra
+round-trip of latency for its first block, because that block is demand-fetched in chunks before the pattern
+establishes and the whole-file fetch kicks in. It is cold-only (a warm re-read is unaffected), byte-identical, and
+shrinks with file size (the first block is a smaller fraction of a larger file). The block-0 coalescing gap that
+would erase even this is tracked in [#233](https://github.com/scttfrdmn/lith/issues/233).
 
 ## RAM vs re-fetch
 

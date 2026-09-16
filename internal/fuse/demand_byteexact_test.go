@@ -121,10 +121,12 @@ func TestDemandByteExactOnRandomHandle(t *testing.T) {
 func TestDemandWholeChunkOnSequentialHandle(t *testing.T) {
 	raw, srv := newByteExactFS(t, 64<<20)
 	node, fh := openBig(t, raw)
-	// Establish Sequential posture.
-	readAt(t, raw, node, fh, 0, 4<<10)
-	readAt(t, raw, node, fh, 1*chunk, 4<<10)
-	readAt(t, raw, node, fh, 2*chunk, 4<<10)
+	// Establish Sequential posture with contiguous (tiling) reads — #229: coverage,
+	// not mere block ordering, establishes, so sparse block-advancing reads no
+	// longer count as sequential.
+	readAt(t, raw, node, fh, 0, chunk)
+	readAt(t, raw, node, fh, 1*chunk, chunk)
+	readAt(t, raw, node, fh, 2*chunk, chunk)
 	if got := raw.handleOf(fh).pf.state(); got != prefetch.Sequential {
 		t.Fatalf("expected Sequential posture, got %v", got)
 	}
@@ -161,20 +163,23 @@ func TestByteExactCoalescesWithinChunk(t *testing.T) {
 // sequential run transitions the handle back to whole-chunk fills — the detector,
 // not the fix, governs posture.
 func TestDetectorStillGovernsPosture(t *testing.T) {
-	raw, srv := newByteExactFS(t, 64<<20)
+	raw, srv := newByteExactFS(t, 128<<20)
 	node, fh := openBig(t, raw)
 	driveRandom(t, raw, node, fh)
 	readAt(t, raw, node, fh, 50*chunk+10, 1<<10) // byte-exact (Random)
 
-	// Now read sequentially to re-establish Sequential.
-	readAt(t, raw, node, fh, 55*chunk, 4<<10)
-	readAt(t, raw, node, fh, 56*chunk, 4<<10)
-	readAt(t, raw, node, fh, 57*chunk, 4<<10)
+	// Now read sequentially to re-establish Sequential. #229: re-establishment
+	// takes a windowful of contiguous reads to flush the earlier scattered reads
+	// out of the coverage window — a walk that becomes a stream must earn it, it
+	// does not latch back instantly.
+	for i := int64(55); i < 55+20; i++ {
+		readAt(t, raw, node, fh, i*chunk, chunk)
+	}
 	if got := raw.handleOf(fh).pf.state(); got != prefetch.Sequential {
 		t.Fatalf("expected Sequential after the run, got %v", got)
 	}
 	before := quiesce(srv)
-	readAt(t, raw, node, fh, 62*chunk+10, 1<<10) // small read, now on a Sequential handle
+	readAt(t, raw, node, fh, 120*chunk+10, 1<<10) // small read on a Sequential handle, beyond readahead reach (cold)
 	if got := quiesce(srv) - before; got < chunk {
 		t.Fatalf("post-transition read fetched %d bytes; want whole chunk (>=%d)", got, chunk)
 	}

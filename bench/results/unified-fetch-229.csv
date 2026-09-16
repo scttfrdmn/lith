@@ -1,0 +1,22 @@
+shape,binary,get,s3_bytes,distinct_bytes,amplification_x,wall_s_median,notes
+# #229 unified fetch policy (no broad fetch until the access pattern tiles) vs main. c8gd.2xlarge, us-east-1,
+# cold, main 178760d / branch e60ea17, 3 runs, PARTS-FETCH AT DEFAULT (nothing disabled to flatter the number).
+# amplification = s3_bytes / distinct. VERDICT: the byte wins the piecemeal fixes (#220/#221/#228) could not
+# reach — all three witnesses, with parts-fetch on — at a measured cold-start wall cost for sequential copies.
+# --- WITNESSES ---
+netcdf4,main,5,30318035,327680,92.52,0.39,30MB GOES nc: parts-fetch whole at open
+netcdf4,c229,3,2072019,327680,6.32,0.42,never establishes (scattered walk) -> byte-exact demand; -93% bytes, fewer GETs, wall flat
+cog,main,7,57905803,2621440,22.09,0.55,58MB COG: parts-fetch whole at open
+cog,c229,13,3342336,2621440,1.27,0.71,overview tiles fall in block 0 (d==0, sub-block) -> never establishes -> precise; -94% bytes; GETs 7->13, wall +29%
+grib,main,60,93879370,11534336,8.14,2.73,507MB (>64MiB): open ramp + per-read readahead
+grib,c229,67,38632522,11534336,3.35,2.83,establishes per field, reverts at each jump -> cross-field refill stopped; -59% bytes; GETs 60->67, wall flat
+# --- GUARDS (byte-identical required on S1/A1; no-worse elsewhere) ---
+S1_stream,main,61,507162325,507183104,1.00,1.39,507MB full sequential stream
+S1_stream,c229,75,507162325,507183104,1.00,1.61,PASS bytes (byte-identical); wall +16% and GETs 61->75 (pays ~2 precise reads before the ramp)
+A1_cargoship,main,12,13718909,,,1.03,1985-file CargoShip tree walk
+A1_cargoship,c229,12,13718909,,,0.57,PASS byte-identical + GET-identical (12/12) + FASTER; cargo's contiguous spans establish immediately
+copyR3_copy,main,4,30318035,30343168,1.00,0.24,30MB granule read whole sequentially (the #69 parts-fetch case)
+copyR3_copy,c229,12,30318035,30343168,1.00,0.62,byte-identical BUT wall +2.5x and GETs 4->12 -> FAILS no-worse-on-wall. The cold-start cost of deferring parts-fetch.
+# mmap-random and tiny-files: not cleanly measured this run (mmap-over-FUSE pathology - main hung 326s at 3000
+# random page faults; tiny mount glitched). Both are no-worse secondary guards; re-measure if load-bearing.
+# --- LEDGER cross-check (fixed #226 tooling; buckets==GET confirms dedup) — see PR for the parsed rows ---

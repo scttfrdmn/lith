@@ -13,16 +13,16 @@ func TestGapWalkClassifiesRandom(t *testing.T) {
 	p := New(16)
 	p.SetGapMax(bs)
 	p.Open()
-	p.Observe(0, 0)           // first read, contiguous — establishes Sequential
-	p.Observe(1, 3*bs)        // adjacent block but a 24 MiB gap → a seek, not progress
-	got := p.Observe(2, 3*bs) // second seek with no progress between → Random
+	p.Observe(0, 0, 0, 0)           // first read, contiguous — establishes Sequential
+	p.Observe(1, 0, 0, 3*bs)        // adjacent block but a 24 MiB gap → a seek, not progress
+	got := p.Observe(2, 0, 0, 3*bs) // second seek with no progress between → Random
 	if p.State() != Random {
 		t.Fatalf("scattered walk: state = %v, want Random", p.State())
 	}
 	if len(got) != 0 {
 		t.Fatalf("random walk dispatched %v prefetch blocks; want none", got)
 	}
-	if got := p.Observe(3, 3*bs); len(got) != 0 {
+	if got := p.Observe(3, 0, 0, 3*bs); len(got) != 0 {
 		t.Fatalf("random walk still dispatching %v; want none", got)
 	}
 }
@@ -35,8 +35,8 @@ func TestGapContiguousScanStaysSequential(t *testing.T) {
 	p := New(16)
 	p.SetGapMax(bs)
 	p.Open()
-	p.Observe(0, 0)
-	got := p.Observe(1, 0) // contiguous advance
+	p.Observe(0, 0, 0, 0)
+	got := p.Observe(1, 0, 0, 0) // contiguous advance
 	if p.State() != Sequential {
 		t.Fatalf("contiguous scan: state = %v, want Sequential", p.State())
 	}
@@ -44,8 +44,8 @@ func TestGapContiguousScanStaysSequential(t *testing.T) {
 		t.Fatal("contiguous scan dispatched no prefetch; a stream must prefetch")
 	}
 	w0 := p.PeakWindow()
-	p.Observe(2, 0)
-	p.Observe(3, 0)
+	p.Observe(2, 0, 0, 0)
+	p.Observe(3, 0, 0, 0)
 	if p.PeakWindow() <= w0 {
 		t.Errorf("window did not grow across a contiguous run (%d → %d)", w0, p.PeakWindow())
 	}
@@ -57,11 +57,11 @@ func TestGapReorderStaysSequential(t *testing.T) {
 	p := New(16)
 	p.SetGapMax(bs)
 	p.Open()
-	p.Observe(0, 0)
-	p.Observe(1, 0)
-	p.Observe(2, 0)
+	p.Observe(0, 0, 0, 0)
+	p.Observe(1, 0, 0, 0)
+	p.Observe(2, 0, 0, 0)
 	// A read that arrives out of order (block 1 again) within a small byte gap.
-	p.Observe(1, -64<<10)
+	p.Observe(1, 0, 0, -64<<10)
 	if p.State() != Sequential {
 		t.Fatalf("in-band reorder: state = %v, want Sequential", p.State())
 	}
@@ -74,16 +74,16 @@ func TestGapWalkThenStreamRecovers(t *testing.T) {
 	p := New(16)
 	p.SetGapMax(bs)
 	p.Open()
-	p.Observe(0, 0)
-	p.Observe(10, 5*bs) // seek
-	p.Observe(25, 5*bs) // → Random
+	p.Observe(0, 0, 0, 0)
+	p.Observe(10, 0, 0, 5*bs) // seek
+	p.Observe(25, 0, 0, 5*bs) // → Random
 	if p.State() != Random {
 		t.Fatalf("after scattered reads: state = %v, want Random", p.State())
 	}
 	// Now a contiguous run resumes.
-	p.Observe(26, 0)
-	p.Observe(27, 0)
-	p.Observe(28, 0)
+	p.Observe(26, 0, 0, 0)
+	p.Observe(27, 0, 0, 0)
+	p.Observe(28, 0, 0, 0)
 	if p.State() != Sequential {
 		t.Fatalf("after a contiguous run resumed: state = %v, want Sequential", p.State())
 	}
@@ -94,8 +94,8 @@ func TestGapWalkThenStreamRecovers(t *testing.T) {
 func TestGapOffPreservesOldBehavior(t *testing.T) {
 	p := New(16) // no SetGapMax → seqGapMax = MaxInt64
 	p.Open()
-	p.Observe(0, 0)
-	p.Observe(1, 100*bs) // huge gap, but the gate is off
+	p.Observe(0, 0, 0, 0)
+	p.Observe(1, 0, 0, 100*bs) // huge gap, but the gate is off
 	if p.State() != Sequential {
 		t.Fatalf("gate off: state = %v, want Sequential (pre-1b behavior)", p.State())
 	}

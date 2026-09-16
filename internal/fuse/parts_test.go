@@ -69,8 +69,14 @@ func triggerPartsFetch(t *testing.T, raw fuse.RawFileSystem, node uint64) uint64
 	if s := raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: node}}, &oo); s != fuse.OK {
 		t.Fatalf("open: %v", s)
 	}
-	if _, s := raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: node}, Fh: oo.Fh, Offset: 0, Size: 0}, nil); s != fuse.OK {
-		t.Fatalf("read: %v", s)
+	// #229: parts-fetch is a broad commit and fires only once the access pattern is
+	// known to tile. Establish it the way a copy does — three contiguous
+	// block-advancing reads (block size 2 MiB here) — after which the whole-file
+	// parts fetch runs for the remainder. A file smaller than three blocks cannot
+	// establish and is served by demand (which fetches exactly what is read).
+	buf := make([]byte, 2<<20)
+	for i := int64(0); i < 3; i++ {
+		raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: node}, Fh: oo.Fh, Offset: uint64(i * (2 << 20)), Size: 2 << 20}, buf)
 	}
 	return oo.Fh
 }
@@ -148,11 +154,13 @@ func TestPartsFetchBudgetExhausted(t *testing.T) {
 	raw.Lookup(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "big.bin", &eo)
 	triggerPartsFetch(t, raw, eo.NodeId)
 	gets := waitStableGets(srv)
-	// The eager whole-file parts fetch is skipped (budget too small) and the
-	// open-time window is not dispatched for a parts-covered file, so a
-	// zero-length first read triggers no prefetch GETs at all.
-	if gets != 0 {
-		t.Fatalf("budget-exhausted parts fetch issued %d GETs; expected the eager fetch to be skipped", gets)
+	// #229: establishing the handle demands its three reads (blocks 0–2), then the
+	// whole-file parts fetch is attempted and skipped (budget 1 MiB < 7 MiB file).
+	// The guarantee is that the skip neither over-fetches (no eager parallel grab of
+	// the whole file beyond what was read) nor leaks the budget. A 4-block file read
+	// to establishment touches at most its 4 blocks.
+	if gets > 4 {
+		t.Fatalf("budget-exhausted parts fetch issued %d GETs; the eager whole-file grab was not skipped", gets)
 	}
 	// The budget must be fully released (nothing leaked).
 	if _, used := lim.Budget(); used != 0 {
