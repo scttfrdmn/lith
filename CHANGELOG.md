@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Enhancements from the GCHP project's end-to-end integration run
-([#210](https://github.com/scttfrdmn/lith/issues/210)) — the first workload to
-run entirely off lith-served input.
+## [1.1.2] - 2026-09-17
+
+The concurrency fix from the GCHP project's shared-gateway test
+([#244](https://github.com/scttfrdmn/lith/issues/244)) — `serve nfs` no longer
+returns spurious `NFS3ERR_STALE` under concurrent readers — plus the enhancements
+and observability from its end-to-end integration run
+([#210](https://github.com/scttfrdmn/lith/issues/210)), the first workload to run
+entirely off lith-served input.
 
 ### Added
 
