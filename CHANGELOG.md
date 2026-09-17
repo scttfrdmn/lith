@@ -32,6 +32,14 @@ scattered metadata walks for streams.
   `-race`, govulncheck, fuzz, dual-arch build, docker build — via one reusable
   workflow, no longer a subset ([#199](https://github.com/scttfrdmn/lith/issues/199)).
 
+### Fixed
+
+- **Release workflow pins goreleaser to the triggering tag**
+  (`GORELEASER_CURRENT_TAG`) instead of `git describe`. An `-rc` and its stable
+  tag legitimately share a commit; `git describe` then resolved ambiguously,
+  so the stable run rebuilt the prerelease. Caught cutting this very release —
+  the rc-then-real-tag verification did its job.
+
 ### Changed
 
 - **Fetch policy: no broad fetch until the access pattern establishes**
