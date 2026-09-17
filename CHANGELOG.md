@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-16
+
+The read path learned to **not commit before it knows**. The headline is one
+fetch policy ([#229](https://github.com/scttfrdmn/lith/issues/229)): lith no
+longer fetches broadly — whole-file parts, wide readahead — until a handle's
+reads prove they tile. A sequential reader establishes in the first couple of
+reads and gets the whole-file fetch as before; a scattered or sub-file reader (an
+HDF5 hyperslab, a COG window, a GRIB `.idx` field sweep) stays byte-exact and
+stops pulling whole objects to answer a question about a slice. Plus the release
+now ships packaged and signed, and the prefetch detector stopped mistaking
+scattered metadata walks for streams.
+
+### Added
+
+- **deb and rpm packages, an SBOM, cosign signatures, and SLSA build
+  provenance** on every release (M15,
+  [#207](https://github.com/scttfrdmn/lith/issues/207)). Packages (via goreleaser
+  `nfpms`) and a syft SBOM attach to the release; checksums are signed keyless
+  with cosign (Sigstore bundle); binaries and the image carry
+  `actions/attest-build-provenance` attestations. `cosign verify-blob` and
+  `dpkg -i`/`rpm -i` on a box, verified on the v1.0.2-rc.
+- **The release gate is now the full branch gate** — vet, golangci-lint,
+  `-race`, govulncheck, fuzz, dual-arch build, docker build — via one reusable
+  workflow, no longer a subset ([#199](https://github.com/scttfrdmn/lith/issues/199)).
+
+### Changed
+
+- **Fetch policy: no broad fetch until the access pattern establishes**
+  ([#229](https://github.com/scttfrdmn/lith/issues/229), subsuming
+  [#220](https://github.com/scttfrdmn/lith/issues/220)/[#221](https://github.com/scttfrdmn/lith/issues/221)/[#228](https://github.com/scttfrdmn/lith/issues/228)).
+  One signal — coverage over a trailing read window — gates the open-time
+  parts-fetch, the initial readahead ramp, and the post-seek re-anchor. Measured
+  amplification on scattered/sub-file reads (cold, parts-fetch on): HDF5
+  hyperslab **92.5× → 6.3×**, COG overview+window **22.1× → 1.27×**, GRIB `.idx`
+  **8.1× → 3.35×**; streaming and the CargoShip tree walk stay byte-identical.
+  Cost: a cold sequential copy of a mid-size file pays roughly one extra
+  round-trip for its first block (byte-identical, cold-only, shrinks with size).
+- **Prefetch detector no longer mistakes a scattered metadata walk for a stream**
+  ([#210](https://github.com/scttfrdmn/lith/issues/210)/[#213](https://github.com/scttfrdmn/lith/issues/213)).
+  Reads that land in adjacent blocks but jump in byte offset — an HDF5/netCDF-4
+  metadata traversal — were classified Sequential and got whole-block readahead;
+  gap-aware then coverage-gated classification cut over-read **72–92%** on the
+  GEOS-Chem gcgrid workload, ledger-confirmed.
+- **`--parts-max` default is now `auto`** — derived from NIC baseline ×
+  first-byte latency, clamped to `[--small-file, 64MiB]`
+  ([#220](https://github.com/scttfrdmn/lith/issues/220)).
+
+### Known issues
+
+- **`mmap` of a large object walked randomly is slower than v1.0.1**
+  ([#232](https://github.com/scttfrdmn/lith/issues/232)). The byte-exact posture
+  that wins on scattered *reads* maximizes round-trips on serial *page faults*: a
+  3,000-fault synthetic over an 892 MB index measured ~4.7× v1.0.1's wall
+  (real-workload magnitude, e.g. `bwa`, unmeasured). Each random fault is a
+  synchronous S3 round-trip and no readahead helps. **Mitigation:** copy a
+  randomly-`mmap`'d reference index to local NVMe, or use the gateway / EFS — see
+  `docs/copy-or-mount.md`.
+
 ## [1.0.1] - 2026-09-14
 
 Hardening release from an external review of the v1.0.0 tag. No features. The
