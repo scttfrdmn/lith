@@ -222,6 +222,13 @@ type rawFS struct {
 	pfTrace   *os.File
 	pfTraceMu sync.Mutex
 
+	// missMu/missSeen dedup the ENOENT-lookup breadcrumb (#240): the first time a
+	// lookup resolves to a path not in the index, log it at INFO so a prefix-
+	// scoped mount that is silently short a key says which one. Deduped per
+	// distinct path and capped so a probe-heavy app cannot flood the log.
+	missMu   sync.Mutex
+	missSeen map[string]struct{}
+
 	mu      sync.RWMutex
 	nodes   map[uint64]*node
 	handles map[uint64]*fileHandle
@@ -258,6 +265,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		nextFh:        1,
 		sibLastPos:    map[string]int{},
 		sibPendingSet: map[string]struct{}{},
+		missSeen:      map[string]struct{}{},
 		zarr:          newZarrState(),
 		bgzf:          newBgzfState(),
 		footer:        newFooterState(),
@@ -483,6 +491,7 @@ func (f *rawFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	childPath := joinPath(parent.path, name)
 	fi, err := f.index().Stat("/" + childPath)
 	if err != nil {
+		f.logMiss(childPath)
 		return fuse.ENOENT
 	}
 	f.register(fi.Ino, childPath, header.NodeId, fi.IsDir)
@@ -492,6 +501,25 @@ func (f *rawFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	out.SetAttrTimeout(oneYear)
 	f.fillAttr(&out.Attr, fi)
 	return fuse.OK
+}
+
+// missLogCap bounds the number of distinct missing paths logged, so a probe-heavy
+// app cannot flood the log or the dedup map (#240).
+const missLogCap = 1024
+
+// logMiss records, at INFO and once per distinct path, that a lookup resolved to
+// a path not in the index — the breadcrumb a prefix-scoped read-only mount owes
+// when it is silently short a key (#240). Deduped and capped; past the cap it is
+// silent (the first misses are the diagnostic ones, and memory stays bounded).
+func (f *rawFS) logMiss(path string) {
+	f.missMu.Lock()
+	if _, seen := f.missSeen[path]; seen || len(f.missSeen) >= missLogCap {
+		f.missMu.Unlock()
+		return
+	}
+	f.missSeen[path] = struct{}{}
+	f.missMu.Unlock()
+	slog.Info("lookup miss: path not under this mount's index", "path", "/"+path)
 }
 
 // GetAttr returns attributes for a NodeId.

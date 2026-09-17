@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Enhancements from the GCHP project's end-to-end integration run
+([#210](https://github.com/scttfrdmn/lith/issues/210)) — the first workload to
+run entirely off lith-served input.
+
+### Added
+
+- **`lith` logs a lookup miss (ENOENT) with the path**, at INFO, once per distinct
+  path and capped ([#240](https://github.com/scttfrdmn/lith/issues/240)). A
+  prefix-scoped mount that is silently short a key now says which one, instead of
+  leaving the application's "file not found" as the only clue.
+
+### Changed
+
+- **`lith doctor` warns when `--nic-gbps` looks like the advertised peak**
+  ([#239](https://github.com/scttfrdmn/lith/issues/239)). `--nic-gbps` wants the
+  sustained baseline; the "Up to N Gigabit" figure on the instance page is the
+  peak, and passing it over-sizes readahead and fetches bytes that are never
+  read. `doctor` re-detects the true baseline and flags a peak-valued override.
+- **`docs/knobs.md`**: `--mem-cache` is per-daemon (N mounts on a host add up;
+  set it explicitly), and `--nic-gbps` is the baseline, not the "Up to N" peak.
+
 ## [1.1.1] - 2026-09-17
 
 A patch for a real deployment finding from the GCHP project running 1.1.0 on AWS
