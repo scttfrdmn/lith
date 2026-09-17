@@ -55,6 +55,12 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin the version to the tag that triggered this run, not `git describe`.
+          # An rc and its stable tag legitimately sit on the same commit (same
+          # code), and `git describe` then resolves ambiguously — v1.1.0's run
+          # picked up v1.1.0-rc1, rebuilt the prerelease, and 422'd re-uploading to
+          # the existing rc release. The triggering ref is unambiguous.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
       # SLSA build-provenance for every shipped artifact (binaries, tarballs,
       # deb/rpm, checksums), attached to the GitHub attestations store and
       # verifiable with `gh attestation verify`.
