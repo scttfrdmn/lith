@@ -59,18 +59,24 @@ with N and the working set. The gateway's own read path is concurrent and has
 **no FUSE hop** — a single stream reads *faster* than a FUSE mount (1,463 MB/s
 loopback) — but aggregate cold throughput is still bounded by the one NIC.
 
-### Concurrency ceiling (known issue [#244](https://github.com/scttfrdmn/lith/issues/244))
+### Concurrency under high GETATTR rate (fixed, [#244](https://github.com/scttfrdmn/lith/issues/244))
 
-`serve nfs` is validated to roughly **32 concurrent readers**; above that, GETATTR
-can return `NFS3ERR_STALE` under a high request rate (bytes are never wrong — a
-staled read simply fails rather than returning bad data). For a **tightly-coupled
-MPI job** this matters more than the low rate suggests: a job has no retry at file
-open, so one rank's `ESTALE` at `nf90_open` can abort the whole job. **For jobs
-above ~32 ranks per client, or any MPI job that opens input concurrently, prefer
-per-node FUSE mounts** (`lith mount` on each node) over one shared gateway — they
-carry 96-rank GCHP across nodes with zero read errors. Use the gateway where its
-byte-funnel win is the point (many nodes reading a *shared* dataset) and the
-concurrency stays modest; use per-node mounts for dense concurrent opens.
+Through v1.1.1 a shared gateway could return `NFS3ERR_STALE` on GETATTR under
+concurrent readers (clean to ~32, ~15% from 48 up) — enough to abort a
+tightly-coupled MPI job at file open, since a job has no retry at `nf90_open`.
+The cause was an upstream `go-nfs-client` bug: a variable-length handle was read
+with a single `Read` that ignored short reads, so a handle straddling a
+buffer/segment boundary under load decoded with a zeroed tail and was rejected as
+STALE. Bytes were never wrong — a staled read simply failed rather than returning
+bad data. **Fixed** by bumping `go-nfs-client` to the `io.ReadFull` version, and
+validated at 96 concurrent `O_DIRECT` readers (11,530 GETATTRs, **zero STALE**)
+where the pre-fix build failed ~15%.
+
+So choosing the gateway vs per-node mounts is now purely the funnel decision
+above, not a concurrency limit: use the gateway when many nodes read a *shared*
+dataset (one node's S3 traffic, free second job); use per-node `lith mount`s when
+nodes read *distinct* data (N NICs in parallel — a shared cache has nothing to
+share).
 
 ## When the gateway dies
 
