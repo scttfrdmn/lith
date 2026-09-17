@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-17
+
+A patch for a real deployment finding from the GCHP project running 1.1.0 on AWS
+ParallelCluster ([#237](https://github.com/scttfrdmn/lith/issues/237)). On stock
+ParallelCluster nodes **both** NIC-detection paths fail — ENA reports no
+`ethtool` speed, and the generated node role omits `ec2:DescribeInstanceTypes` —
+and the failure fed a literal `0` into the device-derived knobs. `--parts-max`
+silently clamped to its 4 MiB floor (a 16× swing off the 64 MiB it should be),
+disabling the whole-file parts path for every 4–64 MiB file — exactly the band
+where per-variable scientific inputs live — and `doctor` reported it healthy.
+
+### Fixed
+
+- **NIC detection never propagates `0` into the derived knobs**
+  ([#237](https://github.com/scttfrdmn/lith/issues/237)). When every detection
+  path fails, `--parts-max`, `--coalesce-gap` and `--inflight-bytes` now derive
+  from a single assumed bandwidth (10 Gbps) instead of clamping to their floors.
+  The whole-file parts path stays on for mid-size files on nodes lith cannot
+  probe.
+- **`lith doctor` prints the device-derived values `mount` will actually use**
+  (parts-max, inflight, NIC source) and **`WARN`s — not `INFO`s — when the NIC
+  is undetected**, naming the consequence and pointing at `--nic-gbps`. It no
+  longer reports a healthy `PASS` over a 16× misconfiguration, or an
+  inflight-bytes figure that contradicts the mount.
+
+### Added
+
+- **IMDS instance-type NIC estimate** ([#237](https://github.com/scttfrdmn/lith/issues/237)).
+  When `ec2:DescribeInstanceTypes` is denied but IMDS is reachable (the
+  ParallelCluster case), lith estimates the baseline from the instance size — no
+  IAM change required. `--nic-gbps` remains the precise override, and
+  `DescribeInstanceTypes` the precise detected path when permitted.
+
 ## [1.1.0] - 2026-09-16
 
 The read path learned to **not commit before it knows**. The headline is one

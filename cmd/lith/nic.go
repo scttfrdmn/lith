@@ -61,8 +61,53 @@ func resolveNIC(ctx context.Context, indexDir string, overrideGbps float64) nicI
 			}
 			return ni
 		}
+		// DescribeInstanceTypes was denied (ParallelCluster's default node role
+		// omits ec2:DescribeInstanceTypes) or errored, but IMDS still gave us the
+		// instance type with no IAM. Estimate the baseline from the size — enough
+		// to keep the device-derived knobs (parts-max, coalesce-gap) sized sanely
+		// without a permission change (#237). --nic-gbps remains the precise path.
+		if g, ok := bandwidthFromType(itype); ok {
+			return nicInfo{InstanceType: itype, BaselineGbps: g, PeakGbps: g, Source: "imds-estimate"}
+		}
 	}
-	return nicInfo{}
+	// Nothing detected (off-EC2, or IMDS blocked). Fall back to an assumed
+	// bandwidth rather than letting a literal 0 propagate into the derivations —
+	// which silently clamped parts-max to its 4 MiB floor and disabled the
+	// whole-file parts path for every 4–64 MiB file (#237). Callers should still
+	// pass --nic-gbps; doctor WARNs on this source.
+	return nicInfo{BaselineGbps: defaultFallbackGbps, PeakGbps: defaultFallbackGbps, Source: "fallback"}
+}
+
+// defaultFallbackGbps is the assumed NIC bandwidth when detection fails entirely
+// (no ethtool speed, no cache, no DescribeInstanceTypes, no IMDS type — e.g. an
+// off-EC2 host). A 10 GbE-class assumption: conservative for the modern EC2/HPC
+// nodes where detection actually fails, and enough that the parts path stays on
+// for typical scientific inputs. --nic-gbps overrides it.
+const defaultFallbackGbps = 10.0
+
+// sizeBandwidthGbps maps an EC2 instance size suffix to an approximate baseline
+// bandwidth (Gbps). Baseline scales with size across current-gen families, so a
+// size-keyed estimate is family-agnostic and good enough to size the derived
+// knobs when DescribeInstanceTypes is unavailable (#237). It is deliberately
+// conservative (leans to baseline, not "up to" peak); --nic-gbps is the precise
+// override and doctor labels this an estimate. Network-optimized ('n') and metal
+// variants exceed these — again, --nic-gbps.
+var sizeBandwidthGbps = map[string]float64{
+	"large": 0.9, "xlarge": 1.9, "2xlarge": 3.75, "4xlarge": 7.5,
+	"8xlarge": 15, "12xlarge": 22.5, "16xlarge": 30, "24xlarge": 37.5,
+	"32xlarge": 50, "48xlarge": 50, "metal": 30,
+}
+
+// bandwidthFromType estimates a baseline Gbps from an instance type's size
+// suffix (e.g. "c7g.4xlarge" -> "4xlarge" -> 7.5). ok is false for an
+// unrecognized size.
+func bandwidthFromType(itype string) (float64, bool) {
+	i := strings.LastIndexByte(itype, '.')
+	if i < 0 || i+1 >= len(itype) {
+		return 0, false
+	}
+	g, ok := sizeBandwidthGbps[itype[i+1:]]
+	return g, ok
 }
 
 // selectBandwidth sums the baseline and peak bandwidth (Gbps) across an

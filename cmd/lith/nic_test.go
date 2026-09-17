@@ -169,3 +169,46 @@ func TestComputeInflightFromBaseline(t *testing.T) {
 		t.Fatalf("--inflight-bytes flag = %d, want %d", got, 256<<20)
 	}
 }
+
+// TestBandwidthFromType: the IMDS-estimate size table maps the size suffix to a
+// baseline (#237) — the path stock ParallelCluster nodes take when
+// DescribeInstanceTypes is denied but IMDS gives the type.
+func TestBandwidthFromType(t *testing.T) {
+	cases := map[string]float64{
+		"c7g.4xlarge":    7.5,
+		"m9g.48xlarge":   50,
+		"c8g.large":      0.9,
+		"r7g.16xlarge":   30,
+		"m8g.metal-24xl": 0, // unrecognized size suffix after the dot
+	}
+	for itype, want := range cases {
+		g, ok := bandwidthFromType(itype)
+		if want == 0 {
+			if ok {
+				t.Errorf("%s: expected no estimate, got %g", itype, g)
+			}
+			continue
+		}
+		if !ok || g != want {
+			t.Errorf("%s: got (%g,%v), want %g", itype, g, ok, want)
+		}
+	}
+	// No dot at all → no estimate (not an EC2-style type).
+	if _, ok := bandwidthFromType("notatype"); ok {
+		t.Error("typeless string should yield no estimate")
+	}
+}
+
+// TestFallbackNeverZero: the #237 fix — detection failing must not propagate a
+// literal 0 into the device-derived knobs. defaultFallbackGbps is a real,
+// nonzero assumption, and at it the derived parts-max lands well above its
+// 4 MiB floor (the whole regression was parts-max collapsing to that floor).
+func TestFallbackNeverZero(t *testing.T) {
+	if defaultFallbackGbps <= 0 {
+		t.Fatal("defaultFallbackGbps must be a positive assumption, not 0")
+	}
+	partsMax := int64(defaultFallbackGbps * 1e9 / 8 * 0.04) // NIC × TTFB(40ms)
+	if partsMax <= 4<<20 {
+		t.Fatalf("fallback parts-max %d must clear the 4 MiB floor (the #237 bug)", partsMax)
+	}
+}
