@@ -52,6 +52,10 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config) error {
 	srv := &server{cfg: cfg, clients: map[string]time.Time{}}
 	fs := &roFS{cfg: cfg, srv: srv, ctx: ctx, states: map[string]*seqState{}}
 	h := &handler{cfg: cfg, srv: srv, fs: fs}
+	// Route go-nfs's per-request trace into true per-op counters (#247) and its
+	// own error/warn logs into lith's slog. SetLogger is a process global; one
+	// gateway runs per `lith serve nfs` process.
+	gonfs.SetLogger(newOpLogger(cfg.Logger, cfg.Metrics))
 	go srv.reap(ctx)
 	go func() { <-ctx.Done(); _ = ln.Close() }()
 	return gonfs.Serve(ln, h)
