@@ -27,6 +27,17 @@ run entirely off lith-served input.
   read. `doctor` re-detects the true baseline and flags a peak-valued override.
 - **`docs/knobs.md`**: `--mem-cache` is per-daemon (N mounts on a host add up;
   set it explicitly), and `--nic-gbps` is the baseline, not the "Up to N" peak.
+- **`lith_nfs_ops_total` now counts the true NFS procedure**
+  ([#247](https://github.com/scttfrdmn/lith/issues/247)). It previously counted at
+  the billy-filesystem layer, which cannot see the procedure — so `getattr`
+  silently included LOOKUP and ACCESS (all call `Lstat`), `readdirplus` included
+  READDIR, and FSSTAT was uncounted. The gateway now counts per procedure via
+  go-nfs's request-trace seam, yielding distinct `getattr`, `lookup`, `access`,
+  `read`, `readdir`, `readdirplus`, `fsstat`, `fsinfo`, `pathconf`, `commit`,
+  `readlink` (and an `unparsed` fallback so a future log-format change is visible,
+  not silent). go-nfs's own error/warn logs now route through lith's slog and
+  respect `--log-level`. **Watch for label changes** if you dashboard these:
+  `getattr` no longer includes lookups/accesses.
 
 ### Fixed
 

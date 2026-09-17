@@ -107,7 +107,9 @@ func (f *roFS) key(vpath string) blockstore.Key {
 }
 
 func (f *roFS) Stat(filename string) (os.FileInfo, error) {
-	f.op("getattr")
+	// NFS op counting is done by op procedure at the go-nfs logger seam
+	// (internal/nfs/oplog.go, #247): Stat is called by GETATTR, LOOKUP and ACCESS
+	// alike, so counting here would conflate them.
 	vp := norm(filename)
 	fi, err := f.cfg.Index.Stat(vp)
 	if err != nil {
@@ -133,7 +135,8 @@ func (f *roFS) OpenFile(filename string, flag int, _ os.FileMode) (billy.File, e
 }
 
 func (f *roFS) ReadDir(p string) ([]os.FileInfo, error) {
-	f.op("readdirplus")
+	// Counted by procedure at the logger seam (#247): ReadDir serves both READDIR
+	// and READDIRPLUS, which are distinct ops there.
 	vp := norm(p)
 	var out []os.FileInfo
 	var cursor uint64
@@ -155,12 +158,6 @@ func (f *roFS) ReadDir(p string) ([]os.FileInfo, error) {
 		cursor = next
 	}
 	return out, nil
-}
-
-func (f *roFS) op(name string) {
-	if f.cfg.Metrics != nil {
-		f.cfg.Metrics.NFSOp(name)
-	}
 }
 
 func (f *roFS) Join(elem ...string) string { return path.Join(elem...) }
@@ -274,7 +271,8 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 	if r.fs.cfg.Metrics != nil {
-		r.fs.cfg.Metrics.NFSOp("read")
+		// The read op itself is counted by procedure at the logger seam (#247);
+		// here we record only the bytes served.
 		r.fs.cfg.Metrics.NFSReadBytes(int64(n))
 	}
 	if off+int64(n) >= r.size || n < len(p) {
