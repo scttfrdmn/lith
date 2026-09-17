@@ -62,6 +62,7 @@ const (
 	fail
 	na
 	info
+	warn
 )
 
 func (s checkStatus) tag() string {
@@ -72,6 +73,8 @@ func (s checkStatus) tag() string {
 		return "FAIL"
 	case na:
 		return "N/A "
+	case warn:
+		return "WARN"
 	default:
 		return "INFO"
 	}
@@ -88,7 +91,7 @@ func (d *doctor) add(s checkStatus, name, detail, fix string) {
 		d.failed = true
 	}
 	_, _ = fmt.Fprintf(d.out, "[%s] %-22s %s\n", s.tag(), name, detail)
-	if s == fail && fix != "" {
+	if (s == fail || s == warn) && fix != "" {
 		_, _ = fmt.Fprintf(d.out, "        └─ fix: %s\n", fix)
 	}
 }
@@ -183,11 +186,29 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 		doctorMountpoint(d, f.mountpoint)
 	}
 
-	// --- NIC facts ---
+	// --- NIC facts + the device-derived knobs mount will actually use (#237) ---
 	nic := resolveNIC(ctx, os.TempDir(), f.nicGbps)
-	inflight := int64(nic.BaselineGbps * 1e9 / 8 * 0.1 * 2) // 2 × NIC × 100ms (the mount default)
-	d.add(info, "nic", fmt.Sprintf("%.1f Gbps (source=%s); inflight-bytes budget ≈ %d MiB",
-		nic.BaselineGbps, nic.Source, inflight/(1<<20)), "")
+	nicBytesPerSec := int64(nic.BaselineGbps * 1e9 / 8)
+	inflight := int64(2 * float64(nicBytesPerSec) * 0.1) // 2 × NIC × 100ms (the mount default)
+	partsMax := int64(float64(nicBytesPerSec) * 0.04)    // NIC × TTFB(40ms), clamped [4MiB,64MiB]
+	if partsMax < 4<<20 {
+		partsMax = 4 << 20
+	} else if partsMax > 64<<20 {
+		partsMax = 64 << 20
+	}
+	detail := fmt.Sprintf("%.1f Gbps (source=%s) → parts-max %d MiB, inflight %d MiB",
+		nic.BaselineGbps, nic.Source, partsMax/(1<<20), inflight/(1<<20))
+	switch nic.Source {
+	case "fallback":
+		// Every detection path failed; the values above are assumptions, not
+		// measurements. WARN (not INFO) so an all-PASS report does not hide it.
+		d.add(warn, "nic", detail+" — NIC undetected (no ethtool speed, no IMDS type, no DescribeInstanceTypes)",
+			"pass --nic-gbps <Gbps>; without it the device-derived knobs are guesses (e.g. parts-max)")
+	case "imds-estimate":
+		d.add(info, "nic", detail+fmt.Sprintf(" — estimated from %s size (DescribeInstanceTypes denied); pass --nic-gbps for the exact baseline", nic.InstanceType), "")
+	default:
+		d.add(info, "nic", detail, "")
+	}
 
 	// --- pointer / index target ---
 	if target != "" && cfgErr == nil {
