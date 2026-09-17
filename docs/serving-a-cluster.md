@@ -59,6 +59,19 @@ with N and the working set. The gateway's own read path is concurrent and has
 **no FUSE hop** — a single stream reads *faster* than a FUSE mount (1,463 MB/s
 loopback) — but aggregate cold throughput is still bounded by the one NIC.
 
+### Concurrency ceiling (known issue [#244](https://github.com/scttfrdmn/lith/issues/244))
+
+`serve nfs` is validated to roughly **32 concurrent readers**; above that, GETATTR
+can return `NFS3ERR_STALE` under a high request rate (bytes are never wrong — a
+staled read simply fails rather than returning bad data). For a **tightly-coupled
+MPI job** this matters more than the low rate suggests: a job has no retry at file
+open, so one rank's `ESTALE` at `nf90_open` can abort the whole job. **For jobs
+above ~32 ranks per client, or any MPI job that opens input concurrently, prefer
+per-node FUSE mounts** (`lith mount` on each node) over one shared gateway — they
+carry 96-rank GCHP across nodes with zero read errors. Use the gateway where its
+byte-funnel win is the point (many nodes reading a *shared* dataset) and the
+concurrency stays modest; use per-node mounts for dense concurrent opens.
+
 ## When the gateway dies
 
 Reads are served over NFS, so the client's mount options decide behavior:

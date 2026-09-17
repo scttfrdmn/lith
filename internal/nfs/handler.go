@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
+	"log/slog"
 	"net"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	billy "github.com/go-git/go-billy/v5"
@@ -25,9 +28,31 @@ type handler struct {
 	cfg Config
 	srv *server
 	fs  *roFS
+
+	// STALE/miss diagnostics (#244): a prefix-scoped read-only gateway that
+	// returns NFS3ERR_STALE should say *why* — the reason a black-box "the server
+	// chose STALE" cost the GCHP tester two probes. Counted by category and logged
+	// on powers of two so a high stale rate cannot flood the log (lock-free).
+	staleBadLen   atomic.Uint64 // handle not 16 bytes (malformed / truncated)
+	staleRootID   atomic.Uint64 // handle from a different index (rebuilt/rebuilt root id)
+	staleUnknIno  atomic.Uint64 // valid root id, inode no entry owns
+	toHandleEmpty atomic.Uint64 // ToHandle could not resolve a path → unusable handle
 }
 
 var _ gonfs.Handler = (*handler)(nil)
+
+// logStaleEvery logs on counts 1,2,4,8,… — exponential backoff so a 17% stale
+// rate over millions of ops still yields a handful of lines, no lock, no time.
+func logStaleEvery(c *atomic.Uint64, log *slog.Logger, msg string, attrs ...any) {
+	n := c.Add(1)
+	if n&(n-1) != 0 { // not a power of two
+		return
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Warn(msg, append([]any{"count", n}, attrs...)...)
+}
 
 // Mount registers the client (its remote address) for the clients gauge and the
 // fair-share window, and returns the shared read-only filesystem. AUTH_UNIX and
@@ -61,6 +86,11 @@ func (h *handler) FSStat(_ context.Context, _ billy.Filesystem, s *gonfs.FSStat)
 func (h *handler) ToHandle(_ billy.Filesystem, pathparts []string) []byte {
 	fi, err := h.cfg.Index.Stat(joinAbs(pathparts))
 	if err != nil {
+		// An unresolvable path yields an empty handle, which every later op then
+		// STALEs on. Logged (#244) because if this ever fires under load it is the
+		// upstream cause of a burst of GETATTR stales.
+		logStaleEvery(&h.toHandleEmpty, h.cfg.Logger, "nfs: ToHandle could not resolve path (returning empty handle)",
+			"path", joinAbs(pathparts))
 		return []byte{} // unresolvable path: an empty handle never matches FromHandle
 	}
 	b := make([]byte, 16)
@@ -73,13 +103,23 @@ func (h *handler) ToHandle(_ billy.Filesystem, pathparts []string) []byte {
 // an inode no entry owns is NFS3ERR_STALE. Otherwise it resolves the inode back
 // to a path via the index.
 func (h *handler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	if len(fh) != 16 || !bytes.Equal(fh[0:8], h.cfg.RootID[:]) {
-		return nil, nil, &gonfs.NFSStatusError{NFSStatus: gonfs.NFSStatusStale}
+	stale := &gonfs.NFSStatusError{NFSStatus: gonfs.NFSStatusStale}
+	if len(fh) != 16 {
+		logStaleEvery(&h.staleBadLen, h.cfg.Logger, "nfs: STALE — handle is not 16 bytes (malformed/truncated)",
+			"len", len(fh), "handle", hex.EncodeToString(fh))
+		return nil, nil, stale
+	}
+	if !bytes.Equal(fh[0:8], h.cfg.RootID[:]) {
+		logStaleEvery(&h.staleRootID, h.cfg.Logger, "nfs: STALE — handle root id does not match this index (rebuilt/different index?)",
+			"handle", hex.EncodeToString(fh))
+		return nil, nil, stale
 	}
 	ino := binary.BigEndian.Uint64(fh[8:16])
 	p, ok := h.cfg.Index.ByInode(ino)
 	if !ok {
-		return nil, nil, &gonfs.NFSStatusError{NFSStatus: gonfs.NFSStatusStale}
+		logStaleEvery(&h.staleUnknIno, h.cfg.Logger, "nfs: STALE — inode not found in index",
+			"inode", ino, "handle", hex.EncodeToString(fh))
+		return nil, nil, stale
 	}
 	return h.fs, splitPath(p), nil
 }
