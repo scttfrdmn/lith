@@ -28,6 +28,24 @@ run entirely off lith-served input.
 - **`docs/knobs.md`**: `--mem-cache` is per-daemon (N mounts on a host add up;
   set it explicitly), and `--nic-gbps` is the baseline, not the "Up to N" peak.
 
+### Fixed
+
+- **`lith serve nfs` returned `NFS3ERR_STALE` on GETATTR under concurrent
+  readers** (clean to ~32, ~15% from 48 up), which could abort a tightly-coupled
+  MPI job at file open even though the bytes were never wrong
+  ([#244](https://github.com/scttfrdmn/lith/issues/244)). The root cause was
+  upstream in `go-nfs-client`'s `xdr.ReadOpaque`, which issued a single `r.Read`
+  and ignored short reads: a file handle that straddled a buffer/TCP-segment
+  boundary under load decoded with a zeroed tail, so `FromHandle` saw a bad inode
+  (or root id) and correctly returned STALE. It was GETATTR-specific because that
+  request path decodes the handle through the hand-rolled `ReadOpaque`, whereas
+  READ decodes via `io.ReadFull`-backed struct unmarshaling and was never
+  affected. Fixed by bumping `go-nfs-client` to the version whose `ReadOpaque`
+  uses `io.ReadFull`. lith's own handle logic was never the bug — it round-trips
+  `-race`-clean at 96×200 concurrent handles (`TestHandleRoundTripConcurrent`).
+  The categorized STALE logging and the concurrency-ceiling note added while
+  diagnosing this ([#245](https://github.com/scttfrdmn/lith/issues/245)) stay in.
+
 ## [1.1.1] - 2026-09-17
 
 A patch for a real deployment finding from the GCHP project running 1.1.0 on AWS
