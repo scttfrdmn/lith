@@ -186,7 +186,7 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 		doctorMountpoint(d, f.mountpoint)
 	}
 
-	// --- NIC facts + the device-derived knobs mount will actually use (#237) ---
+	// --- NIC facts + the device-derived knobs mount will actually use (#237/#239) ---
 	nic := resolveNIC(ctx, os.TempDir(), f.nicGbps)
 	nicBytesPerSec := int64(nic.BaselineGbps * 1e9 / 8)
 	inflight := int64(2 * float64(nicBytesPerSec) * 0.1) // 2 × NIC × 100ms (the mount default)
@@ -208,6 +208,27 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 		d.add(info, "nic", detail+fmt.Sprintf(" — estimated from %s size (DescribeInstanceTypes denied); pass --nic-gbps for the exact baseline", nic.InstanceType), "")
 	default:
 		d.add(info, "nic", detail, "")
+	}
+
+	// Peak-vs-baseline guard (#239): --nic-gbps wants the *sustained baseline*, but
+	// the number AWS advertises ("Up to N Gigabit") is the *peak*. Passing the peak
+	// over-sizes the readahead window and fetches bytes that are never read for no
+	// speed gain. When an override is set, re-detect the instance's true baseline
+	// (ignoring the override) and warn if the override looks like the advertised
+	// peak — substantially above the detected baseline.
+	if f.nicGbps > 0 {
+		det := resolveNIC(ctx, os.TempDir(), 0)
+		switch {
+		case det.PeakGbps > det.BaselineGbps && f.nicGbps >= det.PeakGbps*0.95:
+			d.add(warn, "nic-gbps",
+				fmt.Sprintf("--nic-gbps %.1f matches this instance's peak (baseline %.1f, peak %.1f, source=%s)",
+					f.nicGbps, det.BaselineGbps, det.PeakGbps, det.Source),
+				fmt.Sprintf("--nic-gbps wants the sustained baseline (%.1f), not the 'Up to N Gigabit' peak — the peak over-fetches for no speed gain", det.BaselineGbps))
+		case det.Source != "fallback" && det.BaselineGbps > 0 && f.nicGbps >= det.BaselineGbps*1.5:
+			d.add(warn, "nic-gbps",
+				fmt.Sprintf("--nic-gbps %.1f is well above the detected baseline %.1f (source=%s)", f.nicGbps, det.BaselineGbps, det.Source),
+				"--nic-gbps wants the sustained baseline, not the advertised 'Up to N Gigabit' peak; overstating it over-fetches for no speed gain")
+		}
 	}
 
 	// --- pointer / index target ---
