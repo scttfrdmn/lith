@@ -201,6 +201,15 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 	if off >= r.size {
 		return 0, io.EOF
 	}
+	if r.fs.cfg.Metrics != nil {
+		// Account the distinct object bytes this read touches (#65), the same as the
+		// FUSE path (internal/fuse/fs.go) — without this the gateway's
+		// distinct-bytes counter stays 0 and the amplification ratio
+		// s3_bytes/distinct_bytes reads as a *perfect* 0 for an unmeasured gateway
+		// (#253). mark() clamps length to the object size, so the requested len(p)
+		// is safe at EOF.
+		r.fs.cfg.Metrics.MarkDistinctRead(r.key.Key, off, int64(len(p)), r.size)
+	}
 	bs := r.fs.cfg.Store
 	blk := bs.BlockSize()
 

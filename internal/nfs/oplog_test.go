@@ -15,9 +15,10 @@ type countingMetrics struct {
 
 func newCountingMetrics() *countingMetrics { return &countingMetrics{ops: map[string]int{}} }
 
-func (m *countingMetrics) NFSClients(int)     {}
-func (m *countingMetrics) NFSSeqStates(int)   {}
-func (m *countingMetrics) NFSReadBytes(int64) {}
+func (m *countingMetrics) NFSClients(int)                               {}
+func (m *countingMetrics) NFSSeqStates(int)                             {}
+func (m *countingMetrics) NFSReadBytes(int64)                           {}
+func (m *countingMetrics) MarkDistinctRead(string, int64, int64, int64) {}
 func (m *countingMetrics) NFSOp(op string) {
 	m.mu.Lock()
 	m.ops[op]++
