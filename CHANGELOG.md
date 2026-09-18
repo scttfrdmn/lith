@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-09-17
+
+A gateway-observability fix from the GCHP shared-gateway validation
+([#244](https://github.com/scttfrdmn/lith/issues/244)): the gateway's
+distinct-bytes counter now advances, so a shared gateway's byte-dedup
+amplification is computable from its own metrics endpoint.
+
 ### Fixed
 
 - **`lith_distinct_bytes_read` now advances in `serve nfs` mode**
