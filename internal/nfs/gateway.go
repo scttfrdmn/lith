@@ -28,6 +28,7 @@ type Metrics interface {
 	NFSSeqStates(n int)
 	NFSOp(op string)
 	NFSReadBytes(n int64)
+	MarkDistinctRead(key string, off, length, size int64)
 }
 
 // Config configures the gateway.

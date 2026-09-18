@@ -16,12 +16,17 @@ import (
 
 	"github.com/scttfrdmn/lith/internal/blockstore"
 	"github.com/scttfrdmn/lith/internal/index"
+	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/s3client/fake"
 )
 
 // testGateway builds an index + blockstore over an in-memory fake and returns a
 // wired handler/roFS/server for unit tests (no real NFS network).
 func testGateway(t *testing.T, objs map[string][]byte) (*handler, *fake.Server) {
+	return buildGateway(t, objs, nil)
+}
+
+func buildGateway(t *testing.T, objs map[string][]byte, met Metrics) (*handler, *fake.Server) {
 	t.Helper()
 	srv := fake.New()
 	for k, v := range objs {
@@ -44,7 +49,7 @@ func testGateway(t *testing.T, objs map[string][]byte) (*handler, *fake.Server) 
 		t.Fatalf("blockstore: %v", err)
 	}
 	t.Cleanup(bs.Close)
-	cfg := Config{Index: reader, Store: bs, RootID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, ClientIdle: time.Minute}
+	cfg := Config{Index: reader, Store: bs, RootID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, ClientIdle: time.Minute, Metrics: met}
 	s := &server{cfg: cfg, clients: map[string]time.Time{}}
 	fs := &roFS{cfg: cfg, srv: s, ctx: context.Background(), states: map[string]*seqState{}}
 	return &handler{cfg: cfg, srv: s, fs: fs}, srv
@@ -209,6 +214,50 @@ func TestReadServesBytesAndSharesGET(t *testing.T) {
 	}
 	if after := srv.GetCallCount(); after != gets {
 		t.Errorf("warm re-read issued %d new GET(s), want 0", after-gets)
+	}
+}
+
+// TestReadAccountsDistinctBytes: the gateway read path advances
+// lith_distinct_bytes_read the same as the FUSE path, so a shared gateway's
+// amplification (s3_bytes / distinct_bytes) is computable from its own metrics
+// endpoint (#253). Before the fix the counter stayed 0 in serve nfs mode, so the
+// ratio reported a *perfect* result for an unmeasured gateway.
+func TestReadAccountsDistinctBytes(t *testing.T) {
+	data := make([]byte, 4<<20)
+	for i := range data {
+		data[i] = byte(i / 4096)
+	}
+	met := metrics.New()
+	h, _ := buildGateway(t, map[string][]byte{"big.bin": data}, met)
+
+	f, err := h.fs.Open("big.bin")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, len(data))
+	for got := 0; got < len(buf); {
+		n, err := f.ReadAt(buf[got:], int64(got))
+		got += n
+		if err != nil {
+			break
+		}
+	}
+	// A whole-file read touches every byte exactly once (64 KiB extent
+	// granularity divides a 4 MiB object evenly).
+	if d := met.DistinctBytesRead(); d != int64(len(data)) {
+		t.Errorf("DistinctBytesRead = %d, want %d", d, len(data))
+	}
+	// Re-reading the same bytes adds no distinct bytes (dedup by offset).
+	for got := 0; got < len(buf); {
+		n, err := f.ReadAt(buf[got:], int64(got))
+		got += n
+		if err != nil {
+			break
+		}
+	}
+	if d := met.DistinctBytesRead(); d != int64(len(data)) {
+		t.Errorf("DistinctBytesRead after re-read = %d, want %d (a re-read is not new distinct bytes)", d, len(data))
 	}
 }
 

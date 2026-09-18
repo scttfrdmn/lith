@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lith_distinct_bytes_read` now advances in `serve nfs` mode**
+  ([#253](https://github.com/scttfrdmn/lith/issues/253)). The gateway read path
+  never called `MarkDistinctRead`, so the counter stayed 0 — and because it was
+  present-and-zero, the gateway amplification ratio `s3_bytes / distinct_bytes`
+  read as a *perfect* result for an unmeasured gateway rather than failing
+  visibly. The NFS read path now accounts distinct object bytes the same way the
+  FUSE path does, so gateway amplification is computable from the gateway's own
+  metrics endpoint (the counter [#250](https://github.com/scttfrdmn/lith/issues/250)
+  needs).
+
 ## [1.1.2] - 2026-09-17
 
 The concurrency fix from the GCHP project's shared-gateway test
