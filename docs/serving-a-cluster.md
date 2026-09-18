@@ -68,9 +68,12 @@ The cause was an upstream `go-nfs-client` bug: a variable-length handle was read
 with a single `Read` that ignored short reads, so a handle straddling a
 buffer/segment boundary under load decoded with a zeroed tail and was rejected as
 STALE. Bytes were never wrong — a staled read simply failed rather than returning
-bad data. **Fixed** by bumping `go-nfs-client` to the `io.ReadFull` version, and
-validated at 96 concurrent `O_DIRECT` readers (11,530 GETATTRs, **zero STALE**)
-where the pre-fix build failed ~15%.
+bad data. **Fixed** by bumping `go-nfs-client` to the `io.ReadFull` version (v1.1.2).
+Validated where it matters: a **96-rank GCHP MPI job across two nodes completed
+144/144 timesteps against one shared gateway with zero STALE** (where v1.1.1
+aborted 4 s in), and a standalone `O_DIRECT` ladder that failed 6.6–21.2% at
+48–128 concurrent readers on v1.1.1 ran **0 failures across 7,360 reads** on
+v1.1.2.
 
 So choosing the gateway vs per-node mounts is now purely the funnel decision
 above, not a concurrency limit: use the gateway when many nodes read a *shared*
