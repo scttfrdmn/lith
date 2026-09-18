@@ -56,6 +56,54 @@ func newStore(t *testing.T, srv *fake.Server, cfg Config) *BlockStore {
 	return bs
 }
 
+// TestConcurrentReadersSharedSetFetchedOnce models the shared NFS gateway
+// (#250): N clients (distinct NFS connections) reading the *same* working set
+// concurrently must fetch it from S3 exactly once, not N times. One shared
+// gateway is one block store, and claim() single-flights every chunk across all
+// callers — a second caller either hits the memory tier or joins the in-flight
+// fetch, and complete() merges into the tier before clearing the in-flight entry
+// (no window where a chunk is neither cached nor in-flight). So the bytes the
+// gateway pulls equal the distinct set regardless of reader count. This is why a
+// shared gateway serving M nodes reads a shared dataset once; any measured excess
+// over the distinct set (e.g. a two-node run fetching >1× a single node) is
+// larger distinct data across more ranks, not a dedup failure.
+func TestConcurrentReadersSharedSetFetchedOnce(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	// Keep every reader's fetch overlapping in flight so this exercises the
+	// single-flight *join* path, not a serialized cache-then-hit.
+	srv.StreamChunkDelay = 5 * time.Millisecond
+	srv.StreamChunkBytes = mib
+	k := keyFor(t, srv, "obj")
+	size := int64(8) * mib
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MaxRange: 8 << 20})
+
+	const readers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Every reader wants the whole object — the shared working set.
+			if _, err := bs.GetRange(context.Background(), k, 0, size, size); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	// The invariant that answers #250: bytes fetched == distinct bytes, however
+	// many readers raced for them. No chunk is fetched twice.
+	if srv.GetBytes != size {
+		t.Errorf("%d concurrent readers of the same object fetched %d bytes, want %d (the set, fetched once)",
+			readers, srv.GetBytes, size)
+	}
+}
+
 // TestInFlightJoinOneGET: prefetching chunks 0–31 as one run, then demand reads
 // of chunks 3, 7, 12 issues exactly one GET total (#35).
 func TestInFlightJoinOneGET(t *testing.T) {
