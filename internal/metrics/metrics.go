@@ -33,6 +33,8 @@ type Metrics struct {
 	fuseLatency   *prometheus.HistogramVec // op
 	prefetchWait  prometheus.Histogram
 	pfHalved      prometheus.Counter
+	pfEvClamped   *prometheus.CounterVec // evidence-gate clamps by object size class (#256)
+	pfEvWithheld  prometheus.Counter     // blocks withheld by those clamps (#256)
 	pfResetRand   prometheus.Counter
 	pfEvictUnread prometheus.Counter
 	sibPrefetch   prometheus.Counter
@@ -111,6 +113,14 @@ func New() *Metrics {
 		}),
 		pfHalved: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_window_halved_total", Help: "Readahead-window halvings from an out-of-band seek.",
+		}),
+		pfEvClamped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_prefetch_evidence_clamped_total",
+			Help: "Times the #256 evidence gate held a readahead window below the configured max, by object size class. Zero unless --readahead-evidence-ratio is set.",
+		}, []string{"size_class"}),
+		pfEvWithheld: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_evidence_withheld_blocks_total",
+			Help: "Readahead blocks the #256 evidence gate withheld (window the detector wanted minus the window consumption earned).",
 		}),
 		pfResetRand: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_reset_random_total", Help: "Prefetch detector collapses to random (two seeks, no progress between).",
@@ -195,7 +205,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -304,6 +314,21 @@ func (m *Metrics) PrefetchSeeks(halvings, resets int64) {
 	}
 	if resets > 0 {
 		m.pfResetRand.Add(float64(resets))
+	}
+}
+
+// PrefetchEvidenceClamped records a handle's evidence-gate activity at Release
+// (#256): how many times the gate held the window below the configured max, the
+// blocks that withheld, and the size class of the object it happened on. The size
+// class is the label because the question a reporter cannot otherwise answer is
+// whether the gate fires on the large files or the small ones. Nil-safe.
+func (m *Metrics) PrefetchEvidenceClamped(sizeClass string, clamps, withheldBlocks int64) {
+	if m == nil || clamps <= 0 {
+		return
+	}
+	m.pfEvClamped.WithLabelValues(sizeClass).Add(float64(clamps))
+	if withheldBlocks > 0 {
+		m.pfEvWithheld.Add(float64(withheldBlocks))
 	}
 }
 

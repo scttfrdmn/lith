@@ -96,6 +96,29 @@ type Prefetcher struct {
 	// collapses (a stream that becomes a walk), inheriting the #221 transition.
 	established bool
 
+	// Evidence gate (#256): the window a handle may commit is bounded by what it
+	// has actually consumed, so the size of the bet is proportional to the demand
+	// demonstrated for it. The detector advances in block space, so sub-block reads
+	// are d==0 no-ops and a handle establishes at its first *block crossing* — one
+	// block (8 MiB) of contiguous evidence. Without this gate that buys the full
+	// NIC-derived window, which at 50 Gbps is ~223 blocks / ~1.8 GB: a 223x
+	// overcommit on the evidence presented. On a
+	// scattered-but-locally-contiguous hyperslab (GCHP/HEMCO: tile a slab, jump to
+	// the next variable) the bet is re-placed at every re-establishment and ~86%
+	// of it is never read. Measured there: five flag settings move the *volume* of
+	// bad prefetch almost linearly and the hit rate not at all (16.1% -> 13.3%),
+	// so precision is a property of the decision, not of the window size.
+	//
+	// evidenceRatio <= 0 disables the gate (behaviour-preserving default).
+	// `consumed` is cumulative bytes read, the simplest monotone measure of
+	// demonstrated demand; a re-reader inflates it without demonstrating forward
+	// demand, which is acceptable for a bounded, opt-in experiment.
+	evidenceRatio float64
+	evidenceBlock int64 // block size in bytes, to convert the byte bound to blocks
+	consumed      int64 // cumulative bytes this handle has read
+	evidenceHeld  int64 // times the gate held the window below maxReadahead
+	evidenceCut   int64 // cumulative blocks withheld by those holds
+
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
@@ -143,6 +166,50 @@ func (p *Prefetcher) SetCoverage(window int, minRatio float64) {
 
 // LowCoverage reports how many reads the coverage gate forced Random (#221).
 func (p *Prefetcher) LowCoverage() int64 { return p.lowCoverage }
+
+// SetEvidence enables the #256 evidence gate: a committed readahead window may
+// not exceed `ratio` times the bytes this handle has actually read. ratio <= 0 or
+// blockSize <= 0 disables it. A sequential copy consumes fast and so earns the
+// full window within a few reads (preserving #56, which is why establishment
+// jumps straight to the full window); a reader that tiles a slab and jumps never
+// consumes enough to earn it.
+func (p *Prefetcher) SetEvidence(ratio float64, blockSize int64) {
+	if ratio <= 0 || blockSize <= 0 {
+		ratio, blockSize = 0, 0
+	}
+	p.evidenceRatio = ratio
+	p.evidenceBlock = blockSize
+}
+
+// EvidenceHeld reports how many times the evidence gate held a window below the
+// configured maximum (#256). Zero when the gate is disabled.
+func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
+
+// EvidenceWithheld reports the cumulative blocks the gate withheld across those
+// holds (#256) — the difference between the window the handle would have been
+// given and the one its consumption earned. Nothing in the metrics otherwise
+// distinguishes a window the gate refused from one the detector never wanted.
+func (p *Prefetcher) EvidenceWithheld() int64 { return p.evidenceCut }
+
+// windowCap is the largest window, in blocks, this handle's demonstrated
+// consumption justifies. It is maxReadahead when the gate is off, and never
+// below initialWindow — a handle that has proved contiguous progress always gets
+// the minimum dispatch, so the gate narrows bets rather than disabling readahead.
+func (p *Prefetcher) windowCap() int64 {
+	if p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
+		return p.maxReadahead
+	}
+	earned := int64(float64(p.consumed)*p.evidenceRatio) / p.evidenceBlock
+	if earned < initialWindow {
+		earned = initialWindow
+	}
+	if earned >= p.maxReadahead {
+		return p.maxReadahead
+	}
+	p.evidenceHeld++
+	p.evidenceCut += p.maxReadahead - earned
+	return earned
+}
 
 // recordRead pushes a read's byte range into the trailing ring and returns the
 // coverage ratio (union of ranges / total span) over the window. Returns 1.0
@@ -279,6 +346,11 @@ func (p *Prefetcher) Open() []int64 {
 // reorder (gap ≪ block) are unaffected; seqGapMax defaults to "off" (MaxInt64)
 // so a caller that does not set it keeps the pre-1b behavior.
 func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
+	// Demonstrated demand, accumulated before any gate so it is unaffected by
+	// whether the coverage gate is enabled (#256).
+	if length > 0 {
+		p.consumed += length
+	}
 	cov := p.recordRead(off, length)
 	if !p.haveLast {
 		p.haveLast = true
@@ -335,7 +407,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 			return nil
 		}
 		if p.state == Sequential {
-			p.window = min(p.window*2, p.maxReadahead)
+			p.window = min(p.window*2, p.windowCap())
 		} else {
 			// #229: on establishment jump straight to the full window rather than
 			// re-ramping from 2. A genuine stream/copy pays only the first ~2 precise
@@ -346,7 +418,9 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 			// dispatched at most once per established run.
 			p.state = Sequential
 			if p.covMin > 0 {
-				p.window = p.maxReadahead
+				// #256: bounded by demonstrated consumption. With the evidence gate
+				// off this is maxReadahead, i.e. the #229 jump, unchanged.
+				p.window = p.windowCap()
 			} else {
 				p.window = initialWindow // gate off: pre-#229 geometric ramp
 			}
