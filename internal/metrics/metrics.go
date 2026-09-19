@@ -91,7 +91,7 @@ func New() *Metrics {
 			Name: "lith_prefetch_issued_total", Help: "Chunks prefetched (1 MiB cache chunks, not blocks -- one record per chunk dispatched).",
 		}),
 		prefetchHit: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "lith_prefetch_used_total", Help: "Prefetched chunks later read on demand (same 1 MiB unit as lith_prefetch_issued_total).",
+			Name: "lith_prefetch_used_total", Help: "Prefetched chunks TOUCHED by a later demand read (same 1 MiB unit as lith_prefetch_issued_total). A CHUNK-TOUCH count, not a byte count: a 64 KiB read marks the whole 1 MiB chunk used, so used/issued OVERSTATES byte follow-through, and overstates it most for the scattered readers where prefetch is least useful. Measured case: 89% by this ratio against at most ~25% of the prefetched bytes actually read. Do not read it as a byte efficiency (#256).",
 		}),
 		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",
