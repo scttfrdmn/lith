@@ -85,10 +85,10 @@ func New() *Metrics {
 			Name: "lith_s3_inflight", Help: "In-flight S3 requests.",
 		}),
 		prefetchIss: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "lith_prefetch_issued_total", Help: "Blocks prefetched.",
+			Name: "lith_prefetch_issued_total", Help: "Chunks prefetched (1 MiB cache chunks, not blocks -- one record per chunk dispatched).",
 		}),
 		prefetchHit: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "lith_prefetch_used_total", Help: "Prefetched blocks later read on demand.",
+			Name: "lith_prefetch_used_total", Help: "Prefetched chunks later read on demand (same 1 MiB unit as lith_prefetch_issued_total).",
 		}),
 		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",

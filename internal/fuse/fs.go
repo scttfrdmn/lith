@@ -39,7 +39,7 @@ type Config struct {
 	UID          uint32
 	GID          uint32
 	SmallFile    int64 // whole-file prefetch threshold in bytes
-	PartsMax     int64 // largest file fetched whole as parallel parts on first read (#69); 0 falls back to SmallFile
+	PartsMax     int64 // largest file fetched whole as parallel parts once its reads tile (#69/#229); 0 falls back to SmallFile
 	MaxReadahead int64 // max sequential readahead window in blocks
 	// BgzfWholeFileMax is the largest bgzf data file (with an index sibling)
 	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
@@ -596,9 +596,9 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 
 	// Dispatch the initial readahead window at open so the frontier leads from
 	// the start (#38) — but only for files larger than the parts threshold. A
-	// file at or below it is fetched whole as parallel parts on first read (#69),
-	// which already covers every block, so per-handle readahead is both redundant
-	// and a source of contention: the window and the parts fetch would each issue
+	// file at or below it is fetched whole as parallel parts once its reads tile
+	// (#69/#229), which already covers every block, so per-handle readahead is both
+	// redundant and a source of contention: the window and the parts fetch would each issue
 	// a Prefetch for the same low blocks. That contention is *correct* — the chunk
 	// singleflight (session 3) makes concurrent claims for one chunk join a single
 	// fetch and never double-read it — but an unlucky interleave can split a
@@ -948,8 +948,9 @@ func dirOf(rel string) string {
 	return ""
 }
 
-// partsThreshold is the largest file eagerly fetched whole on first read: the
-// #69 parts threshold when set, else the legacy small-file threshold.
+// partsThreshold is the largest file fetched whole as parallel parts once the
+// handle establishes (#229 -- not at open): the #69 parts threshold when set,
+// else the legacy small-file threshold.
 func (f *rawFS) partsThreshold() int64 {
 	if f.cfg.PartsMax > 0 {
 		return f.cfg.PartsMax
