@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cmd/lith-pfreplay`: replay a `--pf-trace` and score per-handle byte
+  follow-through offline** ([#256](https://github.com/scttfrdmn/lith/issues/256)).
+  Four hypotheses for #256 each cost a ~35-minute 48-rank cluster job to refute.
+  This replays a trace through the real `internal/prefetch` detector, recovers the
+  blocks it dispatched, and scores what fraction of those **bytes** the same handle
+  later read — so a candidate policy costs a replay instead of a run. Not a shipped
+  binary (goreleaser builds only `./cmd/lith`).
+
+  It reports **replay fidelity first**: if the replayed dispatch counts disagree
+  with what the live mount recorded, it says so and every number after it is void.
+  The scoring rule is the one agreed and pre-registered with the reporting workload
+  before either side had data — bytes not chunk touches, Spearman |ρ| ≥ 0.5 fit on
+  one arm and tested on another, no-separation iff |ρ| < 0.5 **and** rank-sum
+  AUC < 0.7 — so it cannot be tuned to the answer. It also counts the #256
+  cold-start granularity tax directly from the trace.
+
 - **`--pf-trace`: the access-pattern detector's decisions, recorded and replayable**
   ([#262](https://github.com/scttfrdmn/lith/issues/262)). The trace behind
   `LITH_PF_TRACE` has existed for a while but could not answer what it was needed
