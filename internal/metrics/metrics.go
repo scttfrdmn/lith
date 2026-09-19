@@ -35,6 +35,7 @@ type Metrics struct {
 	pfHalved      prometheus.Counter
 	pfEvClamped   *prometheus.CounterVec // evidence-gate clamps by object size class (#256)
 	pfEvWithheld  prometheus.Counter     // blocks withheld by those clamps (#256)
+	pfDeEstab     *prometheus.CounterVec // establishments lost, by object size class (#256)
 	pfResetRand   prometheus.Counter
 	pfEvictUnread prometheus.Counter
 	sibPrefetch   prometheus.Counter
@@ -122,6 +123,10 @@ func New() *Metrics {
 			Name: "lith_prefetch_evidence_withheld_blocks_total",
 			Help: "Readahead blocks the #256 evidence gate withheld (window the detector wanted minus the window consumption earned).",
 		}),
+		pfDeEstab: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_prefetch_deestablished_total",
+			Help: "Times a handle lost an establishment it had, by object size class (#256). NOT the same as lith_prefetch_reset_random_total, which counts collapses to the Random state and is 20-30x larger; a high value here tracks a reader whose prefetch works (frequent productive re-anchoring), not a wasteful one.",
+		}, []string{"size_class"}),
 		pfResetRand: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_reset_random_total", Help: "Prefetch detector collapses to random (two seeks, no progress between).",
 		}),
@@ -205,7 +210,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -323,12 +328,33 @@ func (m *Metrics) PrefetchSeeks(halvings, resets int64) {
 // class is the label because the question a reporter cannot otherwise answer is
 // whether the gate fires on the large files or the small ones. Nil-safe.
 func (m *Metrics) PrefetchEvidenceClamped(sizeClass string, clamps, withheldBlocks int64) {
-	if m == nil || clamps <= 0 {
+	if m == nil {
 		return
 	}
-	m.pfEvClamped.WithLabelValues(sizeClass).Add(float64(clamps))
+	// Touch the child even at zero so the series EXISTS once a mount has served a
+	// read. A labelled counter that only appears when it fires is indistinguishable
+	// in a scrape from "the binary lacks the feature", "a different label value" or
+	// "the mount was never opened" — the same present-and-zero-versus-absent trap as
+	// #253, reported from the field for exactly this metric.
+	c := m.pfEvClamped.WithLabelValues(sizeClass)
+	if clamps > 0 {
+		c.Add(float64(clamps))
+	}
 	if withheldBlocks > 0 {
 		m.pfEvWithheld.Add(float64(withheldBlocks))
+	}
+}
+
+// PrefetchDeEstablished records how many times a handle lost an establishment it
+// had, by object size class (#256, called once per handle at Release). The series
+// is emitted at zero once a mount has served a read. Nil-safe.
+func (m *Metrics) PrefetchDeEstablished(sizeClass string, n int64) {
+	if m == nil {
+		return
+	}
+	c := m.pfDeEstab.WithLabelValues(sizeClass)
+	if n > 0 {
+		c.Add(float64(n))
 	}
 }
 
