@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **fails the release** when the section is missing, and **asserts the published
   body is non-empty** afterwards. The five affected releases were backfilled from
   this file, so every published release now carries its notes.
+- **Two stale instrumentation strings that misled a bug reporter**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). `--parts-max`'s help still
+  said files are fetched whole **"on first read"**, which has been untrue since
+  [#229](https://github.com/scttfrdmn/lith/issues/229) gated the parts fetch on the
+  handle's reads proving they tile — it reads as contradicting the documented
+  behaviour, and cost a reporter a round trip to resolve. And
+  `lith_prefetch_issued_total`/`_used_total` described themselves as counting
+  **blocks** when they are recorded per **1 MiB chunk**, so a reader converting the
+  counter to bytes had to guess the unit. Both corrected; no behaviour change.
 
 ## [1.1.3] - 2026-09-17
 
