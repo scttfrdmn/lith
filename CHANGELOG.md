@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--pf-trace`: the access-pattern detector's decisions, recorded and replayable**
+  ([#262](https://github.com/scttfrdmn/lith/issues/262)). The trace behind
+  `LITH_PF_TRACE` has existed for a while but could not answer what it was needed
+  for, because rows carried the object key and **not the file handle** — lith builds
+  one prefetcher per `open`, so the handle is the unit that makes decisions, and
+  concurrent handles on one object interleaved indistinguishably (dozens of them
+  under a many-rank job through one daemon). Rows now carry `fh` and `pid`.
+
+  It was also a **silently biased sample**: reads served while a whole-file parts
+  fetch was in flight, or by a footer handle's byte-exact plan, were dropped with no
+  marker — and those are a large, non-random share of the bytes wherever
+  [#229](https://github.com/scttfrdmn/lith/issues/229) whole-fetches large objects.
+  A test case here drops **72%** of its reads under the old behaviour. Every read is
+  now recorded with a `path` column (`window` / `parts` / `footer`) saying which
+  path served it.
+
+  Rows gained `window` and `dispatched`, and the file gained a `#` header line
+  recording the config that produced it (block size, max-readahead, parts-max,
+  small-file, coverage gate, evidence ratio), so a trace is self-describing,
+  comparable across runs, and an offline replay can be **validated for fidelity**
+  before its verdict on a new policy is trusted. A failed trace-file create is now
+  logged instead of silently yielding an empty trace and a successful-looking run.
+  Documented in `docs/knobs.md`, with its cost stated: unbounded, and serialized
+  under one mutex, so it adds a global lock to every read — characterization, not
+  production.
+
+
 - **`--readahead-evidence-ratio`, experimental and off by default**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)). Bounds a committed
   readahead window to a multiple of the bytes a handle has actually read. A handle

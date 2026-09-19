@@ -43,6 +43,7 @@ type mountFlags struct {
 	prefetchBudget    string
 	maxReadahead      int64
 	readaheadEvidence float64
+	pfTrace           string
 	nicGbps           float64
 	siblingWindow     int
 	siblingRead       int
@@ -99,6 +100,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
 	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "EXPERIMENTAL (#256): bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (~223 blocks at 50 Gbps). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that tiles a slab and jumps never earns it. 0 disables (default)")
+	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex, so it adds a global lock to every read: for characterization, not production")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")

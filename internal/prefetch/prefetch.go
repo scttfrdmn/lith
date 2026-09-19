@@ -150,6 +150,12 @@ func (p *Prefetcher) Halvings() int64 { return p.halvings }
 // Resets reports how many times the detector collapsed to Random.
 func (p *Prefetcher) Resets() int64 { return p.resetRandom }
 
+// Window reports the readahead window currently in force, in blocks. Exposed so a
+// trace can record the window at each decision, which is what lets an offline
+// replay be validated for fidelity before its verdict on a new policy is trusted
+// (#262).
+func (p *Prefetcher) Window() int64 { return p.window }
+
 // PeakWindow reports the largest readahead window this handle ever reached.
 func (p *Prefetcher) PeakWindow() int64 { return p.peakWindow }
 
