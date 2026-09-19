@@ -24,7 +24,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64, reEstablishMax int64) *pfWrapper {
 	pf := prefetch.New(maxReadahead)
 	// A read landing more than one block past the previous is a seek, not
 	// sequential progress, however in-band it looks (#210/M16 1b).
@@ -37,6 +37,9 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapp
 	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
 	// default; ratio <= 0 is a no-op.
 	pf.SetEvidence(evidenceRatio, blockSize)
+	// Stop re-arming a handle that keeps losing establishment: the bet, not its
+	// size, is what is wrong on an unpredictable reader (#256).
+	pf.SetReEstablishMax(reEstablishMax)
 	return &pfWrapper{pf: pf}
 }
 
@@ -81,6 +84,12 @@ func (w *pfWrapper) halvings() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.pf.Halvings()
+}
+
+func (w *pfWrapper) reEstablish() (deEstablished, suppressed int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.DeEstablished(), w.pf.Suppressed()
 }
 
 func (w *pfWrapper) evidence() (held, withheld int64) {

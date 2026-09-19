@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--max-readahead`, and **not** an answer to #256's precision question, which
   stays open. Off by default; with the flag unset the read path is unchanged
   (reproduced to 0.5% on the cluster).
+- **`--readahead-reestablish-max`, experimental and off by default**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). After a handle has lost
+  establishment this many times, it stops re-establishing: contiguous progress is
+  still recognized and reads are still served, but no further readahead is
+  committed. The reporting workload oscillates *establish → commit a window → jump
+  → de-establish → coverage recovers → re-establish* ~320 times per run
+  (`prefetch_reset_random_total` 307–332 on the HEMCO mount against 113 on met),
+  and the detector notices every time and then forgets, because a history of failed
+  predictions costs nothing.
+
+  Unlike `--readahead-evidence-ratio` this governs **whether to bet at all** rather
+  than how much — the axis the measurements implicate, since five different window
+  settings moved the volume of bad prefetch and left the hit rate unchanged. **A
+  sequential copy never loses establishment, so the cap is unreachable for it by
+  construction:** no ramp and no cold-start cost, which is why this shape is safer
+  for [#56](https://github.com/scttfrdmn/lith/issues/56) than bounding the window,
+  and it can only ever suppress fetches, so
+  [#229](https://github.com/scttfrdmn/lith/issues/229) is safe too. Whether it
+  actually improves prefetch precision is **unmeasured** — that is what the flag
+  exists to find out, and three previous hypotheses for this issue were refuted by
+  measurement. Ships with `lith_prefetch_deestablished_total` and
+  `lith_prefetch_reestablish_suppressed_total`, both labelled by object size class.
 - **`lith_prefetch_evidence_clamped_total{size_class}` and
   `lith_prefetch_evidence_withheld_blocks_total`** make the gate's action
   observable. Without them the only visible effect was that `prefetch_issued`

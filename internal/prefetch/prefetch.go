@@ -119,6 +119,24 @@ type Prefetcher struct {
 	evidenceHeld  int64 // times the gate held the window below maxReadahead
 	evidenceCut   int64 // cumulative blocks withheld by those holds
 
+	// Re-establishment cap (#256): a handle that keeps losing establishment is a
+	// reader whose forward reads are not predictable, and re-arming it costs a
+	// fresh window every time. The reporting workload oscillates
+	// establish -> commit -> jump -> de-establish -> coverage recovers ->
+	// re-establish ~320 times per run (prefetch_reset_random_total 307-332 on the
+	// HEMCO mount vs 113 on met), and the detector notices every time and then
+	// forgets, because a history of failed predictions costs nothing.
+	//
+	// Once a handle has lost establishment reEstablishMax times it stops
+	// re-establishing: contiguous progress is still recognized and reads are still
+	// served, but no further broad fetch is committed. This targets *whether to
+	// bet at all* rather than *how much to bet* — the axis the measured hit-rate
+	// invariance says is the live one (five window settings moved the volume of bad
+	// prefetch and not the hit rate). 0 disables (behaviour-preserving default).
+	reEstablishMax int64
+	deEstablished  int64 // times this handle lost an establishment it had
+	suppressed     int64 // contiguous reads that would have (re-)established but did not
+
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
@@ -190,6 +208,36 @@ func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
 // given and the one its consumption earned. Nothing in the metrics otherwise
 // distinguishes a window the gate refused from one the detector never wanted.
 func (p *Prefetcher) EvidenceWithheld() int64 { return p.evidenceCut }
+
+// SetReEstablishMax enables the #256 re-establishment cap: after losing
+// establishment this many times, a handle stops re-establishing and commits no
+// further broad fetch. n <= 0 disables it. A sequential copy never loses
+// establishment, so it is never affected — the cap is safe for #56 by
+// construction, and can only ever suppress fetches, so it is safe for #229 too.
+func (p *Prefetcher) SetReEstablishMax(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	p.reEstablishMax = n
+}
+
+// DeEstablished reports how many times this handle lost an establishment it had
+// (#256) — the oscillation count the cap acts on.
+func (p *Prefetcher) DeEstablished() int64 { return p.deEstablished }
+
+// Suppressed reports how many contiguous reads would have (re-)established this
+// handle but were refused by the cap (#256). Zero when the cap is disabled.
+func (p *Prefetcher) Suppressed() int64 { return p.suppressed }
+
+// deEstablish drops establishment, counting the transition only when there was an
+// establishment to lose, so the count measures oscillation rather than the number
+// of scattered reads.
+func (p *Prefetcher) deEstablish() {
+	if p.established {
+		p.deEstablished++
+	}
+	p.established = false
+}
 
 // windowCap is the largest window, in blocks, this handle's demonstrated
 // consumption justifies. It is maxReadahead when the gate is off, and never
@@ -398,6 +446,18 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// is dispatched — and a contiguous read whose window is still full of an
 		// earlier scattered walk de-establishes rather than ramping.
 		if !p.coverageOK(cov) {
+			p.deEstablish()
+			if p.state == Sequential {
+				p.state = Cold
+			}
+			p.window = 0
+			p.frontier = p.cursor + 1
+			return nil
+		}
+		// #256: an oscillating handle has demonstrated that its forward reads are
+		// not predictable. Recognize the progress, commit nothing.
+		if p.reEstablishMax > 0 && p.deEstablished >= p.reEstablishMax {
+			p.suppressed++
 			p.established = false
 			if p.state == Sequential {
 				p.state = Cold
@@ -451,7 +511,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		}
 		p.lowCoverage++
 		p.state = Random
-		p.established = false // #229: a scattered landing de-establishes the handle
+		p.deEstablish() // #229: a scattered landing de-establishes the handle
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx
@@ -462,7 +522,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// A second unexplained jump with no sequential progress between: stop
 		// prefetching until a sequential run resumes.
 		p.state = Random
-		p.established = false
+		p.deEstablish()
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx

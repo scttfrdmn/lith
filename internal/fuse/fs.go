@@ -44,6 +44,9 @@ type Config struct {
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
+	// ReadaheadReEstablishMax stops a handle re-establishing after it has lost
+	// establishment this many times (#256). 0 disables (default).
+	ReadaheadReEstablishMax int64
 	// BgzfWholeFileMax is the largest bgzf data file (with an index sibling)
 	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
 	// 0 uses the default of 512 MiB.
@@ -562,7 +565,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio),
+		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.cfg.ReadaheadReEstablishMax),
 	}
 	f.mu.Lock()
 	fh := f.nextFh
@@ -1010,6 +1013,12 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		// whether the gate fires on the large objects or the small ones.
 		if held, withheld := h.pf.evidence(); held > 0 {
 			f.met.PrefetchEvidenceClamped(sizeClass(h.size), held, withheld)
+		}
+		// #256: ship the cap's observability with the cap. Last time the only visible
+		// effect of a new suppression was that `issued` fell, and the reporter had to
+		// infer the rest; oscillations and refusals are both counted here.
+		if deEst, supp := h.pf.reEstablish(); deEst > 0 || supp > 0 {
+			f.met.PrefetchReEstablish(sizeClass(h.size), deEst, supp)
 		}
 	}
 }

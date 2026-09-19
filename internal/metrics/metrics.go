@@ -35,6 +35,8 @@ type Metrics struct {
 	pfHalved      prometheus.Counter
 	pfEvClamped   *prometheus.CounterVec // evidence-gate clamps by object size class (#256)
 	pfEvWithheld  prometheus.Counter     // blocks withheld by those clamps (#256)
+	pfDeEstab     *prometheus.CounterVec // establishments lost, by object size class (#256)
+	pfReEstSupp   *prometheus.CounterVec // re-establishments refused by the cap (#256)
 	pfResetRand   prometheus.Counter
 	pfEvictUnread prometheus.Counter
 	sibPrefetch   prometheus.Counter
@@ -122,6 +124,14 @@ func New() *Metrics {
 			Name: "lith_prefetch_evidence_withheld_blocks_total",
 			Help: "Readahead blocks the #256 evidence gate withheld (window the detector wanted minus the window consumption earned).",
 		}),
+		pfDeEstab: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_prefetch_deestablished_total",
+			Help: "Times a handle lost an establishment it had (the oscillation the #256 re-establish cap acts on), by object size class.",
+		}, []string{"size_class"}),
+		pfReEstSupp: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "lith_prefetch_reestablish_suppressed_total",
+			Help: "Contiguous reads that would have re-established a handle but were refused by --readahead-reestablish-max (#256), by object size class.",
+		}, []string{"size_class"}),
 		pfResetRand: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_reset_random_total", Help: "Prefetch detector collapses to random (two seeks, no progress between).",
 		}),
@@ -205,7 +215,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfReEstSupp, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -329,6 +339,21 @@ func (m *Metrics) PrefetchEvidenceClamped(sizeClass string, clamps, withheldBloc
 	m.pfEvClamped.WithLabelValues(sizeClass).Add(float64(clamps))
 	if withheldBlocks > 0 {
 		m.pfEvWithheld.Add(float64(withheldBlocks))
+	}
+}
+
+// PrefetchReEstablish records a handle's oscillation and how often the #256
+// re-establish cap refused to re-arm it, labelled by object size class (called
+// once per handle at Release). Nil-safe.
+func (m *Metrics) PrefetchReEstablish(sizeClass string, deEstablished, suppressed int64) {
+	if m == nil {
+		return
+	}
+	if deEstablished > 0 {
+		m.pfDeEstab.WithLabelValues(sizeClass).Add(float64(deEstablished))
+	}
+	if suppressed > 0 {
+		m.pfReEstSupp.WithLabelValues(sizeClass).Add(float64(suppressed))
 	}
 }
 
