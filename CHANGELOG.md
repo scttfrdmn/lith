@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the small ones.
 
 ### Fixed
+
+- **`--pf-trace` was accepted, documented, and silently ignored**
+  ([#264](https://github.com/scttfrdmn/lith/issues/264)). The flag bound a field
+  that never reached `fuse.Config`, so it produced no trace, no error, and exit 0 —
+  and the docs guard passed because the flag *was* documented. Now wired, with a
+  new guard (`TestEveryFlagBindingIsConsumed`) that walks the AST for flag
+  registrations and fails when a bound field is never read anywhere else in the
+  package. It catches exactly this: reverting the one-line fix makes it name
+  `--pf-trace`.
 - **Labelled prefetch counters now emit their series at zero**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)).
   `lith_prefetch_evidence_clamped_total` was only created when it fired, so at zero
