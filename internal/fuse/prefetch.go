@@ -83,6 +83,12 @@ func (w *pfWrapper) halvings() int64 {
 	return w.pf.Halvings()
 }
 
+func (w *pfWrapper) evidence() (held, withheld int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.EvidenceHeld(), w.pf.EvidenceWithheld()
+}
+
 func (w *pfWrapper) peakWindow() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

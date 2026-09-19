@@ -11,18 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`--readahead-evidence-ratio`, experimental and off by default**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)). Bounds a committed
-  readahead window to a multiple of the bytes a handle has actually read, so the
-  size of the bet is proportional to the demand demonstrated for it. A handle
+  readahead window to a multiple of the bytes a handle has actually read. A handle
   establishes at its first **block crossing** — one block (8 MiB) of contiguous
   evidence — and today that buys the full NIC-derived window, ~223 blocks
-  (~1.8 GB) on a 50 Gbps node. A reader that tiles a slab and jumps to the next
-  variable re-places that bet at every re-establishment and never reads most of
-  it: measured at **13–16% of prefetch used** on a GCHP HEMCO mount against
-  **80%** on the met mount in the same job, and no flag setting moved that hit
-  rate. Off by default because the narrower early window is exactly what
-  [#56](https://github.com/scttfrdmn/lith/issues/56) added the jump-to-full-window
-  to avoid; the trade is being measured on the reporting workload before any
-  default changes.
+  (~1.8 GB) on a 50 Gbps node. With a ratio of `k` a handle prefetches ~`k`× what
+  it has read, so a sequential copy still earns the full window (once it has
+  consumed `max-readahead × block-size ÷ k`) while a reader that tiles a slab and
+  jumps does not.
+
+  **What it does and does not do, measured on the reporting workload** (GCHP
+  fullchem, 48 ranks, PR binary with the flag unset as the control): it cuts
+  amplification **2.425× → 1.956×** at `k=8`, which is within 1.5% of what pinning
+  `--max-readahead 1` achieves (1.925×) — but it gets there *without* pinning a
+  global window, so a sequential reader can still earn the full one. It does
+  **not** improve prefetch precision: the hit rate went **16.7% → 14.3%**, because
+  accrued evidence turns out to be uncorrelated with whether a prefetch is used.
+  So this is an ergonomics and safety improvement over telling operators to pin
+  `--max-readahead`, and **not** an answer to #256's precision question, which
+  stays open. Off by default; with the flag unset the read path is unchanged
+  (reproduced to 0.5% on the cluster).
+- **`lith_prefetch_evidence_clamped_total{size_class}` and
+  `lith_prefetch_evidence_withheld_blocks_total`** make the gate's action
+  observable. Without them the only visible effect was that `prefetch_issued`
+  fell, which cannot distinguish a window the gate refused from one the detector
+  never wanted — and cannot answer whether the gate fires on the large objects or
+  the small ones.
 
 ### Fixed
 

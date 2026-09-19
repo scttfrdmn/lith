@@ -117,6 +117,7 @@ type Prefetcher struct {
 	evidenceBlock int64 // block size in bytes, to convert the byte bound to blocks
 	consumed      int64 // cumulative bytes this handle has read
 	evidenceHeld  int64 // times the gate held the window below maxReadahead
+	evidenceCut   int64 // cumulative blocks withheld by those holds
 
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
@@ -184,6 +185,12 @@ func (p *Prefetcher) SetEvidence(ratio float64, blockSize int64) {
 // configured maximum (#256). Zero when the gate is disabled.
 func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
 
+// EvidenceWithheld reports the cumulative blocks the gate withheld across those
+// holds (#256) — the difference between the window the handle would have been
+// given and the one its consumption earned. Nothing in the metrics otherwise
+// distinguishes a window the gate refused from one the detector never wanted.
+func (p *Prefetcher) EvidenceWithheld() int64 { return p.evidenceCut }
+
 // windowCap is the largest window, in blocks, this handle's demonstrated
 // consumption justifies. It is maxReadahead when the gate is off, and never
 // below initialWindow — a handle that has proved contiguous progress always gets
@@ -200,6 +207,7 @@ func (p *Prefetcher) windowCap() int64 {
 		return p.maxReadahead
 	}
 	p.evidenceHeld++
+	p.evidenceCut += p.maxReadahead - earned
 	return earned
 }
 

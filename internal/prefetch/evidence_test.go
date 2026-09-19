@@ -59,6 +59,15 @@ func TestEvidence_TileThenJumpDoesNotEarnFullWindow(t *testing.T) {
 	if p.EvidenceHeld() == 0 {
 		t.Error("EvidenceHeld should record that the gate bound the window")
 	}
+	// The gate's action must be observable: `issued` falling cannot distinguish a
+	// window the gate refused from one the detector never wanted (#256 follow-up).
+	if got := p.EvidenceWithheld(); got <= 0 {
+		t.Errorf("EvidenceWithheld = %d, want > 0 blocks withheld", got)
+	}
+	if p.EvidenceWithheld() < p.EvidenceHeld() {
+		t.Errorf("withheld (%d) < holds (%d): each hold withholds at least one block",
+			p.EvidenceWithheld(), p.EvidenceHeld())
+	}
 
 	// Contrast, stated as fact rather than claim: the same access with the gate off
 	// takes the full #229 jump on the same evidence.

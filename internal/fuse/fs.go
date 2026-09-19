@@ -951,6 +951,23 @@ func dirOf(rel string) string {
 	return ""
 }
 
+// sizeClass buckets an object size for metric labels, at the boundaries the read
+// path actually decides on: --small-file's 4 MiB default, the 16 MiB minimum
+// expressible broad commit (initialWindow=2 at an 8 MiB block), and --parts-max's
+// 64 MiB clamp. Bounded cardinality by construction.
+func sizeClass(size int64) string {
+	switch {
+	case size <= 4<<20:
+		return "<=4MiB"
+	case size <= 16<<20:
+		return "4-16MiB"
+	case size <= 64<<20:
+		return "16-64MiB"
+	default:
+		return ">64MiB"
+	}
+}
+
 // partsThreshold is the largest file fetched whole as parallel parts once the
 // handle establishes (#229 -- not at open): the #69 parts threshold when set,
 // else the legacy small-file threshold.
@@ -987,6 +1004,13 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		halvings, resets := h.pf.halvings(), h.pf.resets()
 		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
 		f.met.PrefetchSeeks(halvings, resets)
+		// #256: make the evidence gate's action observable. Without this the only
+		// visible effect is that `issued` fell, which cannot distinguish a window
+		// the gate refused from one the detector never wanted — and cannot say
+		// whether the gate fires on the large objects or the small ones.
+		if held, withheld := h.pf.evidence(); held > 0 {
+			f.met.PrefetchEvidenceClamped(sizeClass(h.size), held, withheld)
+		}
 	}
 }
 
