@@ -44,6 +44,11 @@ type Config struct {
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
+	// PFTracePath, when set, writes one CSV row per read describing what the
+	// access-pattern detector saw and decided (#262). Diagnostic: unbounded, and
+	// serialized under one mutex, so it adds a global lock to every read. The
+	// LITH_PF_TRACE environment variable is the older spelling; this wins.
+	PFTracePath string
 	// BgzfWholeFileMax is the largest bgzf data file (with an index sibling)
 	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
 	// 0 uses the default of 512 MiB.
@@ -280,20 +285,54 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		f.sibPendingCap = 64
 	}
 	f.ix.Store(&liveIndex{r: cfg.Index})
-	if p := os.Getenv("LITH_PF_TRACE"); p != "" {
-		if tf, err := os.Create(p); err == nil {
+	if p := cfg.PFTracePath; p != "" || os.Getenv("LITH_PF_TRACE") != "" {
+		if p == "" {
+			p = os.Getenv("LITH_PF_TRACE")
+		}
+		tf, err := os.Create(p)
+		if err != nil {
+			// Never fail quietly: a typo'd path used to yield an empty trace and a
+			// successful-looking run (#262).
+			slog.Error("prefetch trace disabled: cannot create file", "path", p, "err", err)
+		} else {
 			f.pfTrace = tf
-			_, _ = fmt.Fprintln(tf, "key,off,len,blk,gap,state_before,state_after,peak_window")
+			// A trace is only comparable across runs, and only replayable, if it
+			// carries the config that produced it (#262).
+			_, _ = fmt.Fprintf(tf, "# lith prefetch trace; block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage_window=%d coverage_min=%g evidence_ratio=%g\n",
+				f.blockSize, f.maxReadahead(), f.partsThreshold(), cfg.SmallFile,
+				coverageWindow, coverageMin, cfg.ReadaheadEvidenceRatio)
+			_, _ = fmt.Fprintln(tf, "fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window")
 		}
 	}
 	return f
 }
 
-// tracePF writes one characterization row (M16 step 1b). Serialized because the
-// kernel issues a handle's reads concurrently.
-func (f *rawFS) tracePF(key string, off, length, blk, gap int64, before, after prefetch.State, peak int64) {
+// pfTraceRow is one traced read. `fh` groups rows by file handle, which is the
+// unit that actually makes prefetch decisions (one Prefetcher per Open): without
+// it, concurrent handles on one key interleave indistinguishably — dozens of them
+// under a many-rank job through a single daemon (#262). `pid` additionally splits
+// a multi-rank trace by reader. `path` says which read path served it, so a trace
+// is a self-describing rather than a silently biased sample.
+type pfTraceRow struct {
+	fh            uint64
+	pid           uint32
+	key           string
+	off, length   int64
+	blk, gap      int64
+	path          string // window | parts | footer
+	before, after prefetch.State
+	window        int64
+	dispatched    int
+	peak          int64
+}
+
+// tracePF writes one characterization row (#262; M16 step 1b). Serialized because
+// the kernel issues a handle's reads concurrently.
+func (f *rawFS) tracePF(r pfTraceRow) {
 	f.pfTraceMu.Lock()
-	_, _ = fmt.Fprintf(f.pfTrace, "%s,%d,%d,%d,%d,%s,%s,%d\n", key, off, length, blk, gap, before, after, peak)
+	_, _ = fmt.Fprintf(f.pfTrace, "%d,%d,%s,%d,%d,%d,%d,%s,%s,%s,%d,%d,%d\n",
+		r.fh, r.pid, r.key, r.off, r.length, r.blk, r.gap, r.path, r.before, r.after,
+		r.window, r.dispatched, r.peak)
 	f.pfTraceMu.Unlock()
 }
 
@@ -768,26 +807,46 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// (see Open: readahead would only contend with the parts fetch), or this is a
 	// footer-family handle whose byte-exact projection plan replaces the window
 	// (a whole-block window would re-fetch the columns the plan skips; #118).
+	blk := off / f.blockSize
+	// Byte gap from the previous read on this handle: a large gap is a seek even
+	// when it lands in an adjacent block or the grown reorder band, so the detector
+	// does not grow the readahead window for a scattered metadata walk (#210/M16
+	// 1b). The gated trace records what the detector saw; nil in production.
+	gap := off - h.lastReadEnd.Load()
 	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
-		blk := off / f.blockSize
-		// Byte gap from the previous read on this handle: a large gap is a seek even
-		// when it lands in an adjacent block or the grown reorder band, so the
-		// detector does not grow the readahead window for a scattered metadata walk
-		// (#210/M16 1b). The env-gated trace (LITH_PF_TRACE) records what the
-		// detector saw for the 1b characterization; nil in production.
-		gap := off - h.lastReadEnd.Load()
 		var before prefetch.State
 		if f.pfTrace != nil {
 			before = h.pf.state()
 		}
 		pbs := h.pf.observe(blk, off, end-off, gap, f.perHandleWindow())
 		if f.pfTrace != nil {
-			f.tracePF(h.key.Key, off, end-off, blk, gap, before, h.pf.state(), h.pf.peakWindow())
+			f.tracePF(pfTraceRow{
+				fh: input.Fh, pid: input.Pid, key: h.key.Key, off: off, length: end - off,
+				blk: blk, gap: gap, path: "window", before: before, after: h.pf.state(),
+				window: h.pf.window(), dispatched: len(pbs), peak: h.pf.peakWindow(),
+			})
 		}
 		for _, pb := range pbs {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
 		h.lastReadEnd.Store(end)
+	} else if f.pfTrace != nil {
+		// The prefetcher is deliberately not driven here — a whole-file parts fetch
+		// already covers every block, or a footer handle's byte-exact plan replaces
+		// the window. Still record the read, marked with which path served it: these
+		// omissions are a large and non-random share of the bytes on a mount where
+		// #229 whole-fetches most large objects, and a trace that drops them silently
+		// is a biased sample that looks complete (#262).
+		path := "footer"
+		if h.partsDispatched.Load() {
+			path = "parts"
+		}
+		st := h.pf.state()
+		f.tracePF(pfTraceRow{
+			fh: input.Fh, pid: input.Pid, key: h.key.Key, off: off, length: end - off,
+			blk: blk, gap: gap, path: path, before: st, after: st,
+			window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
+		})
 	}
 	return res, fuse.OK
 }

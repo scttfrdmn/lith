@@ -95,6 +95,12 @@ func (w *pfWrapper) evidence() (held, withheld int64) {
 	return w.pf.EvidenceHeld(), w.pf.EvidenceWithheld()
 }
 
+func (w *pfWrapper) window() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.Window()
+}
+
 func (w *pfWrapper) peakWindow() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

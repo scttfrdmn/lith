@@ -35,6 +35,7 @@ var serveInapplicable = map[string]string{
 	"bgzf-whole-file-max":      "FUSE bgzf prefetch (#107); gateway read path does not use it",
 	// Diagnostics / internal.
 	"timeline-csv": "FUSE per-chunk diagnostic (#70)",
+	"pf-trace":     "FUSE access-pattern detector trace (#262); internal/nfs has no prefetcher at all",
 	"pprof":        "debug surface; not part of the gateway operational surface",
 	"disk-writers": "internal write-behind pool; fixed on serve",
 	// (--keys is a `lith index build` flag, not a mount flag: build with
