@@ -399,6 +399,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		DisableFooterTier2:     !f.footerTier2,
 		MaxReadahead:           f.maxReadahead,
 		ReadaheadEvidenceRatio: f.readaheadEvidence,
+		PFTracePath:            f.pfTrace,
 		SiblingWindow:          f.siblingWindow,
 		SiblingReadahead:       f.siblingRead,
 		Limits:                 limits,
