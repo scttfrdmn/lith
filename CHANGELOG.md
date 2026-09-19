@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--readahead-evidence-ratio`, experimental and off by default**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). Bounds a committed
+  readahead window to a multiple of the bytes a handle has actually read, so the
+  size of the bet is proportional to the demand demonstrated for it. A handle
+  establishes at its first **block crossing** — one block (8 MiB) of contiguous
+  evidence — and today that buys the full NIC-derived window, ~223 blocks
+  (~1.8 GB) on a 50 Gbps node. A reader that tiles a slab and jumps to the next
+  variable re-places that bet at every re-establishment and never reads most of
+  it: measured at **13–16% of prefetch used** on a GCHP HEMCO mount against
+  **80%** on the met mount in the same job, and no flag setting moved that hit
+  rate. Off by default because the narrower early window is exactly what
+  [#56](https://github.com/scttfrdmn/lith/issues/56) added the jump-to-full-window
+  to avoid; the trade is being measured on the reporting workload before any
+  default changes.
+
 ### Fixed
 
 - **GitHub releases carry release notes again.** `.goreleaser.yaml` disables

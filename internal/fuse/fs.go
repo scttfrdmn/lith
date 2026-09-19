@@ -41,6 +41,9 @@ type Config struct {
 	SmallFile    int64 // whole-file prefetch threshold in bytes
 	PartsMax     int64 // largest file fetched whole as parallel parts once its reads tile (#69/#229); 0 falls back to SmallFile
 	MaxReadahead int64 // max sequential readahead window in blocks
+	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
+	// of the bytes a handle has actually read (#256). 0 disables (default).
+	ReadaheadEvidenceRatio float64
 	// BgzfWholeFileMax is the largest bgzf data file (with an index sibling)
 	// prefetched whole on open (#107); above it, tier-2 slice ranges are used.
 	// 0 uses the default of 512 MiB.
@@ -559,7 +562,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead(), f.blockSize),
+		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio),
 	}
 	f.mu.Lock()
 	fh := f.nextFh

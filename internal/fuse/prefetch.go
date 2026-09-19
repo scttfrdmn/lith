@@ -24,7 +24,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapper {
 	pf := prefetch.New(maxReadahead)
 	// A read landing more than one block past the previous is a seek, not
 	// sequential progress, however in-band it looks (#210/M16 1b).
@@ -33,6 +33,10 @@ func newPFWrapper(maxReadahead, blockSize int64) *pfWrapper {
 	// however its block deltas look; force it Random so the seek path stops
 	// re-anchoring and prefetching across a scattered walk (#221).
 	pf.SetCoverage(coverageWindow, coverageMin)
+	// Bound a committed window by the bytes the handle has actually read, so
+	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
+	// default; ratio <= 0 is a no-op.
+	pf.SetEvidence(evidenceRatio, blockSize)
 	return &pfWrapper{pf: pf}
 }
 

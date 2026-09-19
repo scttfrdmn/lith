@@ -26,37 +26,38 @@ import (
 )
 
 type mountFlags struct {
-	indexFile        string
-	cargoship        string
-	memCache         string
-	diskCache        string
-	diskPath         string
-	blockSize        string
-	maxRange         string
-	smallFile        string
-	partsMax         string
-	coalesceGap      string
-	bgzfWholeFileMax string
-	footerTier2      bool
-	s3Concurrency    int
-	prefetchConc     int
-	prefetchBudget   string
-	maxReadahead     int64
-	nicGbps          float64
-	siblingWindow    int
-	siblingRead      int
-	diskWriters      int
-	inflightBytes    string
-	metrics          string
-	pprof            string
-	timelineCSV      string
-	allowOther       bool
-	uid              int
-	gid              int
-	exec             bool
-	autoIndexLimit   int
-	daemon           bool
-	logLevel         string
+	indexFile         string
+	cargoship         string
+	memCache          string
+	diskCache         string
+	diskPath          string
+	blockSize         string
+	maxRange          string
+	smallFile         string
+	partsMax          string
+	coalesceGap       string
+	bgzfWholeFileMax  string
+	footerTier2       bool
+	s3Concurrency     int
+	prefetchConc      int
+	prefetchBudget    string
+	maxReadahead      int64
+	readaheadEvidence float64
+	nicGbps           float64
+	siblingWindow     int
+	siblingRead       int
+	diskWriters       int
+	inflightBytes     string
+	metrics           string
+	pprof             string
+	timelineCSV       string
+	allowOther        bool
+	uid               int
+	gid               int
+	exec              bool
+	autoIndexLimit    int
+	daemon            bool
+	logLevel          string
 
 	// S3 client options (shared with index build).
 	noSignRequest bool
@@ -97,6 +98,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
+	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "EXPERIMENTAL (#256): bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (~223 blocks at 50 Gbps). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that tiles a slab and jumps never earns it. 0 disables (default)")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
@@ -384,19 +386,20 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	)
 
 	fcfg := fusefs.Config{
-		Index:              root,
-		Store:              bs,
-		Metrics:            met,
-		UID:                uint32(f.uid),
-		GID:                uint32(f.gid),
-		SmallFile:          smallFile,
-		PartsMax:           partsMax,
-		BgzfWholeFileMax:   bgzfWholeFileMax,
-		DisableFooterTier2: !f.footerTier2,
-		MaxReadahead:       f.maxReadahead,
-		SiblingWindow:      f.siblingWindow,
-		SiblingReadahead:   f.siblingRead,
-		Limits:             limits,
+		Index:                  root,
+		Store:                  bs,
+		Metrics:                met,
+		UID:                    uint32(f.uid),
+		GID:                    uint32(f.gid),
+		SmallFile:              smallFile,
+		PartsMax:               partsMax,
+		BgzfWholeFileMax:       bgzfWholeFileMax,
+		DisableFooterTier2:     !f.footerTier2,
+		MaxReadahead:           f.maxReadahead,
+		ReadaheadEvidenceRatio: f.readaheadEvidence,
+		SiblingWindow:          f.siblingWindow,
+		SiblingReadahead:       f.siblingRead,
+		Limits:                 limits,
 	}
 
 	srv, swapper, err := fusefs.Mount(mountpoint, fcfg, fusefs.MountOptions{
