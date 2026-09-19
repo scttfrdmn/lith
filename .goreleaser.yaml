@@ -110,6 +110,13 @@ signs:
       - "--yes"
     output: true
 
+# The release body is NOT generated from git log: the hand-written CHANGELOG.md is
+# the source of truth. release.yml extracts this tag's section with
+# scripts/release-notes.sh and passes it as `--release-notes`, which is what fills
+# the body. Disabling the changelog here without supplying notes there is what
+# published five releases (v0.5.0, v1.1.0-v1.1.3) with an EMPTY body, so the two
+# halves must stay wired together — the workflow fails the release if either the
+# CHANGELOG section or the resulting body is missing.
 changelog:
   disable: true
 
