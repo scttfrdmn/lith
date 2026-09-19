@@ -127,3 +127,48 @@ func TestNilMetricsReadHooks(t *testing.T) {
 		t.Fatal("nil ReadSizeStats should be 0/0")
 	}
 }
+
+// TestLabelledPrefetchCountersEmitAtZero pins the fix for a field-reported trap
+// (#256): a labelled counter that is only created when it fires emits **no series
+// at all** at zero, which in a scrape is indistinguishable from "the binary lacks
+// the feature", "a different label value", or "the mount was never opened". A
+// reporter had to infer "zero suppressions" from an absent line and could only
+// resolve it because a second arm proved the same binary did emit the series when
+// it fired. This is the same present-and-zero-versus-absent trap as #253, so it
+// gets a test rather than a promise.
+func TestLabelledPrefetchCountersEmitAtZero(t *testing.T) {
+	m := New()
+	// A handle that served a read but never clamped and never de-established —
+	// the common case, and the one that produced no series before the fix.
+	m.PrefetchEvidenceClamped(">64MiB", 0, 0)
+	m.PrefetchDeEstablished(">64MiB", 0)
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		`lith_prefetch_evidence_clamped_total{size_class=">64MiB"} 0`,
+		`lith_prefetch_deestablished_total{size_class=">64MiB"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q — a zero-valued labelled counter must still emit its series", want)
+		}
+	}
+
+	// And they still count when they do fire.
+	m.PrefetchEvidenceClamped(">64MiB", 3, 40)
+	m.PrefetchDeEstablished(">64MiB", 7)
+	rec = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body = rec.Body.String()
+	for _, want := range []string{
+		`lith_prefetch_evidence_clamped_total{size_class=">64MiB"} 3`,
+		"lith_prefetch_evidence_withheld_blocks_total 40",
+		`lith_prefetch_deestablished_total{size_class=">64MiB"} 7`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}

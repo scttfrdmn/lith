@@ -83,6 +83,12 @@ func (w *pfWrapper) halvings() int64 {
 	return w.pf.Halvings()
 }
 
+func (w *pfWrapper) deEstablished() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.DeEstablished()
+}
+
 func (w *pfWrapper) evidence() (held, withheld int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

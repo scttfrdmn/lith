@@ -1008,9 +1008,11 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		// visible effect is that `issued` fell, which cannot distinguish a window
 		// the gate refused from one the detector never wanted — and cannot say
 		// whether the gate fires on the large objects or the small ones.
-		if held, withheld := h.pf.evidence(); held > 0 {
-			f.met.PrefetchEvidenceClamped(sizeClass(h.size), held, withheld)
-		}
+		// Called unconditionally: the metric emits its labelled series at zero so an
+		// absent line cannot be mistaken for a missing feature (#256 field report).
+		held, withheld := h.pf.evidence()
+		f.met.PrefetchEvidenceClamped(sizeClass(h.size), held, withheld)
+		f.met.PrefetchDeEstablished(sizeClass(h.size), h.pf.deEstablished())
 	}
 }
 

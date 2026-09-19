@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--max-readahead`, and **not** an answer to #256's precision question, which
   stays open. Off by default; with the flag unset the read path is unchanged
   (reproduced to 0.5% on the cluster).
+- **`lith_prefetch_deestablished_total{size_class}`**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)) counts how many times a
+  handle lost an establishment it had. It is **not**
+  `lith_prefetch_reset_random_total`, which counts collapses to the Random *state*
+  and is 20–30× larger (307–332 per run against 10–17 on the same mount) — a
+  distinction that matters, because conflating them made a re-establishment cap
+  look worth building and it measured completely inert. Kept because the counter
+  separates mounts in the *opposite* direction to the obvious guess: the mount with
+  an 80% prefetch hit rate de-establishes **51** times (45% of its Random
+  collapses) while the pathological one de-establishes **10** (3%). Frequent
+  re-anchoring marks a reader whose prefetch works, not one whose prefetch is
+  wasted.
+
 - **`lith_prefetch_evidence_clamped_total{size_class}` and
   `lith_prefetch_evidence_withheld_blocks_total`** make the gate's action
   observable. Without them the only visible effect was that `prefetch_issued`
@@ -38,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the small ones.
 
 ### Fixed
+- **Labelled prefetch counters now emit their series at zero**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)).
+  `lith_prefetch_evidence_clamped_total` was only created when it fired, so at zero
+  it emitted **no series at all** — indistinguishable in a scrape from "the binary
+  lacks the feature", "a different label value", or "the mount was never opened". A
+  reporter had to infer a zero from an absent line and could only confirm it because
+  another arm proved the same binary did emit the series when it fired. This is the
+  same present-and-zero-versus-absent trap as
+  [#253](https://github.com/scttfrdmn/lith/issues/253), in a metric added to *fix*
+  an observability complaint, so it now has a test.
+
 
 - **GitHub releases carry release notes again.** `.goreleaser.yaml` disables
   goreleaser's git-log changelog (this hand-written file is the source of truth)

@@ -119,6 +119,21 @@ type Prefetcher struct {
 	evidenceHeld  int64 // times the gate held the window below maxReadahead
 	evidenceCut   int64 // cumulative blocks withheld by those holds
 
+	// deEstablished (#256) counts losses of an establishment that existed — the
+	// oscillation establish -> commit -> jump -> de-establish. It is deliberately
+	// NOT resetRandom, which counts collapses to the Random *state* and is 20-30x
+	// larger: on the reporting workload resetRandom is 307-332 per run while
+	// deEstablished is 10-17. Conflating the two is what made a re-establishment
+	// cap look worth building; it was measured inert because the oscillation it
+	// gated happens ~3-5% as often as the signal cited for it.
+	//
+	// Kept as a diagnostic because it separates the mounts in the *opposite*
+	// direction to the obvious guess: the healthy mount (80% prefetch hit rate)
+	// de-establishes 51 times, 45% of its Random collapses, while the pathological
+	// one de-establishes 10, 3% of its collapses. Frequent re-anchoring is a sign
+	// of a reader whose prefetch works, not one whose prefetch is wasted.
+	deEstablished int64
+
 	// Diagnostics (#49). Single-threaded via pfWrapper.
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
@@ -190,6 +205,21 @@ func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
 // given and the one its consumption earned. Nothing in the metrics otherwise
 // distinguishes a window the gate refused from one the detector never wanted.
 func (p *Prefetcher) EvidenceWithheld() int64 { return p.evidenceCut }
+
+// DeEstablished reports how many times this handle lost an establishment it had
+// (#256). See the field comment: this is not resetRandom, and the difference
+// between them is load-bearing.
+func (p *Prefetcher) DeEstablished() int64 { return p.deEstablished }
+
+// deEstablish drops establishment, counting the transition only when there was an
+// establishment to lose, so the count measures oscillation rather than the number
+// of scattered reads.
+func (p *Prefetcher) deEstablish() {
+	if p.established {
+		p.deEstablished++
+	}
+	p.established = false
+}
 
 // windowCap is the largest window, in blocks, this handle's demonstrated
 // consumption justifies. It is maxReadahead when the gate is off, and never
@@ -398,7 +428,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// is dispatched — and a contiguous read whose window is still full of an
 		// earlier scattered walk de-establishes rather than ramping.
 		if !p.coverageOK(cov) {
-			p.established = false
+			p.deEstablish()
 			if p.state == Sequential {
 				p.state = Cold
 			}
@@ -451,7 +481,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		}
 		p.lowCoverage++
 		p.state = Random
-		p.established = false // #229: a scattered landing de-establishes the handle
+		p.deEstablish() // #229: a scattered landing de-establishes the handle
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx
@@ -462,7 +492,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// A second unexplained jump with no sequential progress between: stop
 		// prefetching until a sequential run resumes.
 		p.state = Random
-		p.established = false
+		p.deEstablish()
 		p.pending = false
 		p.window = 0
 		p.cursor = blockIdx
