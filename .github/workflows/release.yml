@@ -48,11 +48,22 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
       - name: install syft
         uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26  # v0.24.2
+      # The release body comes from this tag's CHANGELOG.md section. goreleaser's
+      # own changelog generation is disabled (the hand-written CHANGELOG is the
+      # source of truth, not git log), and with nothing supplied in its place
+      # every release from v0.5.0 on published an EMPTY body. This fails the
+      # release when the section is missing, so a tag can never again ship
+      # unannotated — add the `## [x.y.z]` section before tagging.
+      - name: release notes from CHANGELOG
+        run: |
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+          echo "--- release body for $GITHUB_REF_NAME ---"
+          cat "$RUNNER_TEMP/release-notes.md"
       - name: goreleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6
         with:
           version: "v2.18.1"
-          args: release --clean
+          args: release --clean --release-notes=${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pin the version to the tag that triggered this run, not `git describe`.
@@ -87,3 +98,18 @@ jobs:
           subject-name: ghcr.io/scttfrdmn/lith
           subject-digest: ${{ steps.img.outputs.digest }}
           push-to-registry: true
+      # Belt-and-braces on the step above: assert the published release actually
+      # carries a body. The notes step can only catch a missing CHANGELOG section;
+      # this catches the wiring itself regressing (a dropped --release-notes flag,
+      # a goreleaser flag rename), which is how the empty bodies went unnoticed
+      # across five releases.
+      - name: verify the published release has a body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          n=$(gh release view "$GITHUB_REF_NAME" --json body -q '.body | length')
+          if [ "${n:-0}" -lt 20 ]; then
+            echo "::error::release $GITHUB_REF_NAME published with an empty body ($n chars)"
+            exit 1
+          fi
+          echo "release body: $n chars"

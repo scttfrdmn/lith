@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitHub releases carry release notes again.** `.goreleaser.yaml` disables
+  goreleaser's git-log changelog (this hand-written file is the source of truth)
+  but nothing supplied notes in its place, so every release from **v0.5.0** on
+  (`v0.5.0`, `v1.1.0`–`v1.1.3`) published with an **empty body**. The release
+  workflow now extracts the tag's section from this file
+  (`scripts/release-notes.sh`) and passes it to goreleaser as `--release-notes`,
+  **fails the release** when the section is missing, and **asserts the published
+  body is non-empty** afterwards. The five affected releases were backfilled from
+  this file, so every published release now carries its notes.
+
 ## [1.1.3] - 2026-09-17
 
 A gateway-observability fix from the GCHP shared-gateway validation
