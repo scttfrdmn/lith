@@ -86,17 +86,29 @@ func (g globalStats) followThrough() float64 {
 // scoreTrace's features, cold tax and mismatch count untouched — so the #256 rule is fit
 // on identical predictors and the fidelity filter still applies — and carry shared-cache
 // dispatchedBytes / usedBytes / followThrough in place of the per-handle ones.
-func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact int64) ([]handleScore, globalStats, error) {
+func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact int64) ([]handleScore, globalStats, map[string]*keyAgg, error) {
 	var stats globalStats
+	// Per-OBJECT aggregates of the very same accounting, for the key-level fit (keys.go).
+	// Filled here rather than recomputed there so that the dedup, the EOF clamp and the
+	// first-run cold rule cannot drift between the two units.
+	keyAggs := map[string]*keyAgg{}
+	ka := func(k string) *keyAgg {
+		a, ok := keyAggs[k]
+		if !ok {
+			a = &keyAgg{}
+			keyAggs[k] = a
+		}
+		return a
+	}
 	if len(rows) == 0 {
-		return nil, stats, fmt.Errorf("no rows")
+		return nil, stats, nil, fmt.Errorf("no rows")
 	}
 	for _, r := range rows {
 		if r.seq == 0 {
-			return nil, stats, fmt.Errorf("trace has no `seq` column: a shared cache must be replayed in mount-wide decision order, and this trace records none (#271)")
+			return nil, stats, nil, fmt.Errorf("trace has no `seq` column: a shared cache must be replayed in mount-wide decision order, and this trace records none (#271)")
 		}
 		if r.key == "" {
-			return nil, stats, fmt.Errorf("trace has no `key` column: dedup is per object, and this trace does not say which object a read is on")
+			return nil, stats, nil, fmt.Errorf("trace has no `key` column: dedup is per object, and this trace does not say which object a read is on")
 		}
 	}
 
@@ -179,12 +191,14 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		if claimed[d.key][d.block] {
 			stats.suppressedBlocks++
 			suppressed[d.fh]++
+			ka(d.key).suppressedBlocks++
 			continue
 		}
 		claimed[d.key][d.block] = true
 		stats.claimedBlocks++
 		stats.dispatchedBytes += hi - lo
 		gDisp[d.fh] += hi - lo
+		ka(d.key).dispatchedBytes += hi - lo
 
 		// Redeemed by any later read of this KEY, by any handle.
 		var later, same []row
@@ -200,6 +214,7 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		used := coveredBytes(later, lo, hi)
 		gUsed[d.fh] += used
 		stats.usedBytes += used
+		ka(d.key).usedBytes += used
 
 		// Split the credit by WHO read it. If this is ~0%, the shared unit is just
 		// relabelling the per-handle one; if it is large, cross-handle reuse is the
@@ -207,6 +222,7 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		s := coveredBytes(same, lo, hi)
 		stats.sameHandleBytes += s
 		stats.crossHandleBytes += used - s
+		ka(d.key).crossHandleBytes += used - s
 	}
 
 	// THE COLD TAX, in the same unit — and this is the one that was impossible. 8,403 MiB
@@ -241,12 +257,14 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		}
 		cFirst[r.fh]++
 		stats.coldFirstRunReads++
+		ka(r.key).coldFirstRunReads++
 		ci := r.off / chunkSize
 		if coldSeen[r.key] == nil {
 			coldSeen[r.key] = map[int64]bool{}
 		}
 		if coldSeen[r.key][ci] {
 			stats.coldSuppressed++
+			ka(r.key).coldSuppressed++
 			continue // already resident: a cache hit, and it costs nothing
 		}
 		coldSeen[r.key][ci] = true
@@ -264,8 +282,15 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		cNet[r.fh] += n
 		stats.coldGrossWaste += g
 		stats.coldNetWaste += n
+		ka(r.key).coldGrossWaste += g
+		ka(r.key).coldNetWaste += n
 	}
 
+	// The clamped size, so the key-level features divide by the same denominator the
+	// byte accounting used rather than re-deriving it.
+	for k, sz := range sizeOf {
+		ka(k).size = sz
+	}
 	stats.keys = len(byKey)
 	for _, rs := range readersOf {
 		if len(rs) > 1 {
@@ -294,7 +319,7 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		out = append(out, s)
 	}
 	stats.handles = len(out)
-	return out, stats, nil
+	return out, stats, keyAggs, nil
 }
 
 // parseIssuedPer reads `met/a=2939,hemco/a=4632`: the mount's own
