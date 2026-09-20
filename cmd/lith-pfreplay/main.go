@@ -170,7 +170,7 @@ func main() {
 		reportDistribution(scores)
 		reportColdTax(scores)
 		if units := parseUnits(*gran); len(units) > 0 {
-			reportGranularity(os.Stdout, spec, sweepGranularity(rows, *byteExact, units))
+			reportGranularity(spec, sweepGranularity(rows, *byteExact, units))
 		}
 		if *global_ {
 			gs, gstats, kaggs, err := globalScore(scores, cfg, rows, *byteExact)

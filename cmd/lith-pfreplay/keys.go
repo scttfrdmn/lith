@@ -713,7 +713,7 @@ func writeKeyCSV(path string, all []keyScore) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w := csv.NewWriter(f)
 	hdr := []string{"label", "arm", "key", "obj_size", "readers", "reads", "reader_mismatches",
 		"dispatched_bytes", "used_bytes", "distinct_bytes", "follow_through",

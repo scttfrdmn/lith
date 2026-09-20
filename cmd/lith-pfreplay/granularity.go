@@ -36,7 +36,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -136,7 +135,7 @@ func sweepGranularity(rows []row, byteExact int64, units []int64) []granRow {
 
 // reportGranularity prints the sweep as the trade it is: bytes saved against round-trips
 // added, both relative to what the mount does today at G = chunkSize.
-func reportGranularity(w io.Writer, label string, g []granRow) {
+func reportGranularity(label string, g []granRow) {
 	if len(g) == 0 {
 		return
 	}
@@ -147,10 +146,10 @@ func reportGranularity(w io.Writer, label string, g []granRow) {
 			base = r
 		}
 	}
-	fmt.Fprintf(w, "   -- cold-start fetch GRANULARITY sweep (%s): the trade the inversion makes\n", label)
-	fmt.Fprintf(w, "      eligible first-run cold reads asked for %.1f MiB; today's %s chunk fetches %.1f MiB of it\n",
+	fmt.Printf("   -- cold-start fetch GRANULARITY sweep (%s): the trade the inversion makes\n", label)
+	fmt.Printf("      eligible first-run cold reads asked for %.1f MiB; today's %s chunk fetches %.1f MiB of it\n",
 		mib(base.readBytes), human(chunkSize), mib(base.grossFetched))
-	fmt.Fprintf(w, "      %-9s %9s %9s %11s %11s %9s   %s\n",
+	fmt.Printf("      %-9s %9s %9s %11s %11s %9s   %s\n",
 		"unit", "fetches", "free hits", "fetched MiB", "waste MiB", "waste %", "vs today")
 	for _, r := range g {
 		wpct := 0.0
@@ -169,12 +168,12 @@ func reportGranularity(w io.Writer, label string, g []granRow) {
 		} else if r.unit == chunkSize {
 			delta = "today"
 		}
-		fmt.Fprintf(w, "      %-9s %9d %9d %11.1f %11.1f %8.1f%%   %s\n",
+		fmt.Printf("      %-9s %9d %9d %11.1f %11.1f %8.1f%%   %s\n",
 			human(r.unit), r.fetches, r.hits, mib(r.grossFetched), mib(r.netWaste), wpct, delta)
 	}
-	fmt.Fprintf(w, "      Read the KiB/fetch column as the exchange rate: bytes bought per extra\n")
-	fmt.Fprintf(w, "      round-trip. It is not a verdict -- a request costs latency and money that\n")
-	fmt.Fprintf(w, "      this trace cannot price, and the free-hits column is what shrinks.\n")
+	fmt.Printf("      Read the KiB/fetch column as the exchange rate: bytes bought per extra\n")
+	fmt.Printf("      round-trip. It is not a verdict -- a request costs latency and money that\n")
+	fmt.Printf("      this trace cannot price, and the free-hits column is what shrinks.\n")
 }
 
 // parseUnits reads the -granularity list. Sizes come back in DESCENDING order so the
