@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`lith-pfreplay` replays in decision order, not file order**
+  ([#272](https://github.com/scttfrdmn/lith/issues/272)). #271 recorded a monotonic
+  `seq` inside the handle's lock, and the replay parsed it and then sorted by nothing
+  — so the ordering fix stopped short of the thing it was for. Measured on live
+  mounts: **10.9%** of rows arrive out of decision order with 256 handles, and
+  **0.0%** with a single reader, which is why my own verification (single-threaded,
+  so file order *was* decision order) reported a clean 1.00× round-trip while the
+  defect was present. Now sorted per handle by `seq`, with
+  `TestReplayIsInvariantToRowOrder` shuffling a known-good trace and requiring
+  identical results — a property the tool should hold unconditionally.
+
 - **The replay's verdict now respects its own fidelity gate**
   ([#267](https://github.com/scttfrdmn/lith/pull/267)). On the real 48-rank capture
   the tool printed *"everything below is void"* from the fidelity gate and then,

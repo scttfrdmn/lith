@@ -295,6 +295,15 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 	var out []handleScore
 	for _, fh := range order {
 		hr := byHandle[fh]
+		// Replay in DECISION order, not file order. tracePF appends outside the lock
+		// that observe() decides under, so rows arrive out of order whenever one handle
+		// has concurrent reads — measured at 10.9% of rows with 256 handles, and 0.0%
+		// with a single reader, which is why a single-threaded check calls this clean.
+		// Feeding the state machine the wrong sequence is exactly what `seq` was added
+		// to prevent, and parsing it without sorting left the fix short of the replay.
+		if len(hr) > 1 && hr[0].seq > 0 {
+			sort.SliceStable(hr, func(i, j int) bool { return hr[i].seq < hr[j].seq })
+		}
 		s := handleScore{label: label, arm: arm, fh: fh, rows: len(hr)}
 
 		// Replay. Only rows the live mount actually drove the prefetcher with
