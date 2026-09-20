@@ -4,6 +4,7 @@ package fuse
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/scttfrdmn/lith/internal/prefetch"
 )
@@ -40,11 +41,40 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapp
 	return &pfWrapper{pf: pf}
 }
 
-func (w *pfWrapper) observe(block, off, length, byteGap, maxWindow int64) []int64 {
+// observation is everything a trace row needs about one decision, captured while
+// the handle's lock is still held (#267). Reading `after`/`window`/`peak` after
+// observe() returned meant that on a handle with concurrent reads those three
+// columns could describe a *different* read's transition, and appending the row
+// outside the lock meant rows could be written out of decision order — measured at
+// 1.9-2.0% of window rows on a 48-rank capture, some logically impossible
+// (recorded gap 0 for an offset the handle had already read past).
+//
+// `seq` is a mount-wide monotonic decision number, allocated inside the lock. A
+// timestamp taken in tracePF could not fix this: it would stamp the *append*, so it
+// would record the wrong order faithfully. Per handle this is exact, because one
+// handle's decisions are serialized by w.mu; across handles any two decisions that
+// are genuinely ordered (one finishes before the other starts) get ordered seqs,
+// which is the serialization a shared-cache replay needs.
+type observation struct {
+	dispatch []int64
+	seq      int64
+	after    prefetch.State
+	window   int64
+	peak     int64
+}
+
+func (w *pfWrapper) observe(block, off, length, byteGap, maxWindow int64, seq *atomic.Int64) observation {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pf.SetMax(maxWindow)
-	return w.pf.Observe(block, off, length, byteGap)
+	d := w.pf.Observe(block, off, length, byteGap)
+	return observation{
+		dispatch: d,
+		seq:      seq.Add(1),
+		after:    w.pf.State(),
+		window:   w.pf.Window(),
+		peak:     w.pf.PeakWindow(),
+	}
 }
 
 // isEstablished reports whether the handle's access pattern is known to tile —

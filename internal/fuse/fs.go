@@ -229,6 +229,7 @@ type rawFS struct {
 	// nil in production; no cost when unset.
 	pfTrace   *os.File
 	pfTraceMu sync.Mutex
+	pfSeq     atomic.Int64 // mount-wide decision sequence for the trace (#267)
 
 	// missMu/missSeen dedup the ENOENT-lookup breadcrumb (#240): the first time a
 	// lookup resolves to a path not in the index, log it at INFO so a prefix-
@@ -301,7 +302,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			_, _ = fmt.Fprintf(tf, "# lith prefetch trace; block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage_window=%d coverage_min=%g evidence_ratio=%g\n",
 				f.blockSize, f.maxReadahead(), f.partsThreshold(), cfg.SmallFile,
 				coverageWindow, coverageMin, cfg.ReadaheadEvidenceRatio)
-			_, _ = fmt.Fprintln(tf, "fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window")
+			_, _ = fmt.Fprintln(tf, "seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window")
 		}
 	}
 	return f
@@ -314,6 +315,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 // a multi-rank trace by reader. `path` says which read path served it, so a trace
 // is a self-describing rather than a silently biased sample.
 type pfTraceRow struct {
+	seq  int64 // mount-wide decision order, allocated under the handle's lock (#267)
 	fh   uint64
 	pid  uint32
 	key  string
@@ -322,6 +324,7 @@ type pfTraceRow struct {
 	off, length   int64
 	blk, gap      int64
 	path          string // window | parts | footer
+	maxWindow     int64  // the SetMax input for this decision (#267)
 	before, after prefetch.State
 	window        int64
 	dispatched    int
@@ -332,9 +335,9 @@ type pfTraceRow struct {
 // the kernel issues a handle's reads concurrently.
 func (f *rawFS) tracePF(r pfTraceRow) {
 	f.pfTraceMu.Lock()
-	_, _ = fmt.Fprintf(f.pfTrace, "%d,%d,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%d\n",
-		r.fh, r.pid, r.key, r.size, r.off, r.length, r.blk, r.gap, r.path, r.before, r.after,
-		r.window, r.dispatched, r.peak)
+	_, _ = fmt.Fprintf(f.pfTrace, "%d,%d,%d,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%d,%d\n",
+		r.seq, r.fh, r.pid, r.key, r.size, r.off, r.length, r.blk, r.gap, r.path, r.before, r.after,
+		r.maxWindow, r.window, r.dispatched, r.peak)
 	f.pfTraceMu.Unlock()
 }
 
@@ -820,15 +823,22 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		if f.pfTrace != nil {
 			before = h.pf.state()
 		}
-		pbs := h.pf.observe(blk, off, end-off, gap, f.perHandleWindow())
+		// perHandleWindow is mount-wide and time-varying (the prefetch budget divided
+		// by the live handle count), and it is applied via SetMax before EVERY live
+		// Observe. An offline replay that does not know it runs a different program —
+		// measured at 2.70x more dispatch than the mount, on a capture where the mount
+		// never exceeded 17 blocks and the replay assumed 223 (#267). So it is recorded.
+		maxWin := f.perHandleWindow()
+		obs := h.pf.observe(blk, off, end-off, gap, maxWin, &f.pfSeq)
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
-				fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size, off: off, length: end - off,
-				blk: blk, gap: gap, path: "window", before: before, after: h.pf.state(),
-				window: h.pf.window(), dispatched: len(pbs), peak: h.pf.peakWindow(),
+				seq: obs.seq, fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
+				off: off, length: end - off, blk: blk, gap: gap, path: "window",
+				before: before, after: obs.after, maxWindow: maxWin,
+				window: obs.window, dispatched: len(obs.dispatch), peak: obs.peak,
 			})
 		}
-		for _, pb := range pbs {
+		for _, pb := range obs.dispatch {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
 		h.lastReadEnd.Store(end)
@@ -845,9 +855,9 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		}
 		st := h.pf.state()
 		f.tracePF(pfTraceRow{
-			fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size, off: off, length: end - off,
-			blk: blk, gap: gap, path: path, before: st, after: st,
-			window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
+			seq: f.pfSeq.Add(1), fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
+			off: off, length: end - off, blk: blk, gap: gap, path: path, before: st, after: st,
+			maxWindow: f.perHandleWindow(), window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
 		})
 	}
 	return res, fuse.OK
