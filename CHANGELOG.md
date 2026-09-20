@@ -106,6 +106,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`lith-pfreplay` now reproduces the mount's conditional `Open()`, closing the last
+  source of replay divergence.** The mount calls `pf.open()` **only** for objects
+  larger than `partsThreshold`; for a smaller object the prefetcher is never
+  `Open()`ed, so its first `Observe` takes the `!haveLast` path — `lastBlock =
+  blockIdx` rather than `-1`, leaving `lastDelta` at 0 and making the strided branch
+  unreachable on read 2. Replaying `Open()` unconditionally dispatched a block the
+  mount did not, and **only** on handles that never reach sequential or strided —
+  exactly the population a field report isolated (10 of 6,229 HEMCO handles, every
+  row `cold` or `random`, median object 33.4 MB against a 64 MiB `parts-max`). With
+  it, all four real traces replay at **fidelity OK on every handle** and replay
+  decisions equal the mount's own column exactly (52,104 = 52,104). The pre-registered
+  verdict is unchanged, so the finding never depended on the defect.
+- **A mismatch now names its first diverging row** (`fh`, `seq`, block, offset, gap,
+  `max_window`, state transition, mount-vs-replay dispatch counts). Counting
+  mismatches says a replay is wrong; naming the row is what made the cause findable.
+
 - **`lith-pfreplay` replays in decision order, not file order**
   ([#272](https://github.com/scttfrdmn/lith/issues/272)). #271 recorded a monotonic
   `seq` inside the handle's lock, and the replay parsed it and then sorted by nothing
