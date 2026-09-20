@@ -62,6 +62,8 @@ import (
 const chunkSize = 1 << 20 // lith's cache-chunk granularity, for the straddle feature
 
 type row struct {
+	seq         int64
+	maxWindow   int64 // the mount's SetMax input for this decision; 0 = pre-#267 trace
 	fh          uint64
 	size        int64 // object size, for the EOF clamp
 	off, length int64
@@ -109,6 +111,7 @@ type handleScore struct {
 	coldNetWasteBytes  int64 // first-run only
 	coldGrossWasteByte int64 // chunk - read_len, the inflated figure, kept for comparison
 	dispatchDecisions  int   // blocks Observe returned, before the EOF clamp
+	recordedDispatched int   // blocks the MOUNT recorded dispatching, from the trace's own column
 	clampedAway        int   // of those, how many fell entirely past the object's end
 }
 
@@ -125,7 +128,7 @@ func main() {
 	}
 
 	var all []handleScore
-	var totalDispBytes int64
+	var totalDispBytes, totalDecisionBlocks, totalRecordedBlocks, blockSize int64
 	labels := []string{}
 	seenLabel := map[string]bool{}
 	for _, arg := range flag.Args() {
@@ -152,7 +155,10 @@ func main() {
 		reportColdTax(scores)
 		for _, sc := range scores {
 			totalDispBytes += sc.dispatchedBytes
+			totalRecordedBlocks += int64(sc.recordedDispatched)
+			totalDecisionBlocks += int64(sc.dispatchDecisions)
 		}
+		blockSize = cfg.blockSize
 		all = append(all, scores...)
 		if !seenLabel[label] {
 			seenLabel[label] = true
@@ -160,7 +166,7 @@ func main() {
 		}
 	}
 
-	reportIssuedCrossCheck(totalDispBytes, *issued)
+	reportIssuedCrossCheck(totalDecisionBlocks, totalRecordedBlocks, totalDispBytes, blockSize, *issued)
 	reportSeparation(all, labels, *minN)
 	if *out != "" {
 		if err := writeCSV(*out, all); err != nil {
@@ -230,8 +236,15 @@ func readTrace(path string) (traceConfig, []row, error) {
 		if _, ok := col["size"]; ok {
 			size = atoi("size")
 		}
+		var seq, maxWin int64
+		if _, ok := col["seq"]; ok {
+			seq = atoi("seq")
+		}
+		if _, ok := col["max_window"]; ok {
+			maxWin = atoi("max_window")
+		}
 		rows = append(rows, row{
-			fh: fh, size: size, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
+			seq: seq, maxWindow: maxWin, fh: fh, size: size, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
 			path: rec[col["path"]], before: rec[col["state_before"]], dispatched: int(atoi("dispatched")),
 		})
 	}
@@ -303,7 +316,15 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 			if r.path != "window" {
 				continue
 			}
+			// The live path calls SetMax(perHandleWindow()) before EVERY Observe, and
+			// that input is mount-wide and time-varying. Replaying without it is a
+			// different program: measured 2.70x more dispatch than the mount, because
+			// the replay assumed the 223-block static cap where the mount used <= 17.
+			if r.maxWindow > 0 {
+				p.SetMax(r.maxWindow)
+			}
 			got := p.Observe(r.blk, r.off, r.length, r.gap)
+			s.recordedDispatched += r.dispatched
 			if len(got) != r.dispatched {
 				s.mismatches++
 			}
@@ -517,6 +538,18 @@ func reportFidelity(rows []row, scores []handleScore) {
 	}
 	fmt.Printf("   rows: %d (window=%d parts=%d footer=%d)  handles: %d\n",
 		len(rows), pathCount["window"], pathCount["parts"], pathCount["footer"], handles)
+	haveMaxWin := false
+	for _, r := range rows {
+		if r.maxWindow > 0 {
+			haveMaxWin = true
+			break
+		}
+	}
+	if !haveMaxWin {
+		fmt.Printf("   ** no `max_window` column: the replay runs the STATIC cap where the mount applied a\n")
+		fmt.Printf("      time-varying per-handle budget share before every Observe. Expect inflated dispatch and\n")
+		fmt.Printf("      fidelity mismatches that are this absence, not lith's behaviour. Recapture to score. **\n")
+	}
 	if !haveSize {
 		fmt.Printf("   ** no `size` column: object sizes ESTIMATED from each handle's highest read offset.\n")
 		fmt.Printf("      The EOF clamp is therefore approximate (it under-states, not over-states). Recapture with a #267 binary.\n")
@@ -582,32 +615,38 @@ func reportFidelity(rows []row, scores []handleScore) {
 // run's single live counter. Doing this per trace was wrong: with N traces from one
 // mount, each arm's own count was printed beside the whole run's total, so the line
 // that exists to catch a 12x error was itself off by up to Nx.
-func reportIssuedCrossCheck(totalDispBytes, issued int64) {
-	if issued <= 0 {
+// reportIssuedCrossCheck decomposes the replay-vs-mount gap into its two factors,
+// because a single ratio blames the wrong thing. A 9.25x gap on a real capture was
+// read as ~13x sharing when it was 2.70x replay-window inflation (a missing per-call
+// input) times 3.43x genuine dedup. The mount's own `dispatched` column is the pivot
+// that separates them, and it needs no new column.
+func reportIssuedCrossCheck(totalDecisionBlocks, totalRecordedBlocks, totalDispBytes, blockSize, issued int64) {
+	perBlock := blockSize / chunkSize
+	if perBlock <= 0 {
 		return
 	}
-	// The live counter records chunks actually FETCHED (deduped: re-dispatching a
-	// cached chunk records nothing), whereas the replay counts DECISIONS, which
-	// legitimately repeat across handles and across re-establishments. So replay
-	// exceeding it is expected — measured at ~1.2-2.4x — and that gap is itself
-	// informative: it is how much a per-handle score understates prefetch's value.
-	replayChunks := totalDispBytes / chunkSize
-	fmt.Printf("\n   vs live lith_prefetch_issued_total (all traces summed): replay %d chunk-decisions, mount %d chunks fetched",
-		replayChunks, issued)
-	if issued > 0 {
-		fmt.Printf(" (%.2fx)", float64(replayChunks)/float64(issued))
+	decided := totalDecisionBlocks * perBlock // replay decisions, pre-EOF-clamp
+	mount := totalRecordedBlocks * perBlock   // what the mount's own column recorded
+	fetchable := totalDispBytes / chunkSize   // replay decisions that could fetch anything
+
+	if mount <= 0 {
+		return
 	}
-	fmt.Println()
-	fmt.Printf("     Per-handle follow-through therefore UNDERSTATES prefetch's value by about that factor:\n")
-	fmt.Printf("     several handles decide to prefetch overlapping blocks and the cache fetches each once.\n")
-	// Calibration: the field-measured healthy range is 1.2-2.4x (several handles
-	// deciding on overlapping blocks), and a synthetic with two heavily
-	// re-establishing handles on one object reaches 4.6x. The broken-clamp case was
-	// 12.3x. 8x sits between them, so this fires on the failure and not on ordinary
-	// re-dispatch.
-	if replayChunks > 8*issued {
-		fmt.Printf("     ** >8x the mount's fetched chunks: far outside the 1.2-4.6x that dedup and\n")
-		fmt.Printf("        re-establishment explain. Suspect the EOF clamp or a config mismatch. **\n")
+	fmt.Printf("\n   decomposition of the replay-vs-mount gap:\n")
+	fmt.Printf("     replay decisions   %8d chunks (pre-EOF-clamp)   -> %.2fx the mount's, %.2fx of which is past EOF\n",
+		decided, float64(decided)/float64(mount), float64(decided)/math.Max(float64(fetchable), 1))
+	fmt.Printf("     replay fetchable   %8d chunks                   -> %.2fx  <- window/input inflation\n",
+		fetchable, float64(fetchable)/float64(mount))
+	fmt.Printf("     mount decided      %8d chunks (its own column)\n", mount)
+	if issued > 0 {
+		fmt.Printf("     mount fetched      %8d chunks (lith_prefetch_issued_total) -> %.2fx  <- genuine sharing dedup\n",
+			issued, float64(mount)/float64(issued))
+		fmt.Printf("     Per-handle follow-through understates prefetch's value by about that dedup factor.\n")
+	}
+	if fetchable > mount*3/2 {
+		fmt.Printf("     ** the replay would fetch far more than the mount decided, so a per-call INPUT differs.\n")
+		fmt.Printf("        The known one is perHandleWindow (SetMax before every live Observe); a trace without a\n")
+		fmt.Printf("        max_window column makes the replay run the static cap. Fidelity, not dedup. **\n")
 	}
 }
 
@@ -645,6 +684,33 @@ func reportColdTax(scores []handleScore) {
 // reportSeparation applies the pre-registered rule.
 func reportSeparation(all []handleScore, labels []string, minN int) {
 	fmt.Printf("\n== pre-registered verdict (#256)\n")
+
+	// THE VERDICT IS COMPUTED ON FAITHFUL HANDLES ONLY.
+	//
+	// An earlier build printed "everything below is void" from the fidelity gate and
+	// then, eleven lines later, "VERDICT: SEPARATION" — disagreeing with itself on one
+	// page, on real data. --min-n did not help because it counts SCORED handles, and a
+	// handle whose replay diverged is scored; it is just scored wrong. Nothing
+	// connected the verdict to the gate. It does now: a handle whose replayed dispatch
+	// decisions differ from the mount's recorded ones is replaying a different program,
+	// so its follow-through is not evidence about lith's behaviour and cannot vote.
+	var faithful []handleScore
+	unfaithful := 0
+	for _, sc := range all {
+		if sc.mismatches == 0 {
+			faithful = append(faithful, sc)
+			continue
+		}
+		if !math.IsNaN(sc.followThrough) {
+			unfaithful++
+		}
+	}
+	if unfaithful > 0 {
+		fmt.Printf("   fidelity filter: %d scored handles excluded (replay diverged from the mount);\n", unfaithful)
+		fmt.Printf("     the verdict below is computed on the faithful remainder ONLY. A diverging handle is\n")
+		fmt.Printf("     replaying a different program, so its score is not evidence about lith.\n")
+	}
+	all = faithful
 	byLabel := map[string][]float64{}
 	for _, s := range all {
 		if !math.IsNaN(s.followThrough) {
@@ -748,6 +814,27 @@ func reportSeparation(all []handleScore, labels []string, minN int) {
 	}
 
 	fmt.Printf("\n   best |rho| = %.3f (%s); threshold 0.5\n", best, bestName)
+
+	// Distinguish "measured no relationship" from "could not measure one". After the
+	// fidelity filter a class can be left with a handful of handles, and NO SEPARATION
+	// asserted from n=3 is not the pre-registered finding — it is an absence of data
+	// wearing the finding's clothes.
+	thin := []string{}
+	for _, lab := range labels {
+		// n == 0 counts as thin too: a class with no faithful scored handles cannot
+		// support either branch, and "no separation" must never be concluded from an
+		// absence of data.
+		if n := len(byLabel[lab]); n < minN {
+			thin = append(thin, fmt.Sprintf("%s(n=%d)", lab, n))
+		}
+	}
+	if len(thin) > 0 {
+		fmt.Printf("   VERDICT: UNEVALUABLE — after the fidelity filter these classes are below --min-n=%d: %s.\n",
+			minN, strings.Join(thin, ", "))
+		fmt.Printf("            Neither branch of the rule may be claimed: |rho| < 0.5 from n=3 is an absence of\n")
+		fmt.Printf("            data, not a measured absence of relationship. Fix fidelity, then re-score.\n")
+		return
+	}
 	switch {
 	case best >= 0.5:
 		fmt.Printf("   VERDICT: SEPARATION — a feature of a handle's first reads predicts byte follow-through.\n")

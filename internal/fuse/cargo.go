@@ -42,7 +42,7 @@ func (f *rawFS) cargoReadahead(h *fileHandle, p cargoPart, chunkOff int64) {
 	// frame stream, not scattered object metadata, so neither the #210/M16-1b
 	// byte-gap gate nor the #221 coverage gate should fire — passing a contiguous
 	// block span keeps coverage ~1 and preserves cargo's whole-block readahead.
-	for _, pb := range h.pf.observe(blk, chunkOff, f.blockSize, 0, f.perHandleWindow()) {
+	for _, pb := range h.pf.observe(blk, chunkOff, f.blockSize, 0, f.perHandleWindow(), &f.pfSeq).dispatch {
 		pb := pb
 		go f.store.Prefetch(f.ctx, p.key, pb, p.uncompTotal)
 	}

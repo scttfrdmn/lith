@@ -317,3 +317,68 @@ func TestDegenerateArmCannotProduceSeparation(t *testing.T) {
 		t.Errorf("a genuine monotone relationship over 12 handles should count:\n%s", out2)
 	}
 }
+
+// TestVerdictRespectsFidelityGate is the defect the real capture exposed: the tool
+// printed "everything below is void" from the fidelity gate and then, eleven lines
+// later, "VERDICT: SEPARATION" — disagreeing with itself on one page. --min-n did not
+// help, because it counts SCORED handles and a diverged handle is scored; it is just
+// scored wrong. Nothing connected the verdict to the gate.
+func TestVerdictRespectsFidelityGate(t *testing.T) {
+	// Twelve handles per class with a strong correlation — but every one unfaithful.
+	var all []handleScore
+	for i := 0; i < 12; i++ {
+		for _, lab := range []string{"met", "hemco"} {
+			for _, arm := range []string{"a", "b"} {
+				all = append(all, handleScore{
+					label: lab, arm: arm, fh: uint64(i), mismatches: 1, // <- diverged
+					followThrough: float64(i) / 12, fracLargeGap: float64(i) * 0.01,
+				})
+			}
+		}
+	}
+	out := captureStdout(t, func() { reportSeparation(all, []string{"met", "hemco"}, 8) })
+	if strings.Contains(out, "VERDICT: SEPARATION") {
+		t.Errorf("a verdict was declared entirely on handles whose replay diverged:\n%s", out)
+	}
+	if !strings.Contains(out, "fidelity filter") {
+		t.Errorf("the exclusion must be stated, not silent:\n%s", out)
+	}
+	if !strings.Contains(out, "UNEVALUABLE") {
+		t.Errorf("with no faithful handles the answer is UNEVALUABLE, not a measured absence:\n%s", out)
+	}
+
+	// Control: the same data, faithful, does reach a verdict — so the filter is not
+	// simply suppressing everything.
+	for i := range all {
+		all[i].mismatches = 0
+	}
+	out2 := captureStdout(t, func() { reportSeparation(all, []string{"met", "hemco"}, 8) })
+	if strings.Contains(out2, "fidelity filter") {
+		t.Errorf("faithful handles must not be filtered:\n%s", out2)
+	}
+	if !strings.Contains(out2, "VERDICT: SEPARATION") {
+		t.Errorf("faithful handles with a strong correlation should reach a verdict:\n%s", out2)
+	}
+}
+
+// TestThinClassIsUnevaluableNotNoSeparation: after the fidelity filter a class can be
+// left with a handful of handles. |rho| < 0.5 from n=3 is an absence of data, not a
+// measured absence of relationship, and must not be reported as the latter.
+func TestThinClassIsUnevaluableNotNoSeparation(t *testing.T) {
+	var all []handleScore
+	for i := 0; i < 12; i++ { // met is well-populated
+		all = append(all, handleScore{label: "met", arm: "a", fh: uint64(i),
+			followThrough: float64(i%5) / 5, fracLargeGap: float64(i) * 0.02})
+	}
+	for i := 0; i < 3; i++ { // hemco is thin
+		all = append(all, handleScore{label: "hemco", arm: "a", fh: uint64(100 + i),
+			followThrough: 0, fracLargeGap: 0.1})
+	}
+	out := captureStdout(t, func() { reportSeparation(all, []string{"met", "hemco"}, 8) })
+	if !strings.Contains(out, "UNEVALUABLE") {
+		t.Errorf("a thin class must yield UNEVALUABLE:\n%s", out)
+	}
+	if strings.Contains(out, "NO SEPARATION") {
+		t.Errorf("n=3 must not be reported as a measured absence of relationship:\n%s", out)
+	}
+}

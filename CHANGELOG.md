@@ -106,6 +106,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The replay's verdict now respects its own fidelity gate**
+  ([#267](https://github.com/scttfrdmn/lith/pull/267)). On the real 48-rank capture
+  the tool printed *"everything below is void"* from the fidelity gate and then,
+  eleven lines later, **`VERDICT: SEPARATION`** — disagreeing with itself on one page.
+  `--min-n` did not help, because it counts *scored* handles and a diverged handle is
+  scored, just scored wrong. The verdict is now computed on **faithful handles only**,
+  the exclusion is stated, and a class left below `--min-n` (including zero) yields
+  **UNEVALUABLE** rather than "no separation" — an absence of data is not a measured
+  absence of relationship.
+- **The trace records `max_window` and a decision `seq`**
+  ([#267](https://github.com/scttfrdmn/lith/pull/267)). The live path calls
+  `SetMax(perHandleWindow())` before **every** `Observe`, and that input is mount-wide
+  and time-varying; the replay ran the static cap instead, dispatching **2.70×** what
+  the mount did on a capture where the mount never exceeded 17 blocks and the replay
+  assumed 223. And rows were appended outside the handle's lock, so **1.9–2.0%** of
+  window rows were out of decision order — some logically impossible. `seq` is now
+  allocated *inside* the lock (a timestamp in the writer could not fix this: it would
+  stamp the append, recording the wrong order faithfully), and `after`/`window`/`peak`
+  are captured there too, so they can no longer describe a different read's transition.
+- **The replay-vs-mount gap is now decomposed instead of attributed.** A single ratio
+  blamed dedup for a replay-input error: a 9.25× gap read as ~13× sharing when it was
+  **2.70× window inflation × 3.43× genuine dedup**. The mount's own `dispatched`
+  column is the pivot that separates them and needs no new column.
+
 - **An unwritable `--pf-trace` path now fails the mount instead of mounting
   successfully without a trace** ([#264](https://github.com/scttfrdmn/lith/issues/264)).
   Under `--daemon` the error went to `/tmp/lith-<uid>-mount.log` and the mount came
