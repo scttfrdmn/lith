@@ -382,3 +382,83 @@ func TestThinClassIsUnevaluableNotNoSeparation(t *testing.T) {
 		t.Errorf("n=3 must not be reported as a measured absence of relationship:\n%s", out)
 	}
 }
+
+// TestReplayIsInvariantToRowOrder is the guard #272 asked for, and it is the property
+// my own verification lacked: I checked a fresh-format trace round-tripped at 1.00x
+// using a SINGLE-THREADED generator, where file order *is* decision order, so the
+// defect was invisible. Shuffling a known-good trace and requiring identical results
+// tests the property unconditionally — a replay that depends on file order fails it,
+// however clean it looks on an uncontended trace.
+func TestReplayIsInvariantToRowOrder(t *testing.T) {
+	// One handle, contiguous, with explicit decision numbers.
+	var b strings.Builder
+	var prevEnd int64
+	for i := 0; i < 160; i++ {
+		off := int64(i) * kib
+		fmt.Fprintf(&b, "%d,1,7,obj,%d,%d,%d,%d,%d,window,cold,cold,32,0,0,0\n",
+			i+1, 64<<20, off, kib, off/(1<<20), off-prevEnd)
+		prevEnd = off + kib
+	}
+	rows := b.String()
+
+	cfg, inOrder, err := readTrace(writeTraceSeq(t, rows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := scoreTrace("x", "a", cfg, inOrder, 8, 1<<20)[0]
+	// The property under test is invariance, not fidelity: this fixture's `dispatched`
+	// column is hand-written and does not match what the detector decides, which is
+	// fine — a shuffled copy must still score identically. Only require that the
+	// replay actually did something, so the assertions below are not vacuous.
+	if want.dispatchDecisions == 0 {
+		t.Fatal("precondition: the fixture must cause dispatches, or invariance is trivial")
+	}
+
+	// Deterministic shuffles: reversed, and a deterministic interleave. Both must
+	// produce identical scores, because `seq` carries the real order.
+	for name, mangle := range map[string]func([]row) []row{
+		"reversed": func(in []row) []row {
+			out := append([]row(nil), in...)
+			for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+				out[i], out[j] = out[j], out[i]
+			}
+			return out
+		},
+		"interleaved": func(in []row) []row {
+			out := make([]row, 0, len(in))
+			for i := 0; i < len(in); i += 2 {
+				out = append(out, in[i])
+			}
+			for i := 1; i < len(in); i += 2 {
+				out = append(out, in[i])
+			}
+			return out
+		},
+	} {
+		got := scoreTrace("x", "a", cfg, mangle(inOrder), 8, 1<<20)[0]
+		if got.mismatches != want.mismatches {
+			t.Errorf("%s: mismatches %d, want %d — the replay depends on file order", name, got.mismatches, want.mismatches)
+		}
+		if got.dispatchDecisions != want.dispatchDecisions {
+			t.Errorf("%s: dispatch decisions %d, want %d", name, got.dispatchDecisions, want.dispatchDecisions)
+		}
+		if got.dispatchedBytes != want.dispatchedBytes {
+			t.Errorf("%s: dispatched bytes %d, want %d", name, got.dispatchedBytes, want.dispatchedBytes)
+		}
+		if got.followThrough != want.followThrough {
+			t.Errorf("%s: follow-through %v, want %v", name, got.followThrough, want.followThrough)
+		}
+	}
+}
+
+// writeTraceSeq writes a trace in the #271 format (seq + max_window columns).
+func writeTraceSeq(t *testing.T, rows string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "pf.csv")
+	body := "# lith prefetch trace; block_size=1048576 max_readahead=32 parts_max=0 small_file=0 coverage_window=16 coverage_min=0.5 evidence_ratio=0\n" +
+		"seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window\n" + rows
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
