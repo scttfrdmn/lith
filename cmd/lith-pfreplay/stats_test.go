@@ -110,3 +110,45 @@ func TestQuantileAndMean(t *testing.T) {
 		t.Error("empty input should be NaN, not 0")
 	}
 }
+
+// TestDegenerateGuardsRejectOneDegreeOfFreedom pins the guard that stops a
+// confident-but-empty verdict. The reported failure was n=3 with a two-way tie on
+// both axes and one handle differing: monotone by construction, |rho| = 1.000,
+// printed as "VERDICT: SEPARATION". The winning feature was really a restatement of
+// which handle had enough rows to be scored at all.
+func TestDegenerateGuardsRejectOneDegreeOfFreedom(t *testing.T) {
+	// The exact reported shape.
+	xs := []float64{0.000, 0.125, 0.125}
+	ys := []float64{0.155852, 0.000000, 0.000000}
+	if r, ok := spearman(xs, ys); !ok || math.Abs(r) < 0.99 {
+		t.Fatalf("precondition: this shape is monotone by construction, rho=%v ok=%v", r, ok)
+	}
+	if why := degenerate(xs, ys, 8); why == "" {
+		t.Error("n=3 with two-way ties must be rejected: it is one effective degree of freedom")
+	}
+
+	// Enough handles but a near-constant feature is still not evidence.
+	xs2 := []float64{1, 1, 1, 1, 1, 1, 1, 2}
+	ys2 := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+	if why := degenerate(xs2, ys2, 8); why == "" {
+		t.Error("a feature with 2 distinct values across 8 handles must be rejected")
+	}
+	// ...and symmetric in the outcome, which is the case that matters here because
+	// follow-through has real mass at exactly 0.
+	if why := degenerate(ys2, xs2, 8); why == "" {
+		t.Error("an outcome with 2 distinct values must be rejected")
+	}
+
+	// A genuine relationship with enough spread passes.
+	var big, out []float64
+	for i := 0; i < 20; i++ {
+		big = append(big, float64(i))
+		out = append(out, float64(i)*0.5+float64(i%3))
+	}
+	if why := degenerate(big, out, 8); why != "" {
+		t.Errorf("a 20-handle spread relationship was rejected: %s", why)
+	}
+	if d := distinct([]float64{1, 1, 2, 2, 3}); d != 3 {
+		t.Errorf("distinct = %d, want 3", d)
+	}
+}
