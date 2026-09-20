@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two compiled binaries are no longer tracked in git.** `go build ./cmd/<x>`
+  writes its binary into the working directory, so building from the repo root
+  leaves an executable there and `git add -A` commits it. `lith-s3bench` (14.1 MB)
+  went in with #40/#48 and `lith-pfreplay` (2.8 MB) with #267 — together about
+  **17 MB of a 42 MB pack**, and invisible at review because a binary appears in a
+  diff as one unremarkable line. Both untracked, both added to `.gitignore`, and
+  `TestNoBuiltBinariesTracked` now fails when a file named after a `cmd/` package is
+  tracked — because `.gitignore` does nothing for an already-tracked path, which is
+  how the second one got in while the first sat there. History still contains the
+  blobs; rewriting it for this is not worth the disruption.
+
 - **`--pf-trace` was accepted, documented, and silently ignored**
   ([#264](https://github.com/scttfrdmn/lith/issues/264)). The flag bound a field
   that never reached `fuse.Config`, so it produced no trace, no error, and exit 0 —
