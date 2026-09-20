@@ -126,6 +126,9 @@ func main() {
 	byteExact := flag.Int64("byte-exact-threshold", chunkSize, "largest read eligible for byte-exact fetch, for the cold-start tax estimate")
 	minN := flag.Int("min-n", 8, "minimum scored handles per arm for a correlation to count toward the verdict")
 	issued := flag.Int64("issued", 0, "the run's lith_prefetch_issued_total, if you have it: the only fully independent check on the replay's denominator")
+	keys_ := flag.Bool("keys", false, "also fit the rule at the KEY (object) level and score it against the cold-start tax as well as follow-through; implies -global, since the accounting is the shared one (see keys.go)")
+	keysOut := flag.String("keys-out", "", "write per-key scores and features to this CSV")
+	gran := flag.String("granularity", "", "sweep the cold-start fetch unit over this comma-separated list of sizes (e.g. `1MiB,512KiB,256KiB,64KiB`) and print bytes-saved against round-trips-added: the trade the \"unknown until proven sequential\" fix makes (see granularity.go)")
 	global_ := flag.Bool("global", false, "also score against one SHARED cache per mount: charge each (key, block) fetch once and credit reads by ANY handle on that key (needs the seq and key columns)")
 	issuedPer := flag.String("issued-per", "", "per-trace lith_prefetch_issued_total, e.g. `met/a=2939,hemco/a=4632`: with -global, the independent check on which unit reproduces the mount's fetch volume")
 	flag.Parse()
@@ -135,6 +138,12 @@ func main() {
 	}
 
 	var all, allGlobal []handleScore
+	var allKeys []keyScore
+	// The key-level pass reuses the shared-cache accounting wholesale, so asking for one
+	// without the other would silently score objects against a per-handle denominator.
+	if *keys_ {
+		*global_ = true
+	}
 	var totalDispBytes, totalDecisionBlocks, totalRecordedBlocks, blockSize int64
 	labels := []string{}
 	seenLabel := map[string]bool{}
@@ -160,8 +169,11 @@ func main() {
 		reportFidelity(rows, scores)
 		reportDistribution(scores)
 		reportColdTax(scores)
+		if units := parseUnits(*gran); len(units) > 0 {
+			reportGranularity(spec, sweepGranularity(rows, *byteExact, units))
+		}
 		if *global_ {
-			gs, gstats, err := globalScore(scores, cfg, rows, *byteExact)
+			gs, gstats, kaggs, err := globalScore(scores, cfg, rows, *byteExact)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: -global: %v\n", path, err)
 				os.Exit(1)
@@ -173,6 +185,11 @@ func main() {
 			}
 			reportGlobal(gstats, phDisp, phUsed, parseIssuedPer(*issuedPer)[spec], cfg.blockSize)
 			allGlobal = append(allGlobal, gs...)
+			if *keys_ {
+				ks := scoreKeys(label, arm, cfg, rows, scores, kaggs, *k, *byteExact)
+				reportKeys(ks, cfg.blockSize)
+				allKeys = append(allKeys, ks...)
+			}
 		}
 		for _, sc := range scores {
 			totalDispBytes += sc.dispatchedBytes
@@ -212,6 +229,21 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Printf("\nshared-cache scores written to %s\n", gp)
+		}
+	}
+
+	// And the same rule one level up. Printed THIRD, after both handle-level verdicts,
+	// for the same reason they are both printed: which unit the rule belongs in is the
+	// open question, and a reader has to be able to see every answer to judge it.
+	if *keys_ {
+		fmt.Printf("\n########## the rule at the KEY level, against two targets (see keys.go) ##########\n")
+		reportKeyVerdict(allKeys, labels, *minN, *k)
+		if *keysOut != "" {
+			if err := writeKeyCSV(*keysOut, allKeys); err != nil {
+				fmt.Fprintf(os.Stderr, "write %s: %v\n", *keysOut, err)
+				os.Exit(1)
+			}
+			fmt.Printf("\nper-key scores written to %s\n", *keysOut)
 		}
 	}
 }
