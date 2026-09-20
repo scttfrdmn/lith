@@ -19,7 +19,7 @@ func writeTrace(t *testing.T, rows string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "pf.csv")
 	body := "# lith prefetch trace; block_size=8388608 max_readahead=64 parts_max=67108864 small_file=4194304 coverage_window=16 coverage_min=0.5 evidence_ratio=0\n" +
-		"fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window\n" + rows
+		"fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window\n" + rows
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -29,12 +29,12 @@ func writeTrace(t *testing.T, rows string) string {
 // contiguous emits a handle streaming nbytes from 0 in 128 KiB reads. `dispatched`
 // is left at 0, which is deliberately WRONG for a streaming handle — the fidelity
 // check must notice, which is what proves the check works.
-func contiguous(fh int, nbytes int64) string {
+func contiguous(fh int, nbytes, objSize int64) string {
 	var b strings.Builder
 	var prevEnd int64
 	for off := int64(0); off < nbytes; off += kib {
 		gap := off - prevEnd
-		fmt.Fprintf(&b, "%d,7,obj,%d,%d,%d,%d,window,cold,cold,0,0,0\n", fh, off, kib, off/8388608, gap)
+		fmt.Fprintf(&b, "%d,7,obj,%d,%d,%d,%d,%d,window,cold,cold,0,0,0\n", fh, objSize, off, kib, off/8388608, gap)
 		prevEnd = off + kib
 	}
 	return b.String()
@@ -55,8 +55,8 @@ func TestReplayParsesConfigAndGroupsByHandle(t *testing.T) {
 	// trace carried `fh`.
 	rows := ""
 	for i := int64(0); i < 4; i++ {
-		rows += fmt.Sprintf("1,7,obj,%d,%d,%d,%d,window,cold,cold,0,0,0\n", i*kib, kib, 0, kib)
-		rows += fmt.Sprintf("2,9,obj,%d,%d,%d,%d,window,cold,cold,0,0,0\n", i*kib, kib, 0, kib)
+		rows += fmt.Sprintf("1,7,obj,%d,%d,%d,%d,%d,window,cold,cold,0,0,0\n", 64<<20, i*kib, kib, 0, kib)
+		rows += fmt.Sprintf("2,9,obj,%d,%d,%d,%d,%d,window,cold,cold,0,0,0\n", 64<<20, i*kib, kib, 0, kib)
 	}
 	cfg, parsed, err := readTrace(writeTrace(t, rows))
 	if err != nil {
@@ -65,7 +65,7 @@ func TestReplayParsesConfigAndGroupsByHandle(t *testing.T) {
 	if cfg.blockSize != 8388608 || cfg.maxReadahead != 64 || cfg.coverageWindow != 16 || cfg.coverageMin != 0.5 {
 		t.Errorf("config not parsed: %+v", cfg)
 	}
-	scores := scoreTrace("x", cfg, parsed, 8, 1<<20)
+	scores := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)
 	if len(scores) != 2 {
 		t.Fatalf("got %d handles, want 2 (rows must group by fh)", len(scores))
 	}
@@ -81,11 +81,11 @@ func TestReplayParsesConfigAndGroupsByHandle(t *testing.T) {
 // that is void. The synthetic trace claims dispatched=0 everywhere while a streaming
 // handle really does dispatch, so mismatches must be non-zero.
 func TestReplayFidelityDetectsMismatch(t *testing.T) {
-	cfg, parsed, err := readTrace(writeTrace(t, contiguous(1, 24<<20)))
+	cfg, parsed, err := readTrace(writeTrace(t, contiguous(1, 24<<20, 24<<20)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	scores := scoreTrace("x", cfg, parsed, 8, 1<<20)
+	scores := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)
 	if len(scores) != 1 {
 		t.Fatalf("got %d handles, want 1", len(scores))
 	}
@@ -99,27 +99,94 @@ func TestReplayFidelityDetectsMismatch(t *testing.T) {
 	}
 }
 
-// TestFollowThroughIsBytesNotTouches is the core of the agreed rule: a handle that
-// prefetches a lot and then reads only a sliver must score LOW, where lith's live
-// used/issued would call those chunks "used".
+// TestFollowThroughIsBytesNotTouches is the core of the agreed rule, and it also
+// pins the EOF clamp. A handle that streams an object to its end consumes what it
+// prefetched and must score HIGH; one that prefetches deep into a large object and
+// then stops must score LOW. Before the clamp, both came out near zero, because
+// blocks dispatched past EOF — which the live store.Prefetch declines to fetch at
+// all — were counted in the denominator. That artifact read as "prefetch never pays
+// off" and is what made an earlier version of this tool unusable.
 func TestFollowThroughIsBytesNotTouches(t *testing.T) {
-	// Establish by streaming the first 24 MiB (so blocks get dispatched ahead), then
-	// stop reading. Later reads cover almost none of what was dispatched.
-	cfg, parsed, err := readTrace(writeTrace(t, contiguous(1, 24<<20)))
+	// Reads the whole 24 MiB object: everything dispatched inside the object is read.
+	cfg, parsed, err := readTrace(writeTrace(t, contiguous(1, 24<<20, 24<<20)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := scoreTrace("x", cfg, parsed, 8, 1<<20)[0]
-	if s.dispatchedBytes == 0 {
+	full := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]
+	if full.dispatchedBytes == 0 {
 		t.Fatal("nothing dispatched")
 	}
-	if s.followThrough < 0 || s.followThrough > 1.0001 {
-		t.Errorf("follow-through %.3f out of range", s.followThrough)
+	if full.followThrough < 0.9 {
+		t.Errorf("a handle that streams its whole object scored %.3f, want >= 0.9 "+
+			"(a low score here means past-EOF blocks are polluting the denominator)", full.followThrough)
 	}
-	// The handle stops at 24 MiB while the window reaches far past it, so most
-	// dispatched bytes are never read: a low score is the correct answer.
-	if s.followThrough > 0.5 {
-		t.Errorf("follow-through %.3f: a handle that stops reading should score low", s.followThrough)
+	if full.dispatchedBytes > full.objSize {
+		t.Errorf("dispatched %d bytes against a %d-byte object: the EOF clamp is not working",
+			full.dispatchedBytes, full.objSize)
+	}
+
+	// Same reads, but the object is 512 MiB: the window runs far past what the handle
+	// ever reads, so most dispatched bytes inside the object are wasted.
+	cfg2, parsed2, err := readTrace(writeTrace(t, contiguous(1, 24<<20, 512<<20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stops := scoreTrace("x", "a", cfg2, parsed2, 8, 1<<20)[0]
+	if stops.followThrough >= full.followThrough {
+		t.Errorf("a handle that stops early (%.3f) must score below one that reads to EOF (%.3f)",
+			stops.followThrough, full.followThrough)
+	}
+	if stops.followThrough > 0.6 {
+		t.Errorf("handle that stops early scored %.3f, want clearly low", stops.followThrough)
+	}
+}
+
+// TestColdWasteIsNetOfLaterReads: a contiguous reader consumes the chunks it
+// cold-fetched, so its true cold-start waste is ~0. Charging chunk-minus-read-length
+// credited a streaming arm with hundreds of MiB of fiction, which would have
+// swamped the reported floor on the healthy mount.
+func TestColdWasteIsNetOfLaterReads(t *testing.T) {
+	cfg, parsed, err := readTrace(writeTrace(t, contiguous(1, 24<<20, 24<<20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]
+	if s.coldFirstRunReads == 0 {
+		t.Fatal("expected some pre-decision cold reads")
+	}
+	if s.coldNetWasteBytes != 0 {
+		t.Errorf("net cold waste = %d on a handle that reads every chunk it fetched, want 0", s.coldNetWasteBytes)
+	}
+	if s.coldGrossWasteByte == 0 {
+		t.Error("gross waste should be non-zero: it is the uncorrected figure, kept for comparison")
+	}
+}
+
+// TestColdReentriesExcluded: `state_before == cold` also matches RE-ENTRIES into
+// cold (seq->cold is a real transition), which are not the pre-decision phase the
+// floor mechanism describes. They must be counted separately.
+func TestColdReentriesExcluded(t *testing.T) {
+	rows := ""
+	// First cold run: two pre-decision small reads.
+	for i := 0; i < 2; i++ {
+		rows += fmt.Sprintf("1,7,obj,%d,%d,65536,%d,7340032,window,cold,cold,0,0,0\n", 128<<20, int64(i)*7340032, i)
+	}
+	// Classified.
+	rows += fmt.Sprintf("1,7,obj,%d,%d,65536,5,7340032,window,sequential,sequential,4,0,4\n", 128<<20, int64(5)*7340032)
+	// Back to cold: a re-entry, not the pre-decision phase.
+	for i := 6; i < 9; i++ {
+		rows += fmt.Sprintf("1,7,obj,%d,%d,65536,%d,7340032,window,cold,cold,0,0,0\n", 128<<20, int64(i)*7340032, i)
+	}
+	cfg, parsed, err := readTrace(writeTrace(t, rows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]
+	if s.coldFirstRunReads != 2 {
+		t.Errorf("first-run cold reads = %d, want 2", s.coldFirstRunReads)
+	}
+	if s.coldReentryReads != 3 {
+		t.Errorf("cold re-entry reads = %d, want 3 (counted, but not charged to the floor)", s.coldReentryReads)
 	}
 }
 
@@ -143,21 +210,21 @@ func TestCoveredBytesUnionsOverlaps(t *testing.T) {
 func TestColdTaxCountsPreDecisionSmallReads(t *testing.T) {
 	rows := ""
 	for i := 0; i < 5; i++ {
-		rows += fmt.Sprintf("1,7,obj,%d,65536,%d,7340032,window,cold,cold,0,0,0\n", i*7340032, i)
+		rows += fmt.Sprintf("1,7,obj,%d,%d,65536,%d,7340032,window,cold,cold,0,0,0\n", 128<<20, i*7340032, i)
 	}
 	// One read after classification: must NOT be counted.
-	rows += "1,7,obj,99999744,65536,11,7340032,window,random,random,0,0,0\n"
+	rows += "1,7,obj,134217728,99999744,65536,11,7340032,window,random,random,0,0,0\n"
 	cfg, parsed, err := readTrace(writeTrace(t, rows))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := scoreTrace("x", cfg, parsed, 8, 1<<20)[0]
-	if s.coldSmallReads != 5 {
-		t.Errorf("coldSmallReads = %d, want 5 (only the cold-state rows)", s.coldSmallReads)
+	s := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]
+	if s.coldFirstRunReads != 5 {
+		t.Errorf("coldFirstRunReads = %d, want 5 (only first-run cold rows)", s.coldFirstRunReads)
 	}
 	wantWaste := int64(5) * (1<<20 - 65536)
-	if s.coldSmallReadWasteBytes != wantWaste {
-		t.Errorf("waste = %d, want %d", s.coldSmallReadWasteBytes, wantWaste)
+	if s.coldGrossWasteByte != wantWaste {
+		t.Errorf("gross waste = %d, want %d", s.coldGrossWasteByte, wantWaste)
 	}
 }
 
@@ -166,14 +233,14 @@ func TestColdTaxCountsPreDecisionSmallReads(t *testing.T) {
 // decisions, yet still count them as reads for follow-through — otherwise it scores a
 // different program than the one that ran.
 func TestOmittedRowsAreNotReplayedButAreRead(t *testing.T) {
-	rows := contiguous(1, 16<<20)
+	rows := contiguous(1, 16<<20, 64<<20)
 	// A later read, on the parts path, covering block 3's bytes.
-	rows += "1,7,obj,25165824,1048576,3,0,parts,sequential,sequential,64,0,64\n"
+	rows += "1,7,obj,67108864,25165824,1048576,3,0,parts,sequential,sequential,64,0,64\n"
 	cfg, parsed, err := readTrace(writeTrace(t, rows))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := scoreTrace("x", cfg, parsed, 8, 1<<20)[0]
+	s := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]
 	if s.rows != len(strings.Split(strings.TrimSpace(rows), "\n")) {
 		t.Errorf("rows=%d; every read must be counted, including omitted ones", s.rows)
 	}

@@ -26,9 +26,22 @@
 //
 //	lith-pfreplay [-k 8] [-out handles.csv] hemco=hemco.csv met=met.csv
 //
-// Replay fidelity is reported first and deliberately loudly: if the replayed
-// dispatch counts disagree with what the live mount recorded, every number after it
-// is void.
+// Two semantics worth knowing before reading any number it prints:
+//
+//   - Dispatched blocks are CLAMPED AT EOF, exactly as store.Prefetch clamps them.
+//     Without that, a deep readahead window against a small object counts blocks
+//     that fetched nothing, which drags every score to ~0 and reads as "prefetch
+//     never pays off".
+//   - Dispatched bytes count DECISIONS, not S3 bytes: several handles read one
+//     object, and a handle that re-establishes after a seek asks for blocks it
+//     already asked for. The live block store dedupes those; this does not.
+//
+// Fidelity is reported first and labelled for what it does and does not prove. The
+// state-machine check compares Observe's output against a trace column that also
+// came from Observe, so it validates the replayed detector but CANNOT catch an error
+// in byte accounting — which is the class of bug this tool shipped with first time.
+// The denominator sanity check and the optional -issued cross-check are the
+// independent ones.
 package main
 
 import (
@@ -50,6 +63,7 @@ const chunkSize = 1 << 20 // lith's cache-chunk granularity, for the straddle fe
 
 type row struct {
 	fh          uint64
+	size        int64 // object size, for the EOF clamp
 	off, length int64
 	blk, gap    int64
 	path        string // window | parts | footer
@@ -67,27 +81,40 @@ type traceConfig struct {
 // it. Fields are exported through the CSV so the maintainer can re-analyse without
 // re-running this tool.
 type handleScore struct {
-	label                   string
-	fh                      uint64
-	rows                    int
-	dispatchedBytes         int64
-	usedBytes               int64
-	followThrough           float64
-	mismatches              int
-	meanAbsGapBlocks        float64
-	maxAbsGapBlocks         float64
-	fracLargeGap            float64
-	meanReadKiB             float64
-	fracMonotonic           float64
-	fracStraddle            float64
-	coldSmallReads          int // the #256 cold-start granularity tax, countable here
-	coldSmallReadWasteBytes int64
+	label            string // class (hemco / met) — what the AUC compares
+	arm              string // arm within the class — what train/test splits on
+	fh               uint64
+	objSize          int64
+	rows             int
+	dispatchedBytes  int64
+	usedBytes        int64
+	followThrough    float64
+	mismatches       int
+	meanAbsGapBlocks float64
+	maxAbsGapBlocks  float64
+	fracLargeGap     float64
+	meanReadKiB      float64
+	fracMonotonic    float64
+	fracStraddle     float64
+	// #256 cold-start granularity tax. Counted two ways, because both distinctions
+	// were reported as inflating the estimate (and both did):
+	//   - waste is NET: chunk bytes the same handle never subsequently read. A
+	//     contiguous reader consumes the chunks it cold-fetched, so its real waste is
+	//     ~0; charging it chunk-minus-read-length credited a streaming arm with
+	//     hundreds of MiB of fiction.
+	//   - first-run cold is split from RE-ENTRIES into cold (seq->cold transitions are
+	//     real), because only the first run is the pre-decision phase.
+	coldFirstRunReads  int
+	coldReentryReads   int
+	coldNetWasteBytes  int64 // first-run only
+	coldGrossWasteByte int64 // chunk - read_len, the inflated figure, kept for comparison
 }
 
 func main() {
 	k := flag.Int("k", 8, "number of a handle's first reads the predictive features may use")
 	out := flag.String("out", "", "also write per-handle scores and features to this CSV")
 	byteExact := flag.Int64("byte-exact-threshold", chunkSize, "largest read eligible for byte-exact fetch, for the cold-start tax estimate")
+	issued := flag.Int64("issued", 0, "the run's lith_prefetch_issued_total, if you have it: the only fully independent check on the replay's denominator")
 	flag.Parse()
 	if flag.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "usage: lith-pfreplay [-k 8] [-out handles.csv] label=trace.csv [label=trace.csv ...]")
@@ -96,28 +123,34 @@ func main() {
 
 	var all []handleScore
 	labels := []string{}
+	seenLabel := map[string]bool{}
 	for _, arg := range flag.Args() {
-		label, path, ok := strings.Cut(arg, "=")
+		spec, path, ok := strings.Cut(arg, "=")
 		if !ok {
-			// No explicit label: name the arm after the file, so a single-trace run
-			// still reports something readable.
 			path = arg
-			label = strings.TrimSuffix(filepath.Base(arg), ".csv")
+			spec = strings.TrimSuffix(filepath.Base(arg), ".csv")
 		}
+		// class[/arm]: the CLASS is what the AUC compares (hemco vs met) and the ARM is
+		// what the train/test split uses. Without the distinction, four traces named
+		// hemcoA hemcoB metA metB compared HEMCO against HEMCO.
+		label, arm, _ := strings.Cut(spec, "/")
 		cfg, rows, err := readTrace(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
 			os.Exit(1)
 		}
-		scores := scoreTrace(label, cfg, rows, *k, *byteExact)
-		fmt.Printf("== %s (%s)\n", label, path)
+		scores := scoreTrace(label, arm, cfg, rows, *k, *byteExact)
+		fmt.Printf("== class=%s arm=%s (%s)\n", label, arm, path)
 		fmt.Printf("   config: block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage=%d/%g evidence_ratio=%g\n",
 			cfg.blockSize, cfg.maxReadahead, cfg.partsMax, cfg.smallFile, cfg.coverageWindow, cfg.coverageMin, cfg.evidenceRatio)
-		reportFidelity(rows, scores)
+		reportFidelity(rows, scores, *issued)
 		reportDistribution(scores)
 		reportColdTax(scores)
 		all = append(all, scores...)
-		labels = append(labels, label)
+		if !seenLabel[label] {
+			seenLabel[label] = true
+			labels = append(labels, label)
+		}
 	}
 
 	reportSeparation(all, labels)
@@ -185,8 +218,12 @@ func readTrace(path string) (traceConfig, []row, error) {
 		}
 		atoi := func(name string) int64 { v, _ := strconv.ParseInt(rec[col[name]], 10, 64); return v }
 		fh, _ := strconv.ParseUint(rec[col["fh"]], 10, 64)
+		var size int64
+		if _, ok := col["size"]; ok {
+			size = atoi("size")
+		}
 		rows = append(rows, row{
-			fh: fh, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
+			fh: fh, size: size, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
 			path: rec[col["path"]], before: rec[col["state_before"]], dispatched: int(atoi("dispatched")),
 		})
 	}
@@ -224,7 +261,7 @@ func parseConfig(line string) (traceConfig, bool) {
 }
 
 // scoreTrace replays each handle and scores it.
-func scoreTrace(label string, cfg traceConfig, rows []row, k int, byteExact int64) []handleScore {
+func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact int64) []handleScore {
 	byHandle := map[uint64][]row{}
 	order := []uint64{}
 	for _, r := range rows {
@@ -237,7 +274,7 @@ func scoreTrace(label string, cfg traceConfig, rows []row, k int, byteExact int6
 	var out []handleScore
 	for _, fh := range order {
 		hr := byHandle[fh]
-		s := handleScore{label: label, fh: fh, rows: len(hr)}
+		s := handleScore{label: label, arm: arm, fh: fh, rows: len(hr)}
 
 		// Replay. Only rows the live mount actually drove the prefetcher with
 		// (path=window) are fed to it; the others are real reads that the live code
@@ -267,12 +304,26 @@ func scoreTrace(label string, cfg traceConfig, rows []row, k int, byteExact int6
 			}
 		}
 
+		// The object's size, needed to clamp dispatched blocks at EOF exactly as
+		// store.Prefetch does. Without this the denominator counts blocks that fetched
+		// NOTHING: at max_readahead=223 against a 14-block object, ~94% of it, which
+		// drives every follow-through score to ~0 and reads as "prefetch never pays
+		// off". Falls back to the handle's own high-water mark for pre-#267 traces,
+		// which under-counts rather than inflating, and is reported as an estimate.
+		s.objSize = objSizeOf(hr)
+
 		// Byte follow-through: for each dispatched block, the union of bytes that
 		// LATER reads of this same handle covered within it.
 		for _, d := range dispatches {
 			lo := d.block * cfg.blockSize
+			if s.objSize > 0 && lo >= s.objSize {
+				continue // past EOF: the live fetch returns without doing anything
+			}
 			hi := lo + cfg.blockSize
-			s.dispatchedBytes += cfg.blockSize
+			if s.objSize > 0 && hi > s.objSize {
+				hi = s.objSize
+			}
+			s.dispatchedBytes += hi - lo
 			s.usedBytes += coveredBytes(hr[d.atRow+1:], lo, hi)
 		}
 		if s.dispatchedBytes > 0 {
@@ -281,7 +332,7 @@ func scoreTrace(label string, cfg traceConfig, rows []row, k int, byteExact int6
 			s.followThrough = math.NaN()
 		}
 
-		s.coldSmallReads, s.coldSmallReadWasteBytes = coldTax(hr, byteExact)
+		coldTax(&s, hr, byteExact)
 		features(&s, hr, cfg.blockSize, k)
 		out = append(out, s)
 	}
@@ -324,18 +375,73 @@ func coveredBytes(reads []row, lo, hi int64) int64 {
 	return total + cur.b - cur.a
 }
 
-// coldTax counts reads served at whole-chunk granularity purely because the handle
-// was not yet classified — the #256 floor mechanism. A `cold` handle gets
-// `sequential = true` in the granularity decision, so a small read pays a whole
-// chunk. Waste is the chunk minus what the read asked for.
-func coldTax(hr []row, byteExact int64) (n int, waste int64) {
+// objSizeOf returns the object size the trace recorded, or the handle's own
+// high-water read offset when the trace predates the size column. The fallback
+// under-states the size, which under-states the denominator — the safe direction,
+// since the failure being guarded against is an inflated one.
+func objSizeOf(hr []row) int64 {
 	for _, r := range hr {
-		if r.path == "window" && r.before == "cold" && r.length <= byteExact && r.length < chunkSize {
-			n++
-			waste += chunkSize - r.length
+		if r.size > 0 {
+			return r.size
 		}
 	}
-	return n, waste
+	var hi int64
+	for _, r := range hr {
+		if e := r.off + r.length; e > hi {
+			hi = e
+		}
+	}
+	return hi
+}
+
+// coldTax measures the #256 floor: a read served at whole-chunk granularity purely
+// because the handle was not yet classified (a `cold` handle takes `sequential =
+// true` in the granularity decision, so a small read pays a whole chunk).
+//
+// Two corrections over the naive count, both reported as inflating it:
+//
+//   - Waste is NET — chunk bytes the same handle never reads at all. A contiguous
+//     reader consumes what it cold-fetched, so its true waste is ~0; charging it
+//     chunk-minus-read-length credits a streaming arm with fiction.
+//   - Only the FIRST cold run is the pre-decision phase. A handle can re-enter cold
+//     later (seq->cold is a real transition), and those reads are not what the
+//     mechanism describes.
+//
+// Chunks are counted once: a second cold read landing in a chunk already fetched is
+// a cache hit and costs nothing.
+func coldTax(s *handleScore, hr []row, byteExact int64) {
+	firstRun := true
+	seen := map[int64]bool{}
+	for _, r := range hr {
+		if r.before != "cold" {
+			firstRun = false // the handle has been classified at least once
+			continue
+		}
+		if r.path != "window" || r.length > byteExact || r.length >= chunkSize {
+			continue
+		}
+		if !firstRun {
+			s.coldReentryReads++
+			continue
+		}
+		s.coldFirstRunReads++
+		ci := r.off / chunkSize
+		if seen[ci] {
+			continue // the chunk was already fetched by an earlier cold read
+		}
+		seen[ci] = true
+		lo := ci * chunkSize
+		hi := lo + chunkSize
+		if s.objSize > 0 && hi > s.objSize {
+			hi = s.objSize
+		}
+		if hi <= lo {
+			continue
+		}
+		s.coldGrossWasteByte += (hi - lo) - r.length
+		// Net: everything in the chunk this handle never reads, at any point.
+		s.coldNetWasteBytes += (hi - lo) - coveredBytes(hr, lo, hi)
+	}
 }
 
 // features computes the candidates the agreed rule allows: anything derivable from
@@ -376,26 +482,72 @@ func features(s *handleScore, hr []row, blockSize int64, k int) {
 	}
 }
 
-func reportFidelity(rows []row, scores []handleScore) {
+func reportFidelity(rows []row, scores []handleScore, issued int64) {
 	var mism, handles int
-	for _, s := range scores {
-		if s.mismatches > 0 {
+	var dispBytes, objBytes int64
+	seenKey := map[int64]bool{}
+	for _, sc := range scores {
+		if sc.mismatches > 0 {
 			mism++
 		}
 		handles++
+		dispBytes += sc.dispatchedBytes
+		if !seenKey[sc.objSize] {
+			seenKey[sc.objSize] = true
+			objBytes += sc.objSize
+		}
 	}
 	pathCount := map[string]int{}
+	haveSize := false
 	for _, r := range rows {
 		pathCount[r.path]++
+		if r.size > 0 {
+			haveSize = true
+		}
 	}
 	fmt.Printf("   rows: %d (window=%d parts=%d footer=%d)  handles: %d\n",
 		len(rows), pathCount["window"], pathCount["parts"], pathCount["footer"], handles)
-	if mism == 0 {
-		fmt.Printf("   replay fidelity: OK — replayed dispatch counts match the live mount on every handle\n")
-		return
+	if !haveSize {
+		fmt.Printf("   ** no `size` column: object sizes ESTIMATED from each handle's highest read offset.\n")
+		fmt.Printf("      The EOF clamp is therefore approximate (it under-states, not over-states). Recapture with a #267 binary.\n")
 	}
-	fmt.Printf("   replay fidelity: ** MISMATCH on %d/%d handles ** — every number below is void until this is zero.\n", mism, handles)
-	fmt.Printf("     (a replay that does not reproduce the live decisions cannot score a hypothetical policy)\n")
+
+	// State-machine fidelity. Deliberately labelled for what it does and does not
+	// prove: both sides of this comparison originate in Observe, so it CANNOT catch
+	// an error in how dispatched blocks are converted to bytes. That is exactly the
+	// class of bug an earlier version of this tool shipped with, so the check below
+	// it is the one that matters.
+	if mism == 0 {
+		fmt.Printf("   state-machine fidelity: OK — replayed dispatch DECISIONS match the recorded ones on every handle\n")
+	} else {
+		fmt.Printf("   state-machine fidelity: ** MISMATCH on %d/%d handles ** — the detector replay is wrong; everything below is void.\n", mism, handles)
+	}
+	fmt.Printf("     (this compares Observe against a column produced by Observe: it validates the state machine, NOT the byte accounting)\n")
+
+	// Independent sanity check on the denominator.
+	if objBytes > 0 {
+		ratio := float64(dispBytes) / float64(objBytes)
+		// >1x is normal and not a bug: several handles read one object, and a handle
+		// that re-establishes after a seek re-dispatches blocks it already asked for.
+		// The live block store dedupes those; this counts decisions.
+		fmt.Printf("   denominator sanity: %.1f MiB of dispatch DECISIONS against %.1f MiB of distinct objects (%.2fx; >1x is normal)\n",
+			float64(dispBytes)/(1<<20), float64(objBytes)/(1<<20), ratio)
+		if ratio > 4 {
+			fmt.Printf("     ** IMPLAUSIBLE: a mount cannot usefully dispatch many times an object's size. Suspect the EOF clamp. **\n")
+		}
+	}
+	if issued > 0 {
+		// The live counter is the only fully independent witness available. It counts
+		// chunks actually FETCHED (deduped: a re-dispatch of a cached chunk records
+		// nothing), whereas this replay counts DECISIONS, which legitimately repeat
+		// across handles and across re-establishments within a handle. So replay is
+		// expected to exceed it; only a wild excess indicates a broken denominator.
+		replayChunks := dispBytes / chunkSize
+		fmt.Printf("   vs live lith_prefetch_issued_total: replay %d chunk-decisions, mount %d chunks fetched\n", replayChunks, issued)
+		if replayChunks > 4*issued {
+			fmt.Printf("     ** replay is >4x the mount's fetched chunks: too far apart to be dedup alone. Suspect the clamp. **\n")
+		}
+	}
 }
 
 func reportDistribution(scores []handleScore) {
@@ -415,14 +567,18 @@ func reportDistribution(scores []handleScore) {
 }
 
 func reportColdTax(scores []handleScore) {
-	var n int
-	var waste int64
+	var first, reentry int
+	var net, gross int64
 	for _, s := range scores {
-		n += s.coldSmallReads
-		waste += s.coldSmallReadWasteBytes
+		first += s.coldFirstRunReads
+		reentry += s.coldReentryReads
+		net += s.coldNetWasteBytes
+		gross += s.coldGrossWasteByte
 	}
-	fmt.Printf("   cold-start granularity tax (#256 floor): %d pre-decision small reads, %.1f MiB wasted\n",
-		n, float64(waste)/(1<<20))
+	fmt.Printf("   cold-start granularity tax (#256 floor): %d first-run pre-decision small reads (+%d cold re-entries, excluded)\n",
+		first, reentry)
+	fmt.Printf("     NET waste %.1f MiB (chunk bytes never read by that handle)   [gross, uncorrected: %.1f MiB]\n",
+		float64(net)/(1<<20), float64(gross)/(1<<20))
 }
 
 // reportSeparation applies the pre-registered rule.
@@ -436,14 +592,24 @@ func reportSeparation(all []handleScore, labels []string) {
 	}
 
 	auc := math.NaN()
-	if len(labels) >= 2 {
+	for _, lab := range labels {
+		if len(byLabel[lab]) == 0 {
+			fmt.Printf("   ** class %q has NO handles that dispatched prefetch: the AUC half of the rule cannot be\n", lab)
+			fmt.Printf("      evaluated for it, and \"no separation\" must NOT be concluded from its absence. **\n")
+		}
+	}
+	switch {
+	case len(labels) < 2:
+		fmt.Printf("   AUC: needs two CLASSES (e.g. hemco/a=1.csv hemco/b=2.csv met/a=3.csv met/b=4.csv)\n")
+	case len(labels) > 2:
+		fmt.Printf("   AUC: %d classes given; the rule is defined for two. Classes: %v\n", len(labels), labels)
+	default:
 		a, b := byLabel[labels[0]], byLabel[labels[1]]
 		if v, ok := aucMannWhitney(a, b); ok {
 			auc = math.Max(v, 1-v)
 			fmt.Printf("   AUC(%s vs %s) on byte follow-through = %.3f  (n=%d vs %d)\n", labels[0], labels[1], auc, len(a), len(b))
+			fmt.Printf("     (note: the 0.7 bar is undemanding — a uniform shift of one unit clears it at 0.719)\n")
 		}
-	} else {
-		fmt.Printf("   AUC: needs two labelled traces (e.g. hemco=a.csv met=b.csv)\n")
 	}
 
 	type feat struct {
@@ -461,32 +627,51 @@ func reportSeparation(all []handleScore, labels []string) {
 
 	best := 0.0
 	bestName := "(none)"
-	fmt.Printf("   Spearman rho of each first-%s-read feature against byte follow-through:\n", "k")
+	fmt.Printf("   Spearman rho per class/arm (train on one arm, test on another — the agreed rule):\n")
 	for _, ft := range feats {
 		line := "     " + fmt.Sprintf("%-22s", ft.name)
 		holds := 0
 		for _, lab := range labels {
-			var xs, ys []float64
-			for _, s := range all {
-				if s.label == lab && !math.IsNaN(s.followThrough) {
-					xs = append(xs, ft.get(s))
-					ys = append(ys, s.followThrough)
+			arms := map[string][]handleScore{}
+			armOrder := []string{}
+			for _, sc := range all {
+				if sc.label != lab || math.IsNaN(sc.followThrough) {
+					continue
 				}
+				if _, ok := arms[sc.arm]; !ok {
+					armOrder = append(armOrder, sc.arm)
+				}
+				arms[sc.arm] = append(arms[sc.arm], sc)
 			}
-			if r, ok := spearman(xs, ys); ok {
-				line += fmt.Sprintf("  %s=%+.3f", lab, r)
-				if math.Abs(r) >= 0.5 {
-					holds++
+			if len(armOrder) == 0 {
+				line += fmt.Sprintf("  %s=(no prefetching handles)", lab)
+				continue
+			}
+			for _, a := range armOrder {
+				var xs, ys []float64
+				for _, sc := range arms[a] {
+					xs = append(xs, ft.get(sc))
+					ys = append(ys, sc.followThrough)
 				}
-				if math.Abs(r) > best {
-					best, bestName = math.Abs(r), ft.name
+				name := lab
+				if a != "" {
+					name = lab + "/" + a
 				}
-			} else {
-				line += fmt.Sprintf("  %s=n/a", lab)
+				if r, ok := spearman(xs, ys); ok {
+					line += fmt.Sprintf("  %s=%+.3f", name, r)
+					if math.Abs(r) >= 0.5 {
+						holds++
+					}
+					if math.Abs(r) > best {
+						best, bestName = math.Abs(r), ft.name
+					}
+				} else {
+					line += fmt.Sprintf("  %s=n/a", name)
+				}
 			}
 		}
 		if holds >= 2 {
-			line += "   <- holds on both arms"
+			line += "   <- |rho|>=0.5 on 2+ arms (survives out-of-sample)"
 		}
 		fmt.Println(line)
 	}
@@ -518,21 +703,23 @@ func writeCSV(path string, all []handleScore) error {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 	if err := w.Write([]string{
-		"label", "fh", "rows", "dispatched_bytes", "used_bytes", "byte_follow_through", "replay_mismatches",
+		"label", "arm", "fh", "rows", "dispatched_bytes", "used_bytes", "byte_follow_through", "replay_mismatches",
 		"mean_abs_gap_blocks", "max_abs_gap_blocks", "frac_large_gap", "mean_read_kib", "frac_monotonic",
-		"frac_straddle", "cold_small_reads", "cold_small_read_waste_bytes",
+		"frac_straddle", "obj_size", "cold_first_run_reads", "cold_reentry_reads",
+		"cold_net_waste_bytes", "cold_gross_waste_bytes",
 	}); err != nil {
 		return err
 	}
 	for _, s := range all {
 		if err := w.Write([]string{
-			s.label, strconv.FormatUint(s.fh, 10), strconv.Itoa(s.rows),
+			s.label, s.arm, strconv.FormatUint(s.fh, 10), strconv.Itoa(s.rows),
 			strconv.FormatInt(s.dispatchedBytes, 10), strconv.FormatInt(s.usedBytes, 10),
 			strconv.FormatFloat(s.followThrough, 'f', 6, 64), strconv.Itoa(s.mismatches),
 			strconv.FormatFloat(s.meanAbsGapBlocks, 'f', 6, 64), strconv.FormatFloat(s.maxAbsGapBlocks, 'f', 6, 64),
 			strconv.FormatFloat(s.fracLargeGap, 'f', 6, 64), strconv.FormatFloat(s.meanReadKiB, 'f', 3, 64),
 			strconv.FormatFloat(s.fracMonotonic, 'f', 6, 64), strconv.FormatFloat(s.fracStraddle, 'f', 6, 64),
-			strconv.Itoa(s.coldSmallReads), strconv.FormatInt(s.coldSmallReadWasteBytes, 10),
+			strconv.FormatInt(s.objSize, 10), strconv.Itoa(s.coldFirstRunReads), strconv.Itoa(s.coldReentryReads),
+			strconv.FormatInt(s.coldNetWasteBytes, 10), strconv.FormatInt(s.coldGrossWasteByte, 10),
 		}); err != nil {
 			return err
 		}

@@ -17,8 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later read — so a candidate policy costs a replay instead of a run. Not a shipped
   binary (goreleaser builds only `./cmd/lith`).
 
-  It reports **replay fidelity first**: if the replayed dispatch counts disagree
-  with what the live mount recorded, it says so and every number after it is void.
+  Dispatched blocks are **clamped at EOF** exactly as `store.Prefetch` clamps them:
+  without that, a deep readahead window against a small object counts blocks that
+  fetched nothing (measured at ~94% of the denominator in one case), dragging every
+  score to ~0 and reading as "prefetch never pays off". The cold-start tax is
+  measured **net** of bytes the same handle later reads, and first-run `cold` is
+  split from re-entries — both corrections requested after the first version
+  inflated a streaming arm's waste by hundreds of MiB.
+
+  Fidelity is reported first and **labelled for what it does not prove**: the
+  state-machine check compares `Observe` against a trace column that also came from
+  `Observe`, so it cannot catch a byte-accounting error. A denominator sanity check
+  and an optional `-issued` cross-check against the live counter are the independent
+  ones. The trace gained a `size` column so the clamp is exact rather than estimated.
   The scoring rule is the one agreed and pre-registered with the reporting workload
   before either side had data — bytes not chunk touches, Spearman |ρ| ≥ 0.5 fit on
   one arm and tested on another, no-separation iff |ρ| < 0.5 **and** rank-sum
