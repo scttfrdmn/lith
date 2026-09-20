@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,5 +249,71 @@ func TestOmittedRowsAreNotReplayedButAreRead(t *testing.T) {
 	if s.usedBytes == 0 {
 		t.Error("a later `parts` read covering a dispatched block contributed no used bytes; " +
 			"omitted rows must still count as reads")
+	}
+}
+
+// captureStdout runs f and returns what it printed.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	f()
+	_ = w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+// TestDegenerateArmCannotProduceSeparation pins the wiring, not just the helper:
+// the reported failure was an arm with n=3 and a two-way tie on both axes printing
+// "VERDICT: SEPARATION" off |rho| = 1.000, on a feature that was a restatement of
+// which handle had enough rows to be scored. The guard must keep that out of the
+// verdict even though the correlation is real arithmetic.
+func TestDegenerateArmCannotProduceSeparation(t *testing.T) {
+	// The exact reported numbers, as two arms of one class (replication of a
+	// degenerate fit must not rescue it).
+	mk := func(arm string) []handleScore {
+		return []handleScore{
+			{label: "met", arm: arm, fh: 1, followThrough: 0.155852, fracLargeGap: 0.000},
+			{label: "met", arm: arm, fh: 2, followThrough: 0.000000, fracLargeGap: 0.125},
+			{label: "met", arm: arm, fh: 6, followThrough: 0.000000, fracLargeGap: 0.125},
+		}
+	}
+	all := append(mk("a"), mk("b")...)
+
+	out := captureStdout(t, func() { reportSeparation(all, []string{"met"}, 8) })
+
+	if strings.Contains(out, "VERDICT: SEPARATION") {
+		t.Errorf("a degenerate arm (n=3, two-way ties) produced a SEPARATION verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "n=3<8") {
+		t.Errorf("the rejection reason should be shown next to the value, so the reader sees why it was not counted:\n%s", out)
+	}
+	if strings.Contains(out, "QUALIFYING arms") {
+		t.Errorf("a degenerate fit replicated across arms must not be annotated as surviving out-of-sample:\n%s", out)
+	}
+
+	// Control: the same shape with enough spread DOES count, so the guard is not
+	// simply suppressing everything.
+	var spread []handleScore
+	for i := 0; i < 12; i++ {
+		spread = append(spread,
+			handleScore{label: "met", arm: "a", fh: uint64(i), followThrough: float64(i) / 12, fracLargeGap: float64(i) * 0.01},
+			handleScore{label: "met", arm: "b", fh: uint64(100 + i), followThrough: float64(i) / 12, fracLargeGap: float64(i) * 0.01})
+	}
+	out2 := captureStdout(t, func() { reportSeparation(spread, []string{"met"}, 8) })
+	if strings.Contains(out2, "n=12<8") {
+		t.Errorf("a 12-handle arm was wrongly rejected:\n%s", out2)
+	}
+	if !strings.Contains(out2, "best |rho| = 1.000") {
+		t.Errorf("a genuine monotone relationship over 12 handles should count:\n%s", out2)
 	}
 }

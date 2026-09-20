@@ -106,6 +106,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three more defects in `lith-pfreplay`, all found before the expensive capture**
+  ([#267](https://github.com/scttfrdmn/lith/pull/267)). A **degenerate arm could
+  declare `VERDICT: SEPARATION`** — n=3 with a two-way tie on both axes is monotone
+  by construction, and the winning feature was a restatement of which handle had
+  enough rows to be scored at all; correlations now count toward the verdict only
+  from arms with enough handles and enough distinct values on both axes, and
+  replication across arms no longer excuses a degenerate fit. The **`-issued`
+  cross-check compared one run's counter against each trace separately**, so the
+  line that exists to catch a 12× error was itself off by up to N×; it is now
+  computed once over the summed replay, and reports the factor by which per-handle
+  scores understate prefetch's value. And when a trace has no `size` column the
+  **denominator-sanity ratio is suppressed rather than printed**, because estimated
+  per-handle sizes inflate "distinct objects" while decisions collapse — measured
+  turning 2.02× into 0.07×, which reads as reassuring at exactly the moment it is
+  broken. A size-less trace also silently drops the handles that stopped early (the
+  most wasteful ones), which is now reported.
+
 - **Two compiled binaries are no longer tracked in git.** `go build ./cmd/<x>`
   writes its binary into the working directory, so building from the repo root
   leaves an executable there and `git add -A` commits it. `lith-s3bench` (14.1 MB)

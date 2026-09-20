@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"sort"
 )
@@ -103,6 +104,38 @@ func quantile(xs []float64, p float64) float64 {
 		i = len(xs) - 1
 	}
 	return xs[i]
+}
+
+// minDistinct is how many distinct values each axis needs before a correlation may
+// influence the verdict. With three handles and a two-way tie on both axes, any
+// monotone relation gives |rho| = 1 by construction — which is how an earlier build
+// printed "VERDICT: SEPARATION" off one effective degree of freedom, on a feature
+// that was really a restatement of which handle had enough rows to be scored at all.
+const minDistinct = 4
+
+// degenerate returns a short reason when a correlation must not count toward the
+// verdict, or "" when it may. Checked per arm: replicating a degenerate fit on a
+// replicate of the same workload adds no degree of freedom, so agreement across arms
+// must not excuse it.
+func degenerate(xs, ys []float64, minN int) string {
+	if len(xs) < minN {
+		return fmt.Sprintf("n=%d<%d", len(xs), minN)
+	}
+	if d := distinct(xs); d < minDistinct {
+		return fmt.Sprintf("feature has %d distinct", d)
+	}
+	if d := distinct(ys); d < minDistinct {
+		return fmt.Sprintf("outcome has %d distinct", d)
+	}
+	return ""
+}
+
+func distinct(xs []float64) int {
+	seen := map[float64]bool{}
+	for _, x := range xs {
+		seen[x] = true
+	}
+	return len(seen)
 }
 
 func mean(xs []float64) float64 {

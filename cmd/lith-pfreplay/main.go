@@ -108,12 +108,15 @@ type handleScore struct {
 	coldReentryReads   int
 	coldNetWasteBytes  int64 // first-run only
 	coldGrossWasteByte int64 // chunk - read_len, the inflated figure, kept for comparison
+	dispatchDecisions  int   // blocks Observe returned, before the EOF clamp
+	clampedAway        int   // of those, how many fell entirely past the object's end
 }
 
 func main() {
 	k := flag.Int("k", 8, "number of a handle's first reads the predictive features may use")
 	out := flag.String("out", "", "also write per-handle scores and features to this CSV")
 	byteExact := flag.Int64("byte-exact-threshold", chunkSize, "largest read eligible for byte-exact fetch, for the cold-start tax estimate")
+	minN := flag.Int("min-n", 8, "minimum scored handles per arm for a correlation to count toward the verdict")
 	issued := flag.Int64("issued", 0, "the run's lith_prefetch_issued_total, if you have it: the only fully independent check on the replay's denominator")
 	flag.Parse()
 	if flag.NArg() == 0 {
@@ -122,6 +125,7 @@ func main() {
 	}
 
 	var all []handleScore
+	var totalDispBytes int64
 	labels := []string{}
 	seenLabel := map[string]bool{}
 	for _, arg := range flag.Args() {
@@ -143,9 +147,12 @@ func main() {
 		fmt.Printf("== class=%s arm=%s (%s)\n", label, arm, path)
 		fmt.Printf("   config: block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage=%d/%g evidence_ratio=%g\n",
 			cfg.blockSize, cfg.maxReadahead, cfg.partsMax, cfg.smallFile, cfg.coverageWindow, cfg.coverageMin, cfg.evidenceRatio)
-		reportFidelity(rows, scores, *issued)
+		reportFidelity(rows, scores)
 		reportDistribution(scores)
 		reportColdTax(scores)
+		for _, sc := range scores {
+			totalDispBytes += sc.dispatchedBytes
+		}
 		all = append(all, scores...)
 		if !seenLabel[label] {
 			seenLabel[label] = true
@@ -153,7 +160,8 @@ func main() {
 		}
 	}
 
-	reportSeparation(all, labels)
+	reportIssuedCrossCheck(totalDispBytes, *issued)
+	reportSeparation(all, labels, *minN)
 	if *out != "" {
 		if err := writeCSV(*out, all); err != nil {
 			fmt.Fprintf(os.Stderr, "write %s: %v\n", *out, err)
@@ -314,9 +322,11 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 
 		// Byte follow-through: for each dispatched block, the union of bytes that
 		// LATER reads of this same handle covered within it.
+		s.dispatchDecisions = len(dispatches)
 		for _, d := range dispatches {
 			lo := d.block * cfg.blockSize
 			if s.objSize > 0 && lo >= s.objSize {
+				s.clampedAway++
 				continue // past EOF: the live fetch returns without doing anything
 			}
 			hi := lo + cfg.blockSize
@@ -482,7 +492,7 @@ func features(s *handleScore, hr []row, blockSize int64, k int) {
 	}
 }
 
-func reportFidelity(rows []row, scores []handleScore, issued int64) {
+func reportFidelity(rows []row, scores []handleScore) {
 	var mism, handles int
 	var dispBytes, objBytes int64
 	seenKey := map[int64]bool{}
@@ -524,8 +534,15 @@ func reportFidelity(rows []row, scores []handleScore, issued int64) {
 	}
 	fmt.Printf("     (this compares Observe against a column produced by Observe: it validates the state machine, NOT the byte accounting)\n")
 
-	// Independent sanity check on the denominator.
-	if objBytes > 0 {
+	// Independent sanity check on the denominator — but only when object sizes are
+	// real. Without the `size` column each handle estimates its own object, so the
+	// same object is counted once per handle: "distinct objects" INFLATES while
+	// decisions collapse, and the ratio moves the wrong way (measured: 2.02x becomes
+	// 0.07x, which reads as "plenty of headroom" at the moment it is broken). A
+	// number that points the wrong way is worse than no number, so it is withheld.
+	if !haveSize {
+		fmt.Printf("   denominator sanity: SUPPRESSED — without `size` this ratio inverts and reads reassuringly while broken.\n")
+	} else if objBytes > 0 {
 		ratio := float64(dispBytes) / float64(objBytes)
 		// >1x is normal and not a bug: several handles read one object, and a handle
 		// that re-establishes after a seek re-dispatches blocks it already asked for.
@@ -536,17 +553,61 @@ func reportFidelity(rows []row, scores []handleScore, issued int64) {
 			fmt.Printf("     ** IMPLAUSIBLE: a mount cannot usefully dispatch many times an object's size. Suspect the EOF clamp. **\n")
 		}
 	}
-	if issued > 0 {
-		// The live counter is the only fully independent witness available. It counts
-		// chunks actually FETCHED (deduped: a re-dispatch of a cached chunk records
-		// nothing), whereas this replay counts DECISIONS, which legitimately repeat
-		// across handles and across re-establishments within a handle. So replay is
-		// expected to exceed it; only a wild excess indicates a broken denominator.
-		replayChunks := dispBytes / chunkSize
-		fmt.Printf("   vs live lith_prefetch_issued_total: replay %d chunk-decisions, mount %d chunks fetched\n", replayChunks, issued)
-		if replayChunks > 4*issued {
-			fmt.Printf("     ** replay is >4x the mount's fetched chunks: too far apart to be dedup alone. Suspect the clamp. **\n")
+
+	// Population bias: a handle whose every dispatch clamps away leaves the
+	// follow-through population entirely. With estimated sizes that happens to the
+	// handles that stopped early — which are the most wasteful ones, i.e. exactly the
+	// population the question is about. Report it rather than let n shrink silently.
+	var dropped, decided int
+	for _, sc := range scores {
+		if sc.dispatchDecisions > 0 {
+			decided++
+			if sc.dispatchedBytes == 0 {
+				dropped++
+			}
 		}
+	}
+	if dropped > 0 {
+		fmt.Printf("   ** %d of %d handles that dispatched prefetch scored NOTHING: every dispatch clamped past EOF.\n", dropped, decided)
+		if !haveSize {
+			fmt.Printf("      With estimated sizes this drops the handles that stopped early — the most wasteful ones. Recapture with `size`. **\n")
+		} else {
+			fmt.Printf("      With real sizes this means the detector dispatched only past EOF. **\n")
+		}
+	}
+
+}
+
+// reportIssuedCrossCheck compares the TOTAL replayed chunk-decisions against the
+// run's single live counter. Doing this per trace was wrong: with N traces from one
+// mount, each arm's own count was printed beside the whole run's total, so the line
+// that exists to catch a 12x error was itself off by up to Nx.
+func reportIssuedCrossCheck(totalDispBytes, issued int64) {
+	if issued <= 0 {
+		return
+	}
+	// The live counter records chunks actually FETCHED (deduped: re-dispatching a
+	// cached chunk records nothing), whereas the replay counts DECISIONS, which
+	// legitimately repeat across handles and across re-establishments. So replay
+	// exceeding it is expected — measured at ~1.2-2.4x — and that gap is itself
+	// informative: it is how much a per-handle score understates prefetch's value.
+	replayChunks := totalDispBytes / chunkSize
+	fmt.Printf("\n   vs live lith_prefetch_issued_total (all traces summed): replay %d chunk-decisions, mount %d chunks fetched",
+		replayChunks, issued)
+	if issued > 0 {
+		fmt.Printf(" (%.2fx)", float64(replayChunks)/float64(issued))
+	}
+	fmt.Println()
+	fmt.Printf("     Per-handle follow-through therefore UNDERSTATES prefetch's value by about that factor:\n")
+	fmt.Printf("     several handles decide to prefetch overlapping blocks and the cache fetches each once.\n")
+	// Calibration: the field-measured healthy range is 1.2-2.4x (several handles
+	// deciding on overlapping blocks), and a synthetic with two heavily
+	// re-establishing handles on one object reaches 4.6x. The broken-clamp case was
+	// 12.3x. 8x sits between them, so this fires on the failure and not on ordinary
+	// re-dispatch.
+	if replayChunks > 8*issued {
+		fmt.Printf("     ** >8x the mount's fetched chunks: far outside the 1.2-4.6x that dedup and\n")
+		fmt.Printf("        re-establishment explain. Suspect the EOF clamp or a config mismatch. **\n")
 	}
 }
 
@@ -582,7 +643,7 @@ func reportColdTax(scores []handleScore) {
 }
 
 // reportSeparation applies the pre-registered rule.
-func reportSeparation(all []handleScore, labels []string) {
+func reportSeparation(all []handleScore, labels []string, minN int) {
 	fmt.Printf("\n== pre-registered verdict (#256)\n")
 	byLabel := map[string][]float64{}
 	for _, s := range all {
@@ -627,10 +688,12 @@ func reportSeparation(all []handleScore, labels []string) {
 
 	best := 0.0
 	bestName := "(none)"
-	fmt.Printf("   Spearman rho per class/arm (train on one arm, test on another — the agreed rule):\n")
+	fmt.Printf("   Spearman rho per class/arm (train on one arm, test on another — the agreed rule).\n")
+	fmt.Printf("     A value only counts toward the verdict when its arm has >= %d scored handles AND >= %d\n", minN, minDistinct)
+	fmt.Printf("     distinct values on BOTH axes: n=3 with a two-way tie is monotone by construction, not a finding.\n")
 	for _, ft := range feats {
 		line := "     " + fmt.Sprintf("%-22s", ft.name)
-		holds := 0
+		qualified := 0
 		for _, lab := range labels {
 			arms := map[string][]handleScore{}
 			armOrder := []string{}
@@ -644,7 +707,7 @@ func reportSeparation(all []handleScore, labels []string) {
 				arms[sc.arm] = append(arms[sc.arm], sc)
 			}
 			if len(armOrder) == 0 {
-				line += fmt.Sprintf("  %s=(no prefetching handles)", lab)
+				line += fmt.Sprintf("  %s=(none)", lab)
 				continue
 			}
 			for _, a := range armOrder {
@@ -657,21 +720,29 @@ func reportSeparation(all []handleScore, labels []string) {
 				if a != "" {
 					name = lab + "/" + a
 				}
-				if r, ok := spearman(xs, ys); ok {
-					line += fmt.Sprintf("  %s=%+.3f", name, r)
-					if math.Abs(r) >= 0.5 {
-						holds++
-					}
-					if math.Abs(r) > best {
-						best, bestName = math.Abs(r), ft.name
-					}
-				} else {
+				r, ok := spearman(xs, ys)
+				if !ok {
 					line += fmt.Sprintf("  %s=n/a", name)
+					continue
+				}
+				why := degenerate(xs, ys, minN)
+				if why != "" {
+					// Printed, but explicitly not counted: a degenerate fit that happens to
+					// be monotone must not become a SEPARATION verdict.
+					line += fmt.Sprintf("  %s=%+.3f[%s]", name, r, why)
+					continue
+				}
+				line += fmt.Sprintf("  %s=%+.3f", name, r)
+				if math.Abs(r) >= 0.5 {
+					qualified++
+				}
+				if math.Abs(r) > best {
+					best, bestName = math.Abs(r), ft.name
 				}
 			}
 		}
-		if holds >= 2 {
-			line += "   <- |rho|>=0.5 on 2+ arms (survives out-of-sample)"
+		if qualified >= 2 {
+			line += "   <- |rho|>=0.5 on 2+ QUALIFYING arms"
 		}
 		fmt.Println(line)
 	}
