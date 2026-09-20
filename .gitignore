@@ -6,6 +6,14 @@
 *.out
 coverage.*
 
+# `go build ./cmd/<x>` writes its binary into the working directory, so the repo
+# root collects executables named after each command. Two were committed by
+# accident (lith-s3bench in #40/#48, lith-pfreplay in #267) and together came to
+# ~17 MB of a 42 MB pack. TestNoBuiltBinariesTracked keeps them out.
+/lith
+/lith-pfreplay
+/lith-s3bench
+
 # Local index files and caches
 *.lith
 *.lithidx
