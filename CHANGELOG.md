@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registrations and fails when a bound field is never read anywhere else in the
   package. It catches exactly this: reverting the one-line fix makes it name
   `--pf-trace`.
+- **`lith_prefetch_used_total` now says it is a chunk-touch count, not a byte
+  count** ([#256](https://github.com/scttfrdmn/lith/issues/256)). A 64 KiB demand
+  read marks the whole 1 MiB chunk *used*, so `used/issued` **overstates byte
+  follow-through — and overstates it most for the scattered readers where prefetch
+  is least useful.** A measured case reported **89%** by this ratio while at most
+  **~25%** of the prefetched bytes were ever read. Every prefetch-efficiency number
+  in the #256 campaign, including the ones used as kill conditions, was scored on
+  this friendlier unit. The metric help and `docs/knobs.md` now say so, and point at
+  `lith_fill_bytes_total{kind=...}` and `--pf-trace` for byte-level answers. No
+  behaviour change — the counter is unchanged, its description was wrong.
 - **Labelled prefetch counters now emit their series at zero**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)).
   `lith_prefetch_evidence_clamped_total` was only created when it fired, so at zero
