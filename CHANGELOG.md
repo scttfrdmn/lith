@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-pfreplay -global`: the shared-cache accounting unit**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)), contributed as a patch by
+  the reporting workload and taken essentially as written. lith's block cache is per
+  **mount**, not per handle, so a second dispatch of a resident chunk costs nothing —
+  but every verdict this tool had produced charged it anyway. `-global` re-scores the
+  same replay against one cache per mount: a `(key, block)` pair is charged once, to
+  whichever handle dispatched it first in decision order, and a dispatch counts as
+  followed through if **any** handle on that key later reads it. Detectors stay
+  per-handle, exactly as the live code does — the cache is shared, the state machines
+  are not. Only possible because of `seq`, and it refuses to run without it rather
+  than invent an order. Assumption stated in the file: no eviction, so it is an upper
+  bound (tight on these traces at 3.0–3.4 GiB distinct against 24–32 GB of cache).
+
+  **The unit is not a matter of taste — lith's own counter picks it.** Against
+  `lith_prefetch_issued_total`, shared comes to **1.04–1.08×** what the mount actually
+  fetched where per-handle is **1.50–4.56×**. It also explains why no single
+  correction ever fit: met dedupes **4.2×** (12 keys, ~600 handles) and HEMCO
+  **1.45×** (204 keys, ~6,200), so the 3.42× quoted for three gates was the average of
+  two different mounts. And **84–85% of all redeemed bytes were read by a different
+  handle than fetched them**, which is the real lesson: *"did this handle's prefetch
+  pay off" is not a property of the handle.*
+
+### Fixed
+
+- **`readTrace` never parsed the `key` column.** It has been in the trace format since
+  [#262](https://github.com/scttfrdmn/lith/issues/262) and went unused through three
+  gates — and since dedup is per object, the shared-cache unit was unbuildable until it
+  was added. A column the format emits and the parser silently drops is the same class
+  of defect as a metric that emits no series and a flag that reaches nothing.
+
 - **`cmd/lith-pfreplay`: replay a `--pf-trace` and score per-handle byte
   follow-through offline** ([#256](https://github.com/scttfrdmn/lith/issues/256)).
   Four hypotheses for #256 each cost a ~35-minute 48-rank cluster job to refute.
@@ -104,7 +134,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never wanted — and cannot answer whether the gate fires on the large objects or
   the small ones.
 
-### Fixed
+
+- **`lith-pfreplay` now reproduces the mount's conditional `Open()`, closing the last
+  source of replay divergence.** The mount calls `pf.open()` **only** for objects
+  larger than `partsThreshold`; for a smaller object the prefetcher is never
+  `Open()`ed, so its first `Observe` takes the `!haveLast` path — `lastBlock =
+  blockIdx` rather than `-1`, leaving `lastDelta` at 0 and making the strided branch
+  unreachable on read 2. Replaying `Open()` unconditionally dispatched a block the
+  mount did not, and **only** on handles that never reach sequential or strided —
+  exactly the population a field report isolated (10 of 6,229 HEMCO handles, every
+  row `cold` or `random`, median object 33.4 MB against a 64 MiB `parts-max`). With
+  it, all four real traces replay at **fidelity OK on every handle** and replay
+  decisions equal the mount's own column exactly (52,104 = 52,104). The pre-registered
+  verdict is unchanged, so the finding never depended on the defect.
+- **A mismatch now names its first diverging row** (`fh`, `seq`, block, offset, gap,
+  `max_window`, state transition, mount-vs-replay dispatch counts). Counting
+  mismatches says a replay is wrong; naming the row is what made the cause findable.
 
 - **`lith-pfreplay` replays in decision order, not file order**
   ([#272](https://github.com/scttfrdmn/lith/issues/272)). #271 recorded a monotonic

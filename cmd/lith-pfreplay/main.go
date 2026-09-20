@@ -62,14 +62,17 @@ import (
 const chunkSize = 1 << 20 // lith's cache-chunk granularity, for the straddle feature
 
 type row struct {
-	seq         int64
-	maxWindow   int64 // the mount's SetMax input for this decision; 0 = pre-#267 trace
-	fh          uint64
+	seq       int64
+	maxWindow int64 // the mount's SetMax input for this decision; 0 = pre-#267 trace
+	fh        uint64
+	key       string // the object. Only the shared-cache pass uses it, because only a
+	// shared cache has to know when two handles fetch the same block.
 	size        int64 // object size, for the EOF clamp
 	off, length int64
 	blk, gap    int64
 	path        string // window | parts | footer
 	before      string
+	after       string
 	dispatched  int
 }
 
@@ -108,11 +111,13 @@ type handleScore struct {
 	//     real), because only the first run is the pre-decision phase.
 	coldFirstRunReads  int
 	coldReentryReads   int
-	coldNetWasteBytes  int64 // first-run only
-	coldGrossWasteByte int64 // chunk - read_len, the inflated figure, kept for comparison
-	dispatchDecisions  int   // blocks Observe returned, before the EOF clamp
-	recordedDispatched int   // blocks the MOUNT recorded dispatching, from the trace's own column
-	clampedAway        int   // of those, how many fell entirely past the object's end
+	coldNetWasteBytes  int64  // first-run only
+	coldGrossWasteByte int64  // chunk - read_len, the inflated figure, kept for comparison
+	dispatchDecisions  int    // blocks Observe returned, before the EOF clamp
+	firstDiverge       string // the first row where replay and mount disagreed, for diagnosis
+	recordedDispatched int    // blocks the MOUNT recorded dispatching, from the trace's own column
+	clampedAway        int    // of those, how many fell entirely past the object's end
+	suppressedBlocks   int    // -global only: dispatches of a block already resident from another handle
 }
 
 func main() {
@@ -121,13 +126,15 @@ func main() {
 	byteExact := flag.Int64("byte-exact-threshold", chunkSize, "largest read eligible for byte-exact fetch, for the cold-start tax estimate")
 	minN := flag.Int("min-n", 8, "minimum scored handles per arm for a correlation to count toward the verdict")
 	issued := flag.Int64("issued", 0, "the run's lith_prefetch_issued_total, if you have it: the only fully independent check on the replay's denominator")
+	global_ := flag.Bool("global", false, "also score against one SHARED cache per mount: charge each (key, block) fetch once and credit reads by ANY handle on that key (needs the seq and key columns)")
+	issuedPer := flag.String("issued-per", "", "per-trace lith_prefetch_issued_total, e.g. `met/a=2939,hemco/a=4632`: with -global, the independent check on which unit reproduces the mount's fetch volume")
 	flag.Parse()
 	if flag.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "usage: lith-pfreplay [-k 8] [-out handles.csv] label=trace.csv [label=trace.csv ...]")
 		os.Exit(2)
 	}
 
-	var all []handleScore
+	var all, allGlobal []handleScore
 	var totalDispBytes, totalDecisionBlocks, totalRecordedBlocks, blockSize int64
 	labels := []string{}
 	seenLabel := map[string]bool{}
@@ -153,6 +160,20 @@ func main() {
 		reportFidelity(rows, scores)
 		reportDistribution(scores)
 		reportColdTax(scores)
+		if *global_ {
+			gs, gstats, err := globalScore(scores, cfg, rows, *byteExact)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: -global: %v\n", path, err)
+				os.Exit(1)
+			}
+			var phDisp, phUsed int64
+			for _, sc := range scores {
+				phDisp += sc.dispatchedBytes
+				phUsed += sc.usedBytes
+			}
+			reportGlobal(gstats, phDisp, phUsed, parseIssuedPer(*issuedPer)[spec], cfg.blockSize)
+			allGlobal = append(allGlobal, gs...)
+		}
 		for _, sc := range scores {
 			totalDispBytes += sc.dispatchedBytes
 			totalRecordedBlocks += int64(sc.recordedDispatched)
@@ -174,6 +195,24 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("\nper-handle scores written to %s\n", *out)
+	}
+
+	// The same handles, the same features, the same fidelity filter — one unit apart.
+	// Printed SECOND and separately rather than replacing the per-handle verdict,
+	// because which unit is right is itself the open question, and a reader has to be
+	// able to see both answers to judge it.
+	if *global_ {
+		fmt.Printf("\n########## the same handles scored against a SHARED cache (see global.go) ##########\n")
+		reportDistribution(allGlobal)
+		reportSeparation(allGlobal, labels, *minN)
+		if *out != "" {
+			gp := strings.TrimSuffix(*out, ".csv") + ".global.csv"
+			if err := writeCSV(gp, allGlobal); err != nil {
+				fmt.Fprintf(os.Stderr, "write %s: %v\n", gp, err)
+				os.Exit(1)
+			}
+			fmt.Printf("\nshared-cache scores written to %s\n", gp)
+		}
 	}
 }
 
@@ -243,9 +282,13 @@ func readTrace(path string) (traceConfig, []row, error) {
 		if _, ok := col["max_window"]; ok {
 			maxWin = atoi("max_window")
 		}
+		var key string
+		if _, ok := col["key"]; ok {
+			key = rec[col["key"]]
+		}
 		rows = append(rows, row{
-			seq: seq, maxWindow: maxWin, fh: fh, size: size, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
-			path: rec[col["path"]], before: rec[col["state_before"]], dispatched: int(atoi("dispatched")),
+			seq: seq, maxWindow: maxWin, fh: fh, key: key, size: size, off: atoi("off"), length: atoi("len"), blk: atoi("blk"), gap: atoi("gap"),
+			path: rec[col["path"]], before: rec[col["state_before"]], after: rec[col["state_after"]], dispatched: int(atoi("dispatched")),
 		})
 	}
 	return cfg, rows, nil
@@ -310,11 +353,26 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 		// (path=window) are fed to it; the others are real reads that the live code
 		// deliberately skipped, and feeding them would replay a different program
 		// than the one that ran.
+		s.objSize = objSizeOf(hr)
 		p := prefetch.New(cfg.maxReadahead)
 		p.SetGapMax(cfg.blockSize)
 		p.SetCoverage(cfg.coverageWindow, cfg.coverageMin)
 		p.SetEvidence(cfg.evidenceRatio, cfg.blockSize)
-		p.Open()
+		// The mount calls pf.open() ONLY for objects larger than partsThreshold
+		// (fuse/fs.go: `if fi.Size > f.partsThreshold() && ...`). For a smaller object
+		// the prefetcher is never Open()ed, so its first Observe takes the !haveLast
+		// path — lastBlock = blockIdx rather than -1, which leaves lastDelta at 0 and
+		// makes the strided branch unreachable on read 2. Calling Open() unconditionally
+		// replayed a different start and diverged on exactly the handles that never
+		// reach sequential/strided: 10 of 6,229 on a real HEMCO trace, all on objects
+		// below parts-max.
+		partsThreshold := cfg.partsMax
+		if partsThreshold <= 0 {
+			partsThreshold = cfg.smallFile
+		}
+		if s.objSize > partsThreshold {
+			p.Open()
+		}
 
 		type dispatch struct {
 			atRow int
@@ -336,20 +394,24 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 			s.recordedDispatched += r.dispatched
 			if len(got) != r.dispatched {
 				s.mismatches++
+				if s.firstDiverge == "" {
+					// Counting mismatches says a replay is wrong; naming the row says why.
+					s.firstDiverge = fmt.Sprintf("row %d/%d seq=%d blk=%d off=%d len=%d gap=%d maxwin=%d state %s->%s: mount dispatched %d, replay %d",
+						i+1, len(hr), r.seq, r.blk, r.off, r.length, r.gap, r.maxWindow, r.before, r.after, r.dispatched, len(got))
+				}
 			}
 			for _, b := range got {
 				dispatches = append(dispatches, dispatch{atRow: i, block: b})
 			}
 		}
 
-		// The object's size, needed to clamp dispatched blocks at EOF exactly as
+		// The object's size, needed both to decide whether the mount would have called
+		// pf.open() and to clamp dispatched blocks at EOF exactly as
 		// store.Prefetch does. Without this the denominator counts blocks that fetched
 		// NOTHING: at max_readahead=223 against a 14-block object, ~94% of it, which
 		// drives every follow-through score to ~0 and reads as "prefetch never pays
 		// off". Falls back to the handle's own high-water mark for pre-#267 traces,
 		// which under-counts rather than inflating, and is reported as an estimate.
-		s.objSize = objSizeOf(hr)
-
 		// Byte follow-through: for each dispatched block, the union of bytes that
 		// LATER reads of this same handle covered within it.
 		s.dispatchDecisions = len(dispatches)
@@ -573,6 +635,14 @@ func reportFidelity(rows []row, scores []handleScore) {
 		fmt.Printf("   state-machine fidelity: OK — replayed dispatch DECISIONS match the recorded ones on every handle\n")
 	} else {
 		fmt.Printf("   state-machine fidelity: ** MISMATCH on %d/%d handles ** — the detector replay is wrong; everything below is void.\n", mism, handles)
+		shown := 0
+		for _, sc := range scores {
+			if sc.firstDiverge == "" || shown >= 3 {
+				continue
+			}
+			fmt.Printf("     fh=%d first divergence: %s\n", sc.fh, sc.firstDiverge)
+			shown++
+		}
 	}
 	fmt.Printf("     (this compares Observe against a column produced by Observe: it validates the state machine, NOT the byte accounting)\n")
 
@@ -873,7 +943,7 @@ func writeCSV(path string, all []handleScore) error {
 		"label", "arm", "fh", "rows", "dispatched_bytes", "used_bytes", "byte_follow_through", "replay_mismatches",
 		"mean_abs_gap_blocks", "max_abs_gap_blocks", "frac_large_gap", "mean_read_kib", "frac_monotonic",
 		"frac_straddle", "obj_size", "cold_first_run_reads", "cold_reentry_reads",
-		"cold_net_waste_bytes", "cold_gross_waste_bytes",
+		"cold_net_waste_bytes", "cold_gross_waste_bytes", "suppressed_blocks",
 	}); err != nil {
 		return err
 	}
@@ -887,6 +957,7 @@ func writeCSV(path string, all []handleScore) error {
 			strconv.FormatFloat(s.fracMonotonic, 'f', 6, 64), strconv.FormatFloat(s.fracStraddle, 'f', 6, 64),
 			strconv.FormatInt(s.objSize, 10), strconv.Itoa(s.coldFirstRunReads), strconv.Itoa(s.coldReentryReads),
 			strconv.FormatInt(s.coldNetWasteBytes, 10), strconv.FormatInt(s.coldGrossWasteByte, 10),
+			strconv.Itoa(s.suppressedBlocks),
 		}); err != nil {
 			return err
 		}

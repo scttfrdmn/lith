@@ -462,3 +462,64 @@ func writeTraceSeq(t *testing.T, rows string) string {
 	}
 	return p
 }
+
+// writeTraceCfg writes a #271-format trace with an explicit parts_max, so the
+// conditional-Open behaviour below can be exercised on both sides of the threshold.
+func writeTraceCfg(t *testing.T, partsMax int64, rows string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "pf.csv")
+	body := fmt.Sprintf("# lith prefetch trace; block_size=8388608 max_readahead=223 parts_max=%d small_file=4194304 coverage_window=16 coverage_min=0.5 evidence_ratio=0\n", partsMax) +
+		"seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window\n" + rows
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestOpenIsConditionalOnPartsThreshold pins the last source of replay divergence on
+// a real GCHP trace (10 of 6,229 HEMCO handles). The mount calls pf.open() ONLY for
+// objects larger than partsThreshold; for a smaller object the prefetcher is never
+// Open()ed, so its first Observe takes the !haveLast path — lastBlock = blockIdx
+// instead of -1, which leaves lastDelta at 0 and makes the strided branch unreachable
+// on read 2. Replaying Open() unconditionally dispatched a block the mount did not,
+// and only ever on handles that never reach sequential/strided, which is exactly the
+// population the report isolated.
+func TestOpenIsConditionalOnPartsThreshold(t *testing.T) {
+	const blk = 8 << 20
+	// Two reads two blocks apart, each with a byte gap larger than one block, so
+	// neither is contiguous. This is the shape that makes read 2's delta equal read
+	// 1's — the strided trigger — but only if Open() set lastBlock to -1.
+	rows := fmt.Sprintf(
+		"116,35,17362,obj,%d,%d,131072,1,%d,window,cold,cold,39,0,0,0\n"+
+			"247,35,17362,obj,%d,%d,86016,3,%d,window,cold,cold,39,0,0,0\n",
+		30230325, 12845056, 12845056,
+		30230325, 28487680, 15511552)
+
+	// Object is 30.2 MB. With parts_max 64 MiB it is BELOW the threshold, so the
+	// mount never called Open() and dispatched nothing — the trace says so.
+	below := writeTraceCfg(t, 64<<20, rows)
+	cfg, parsed, err := readTrace(below)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := scoreTrace("x", "a", cfg, parsed, 8, 1<<20)[0]; got.mismatches != 0 {
+		t.Errorf("object below parts-max: %d mismatches, want 0 — the replay must skip Open() "+
+			"exactly as the mount does, or it reaches the strided branch the mount could not",
+			got.mismatches)
+	}
+
+	// With parts_max 16 MiB the same object is ABOVE the threshold, so the mount
+	// would have called Open() — and then read 2 does reach strided and dispatches,
+	// so a trace claiming 0 dispatches is inconsistent. That asymmetry is the
+	// behaviour under test: the condition must be read from the config, not assumed.
+	above := writeTraceCfg(t, 16<<20, rows)
+	cfg2, parsed2, err := readTrace(above)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := scoreTrace("x", "a", cfg2, parsed2, 8, 1<<20)[0]; got.mismatches == 0 {
+		t.Error("object above parts-max: expected the Open()-ed replay to diverge from a trace " +
+			"recorded without it; if this passes, the threshold is not being consulted")
+	}
+	_ = blk
+}
