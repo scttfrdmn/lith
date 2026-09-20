@@ -301,7 +301,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			_, _ = fmt.Fprintf(tf, "# lith prefetch trace; block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage_window=%d coverage_min=%g evidence_ratio=%g\n",
 				f.blockSize, f.maxReadahead(), f.partsThreshold(), cfg.SmallFile,
 				coverageWindow, coverageMin, cfg.ReadaheadEvidenceRatio)
-			_, _ = fmt.Fprintln(tf, "fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window")
+			_, _ = fmt.Fprintln(tf, "fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window")
 		}
 	}
 	return f
@@ -314,9 +314,11 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 // a multi-rank trace by reader. `path` says which read path served it, so a trace
 // is a self-describing rather than a silently biased sample.
 type pfTraceRow struct {
-	fh            uint64
-	pid           uint32
-	key           string
+	fh   uint64
+	pid  uint32
+	key  string
+	size int64 // object size: an offline replay needs it to clamp dispatched blocks
+	// at EOF the way store.Prefetch does, or it scores blocks that fetched nothing
 	off, length   int64
 	blk, gap      int64
 	path          string // window | parts | footer
@@ -330,8 +332,8 @@ type pfTraceRow struct {
 // the kernel issues a handle's reads concurrently.
 func (f *rawFS) tracePF(r pfTraceRow) {
 	f.pfTraceMu.Lock()
-	_, _ = fmt.Fprintf(f.pfTrace, "%d,%d,%s,%d,%d,%d,%d,%s,%s,%s,%d,%d,%d\n",
-		r.fh, r.pid, r.key, r.off, r.length, r.blk, r.gap, r.path, r.before, r.after,
+	_, _ = fmt.Fprintf(f.pfTrace, "%d,%d,%s,%d,%d,%d,%d,%d,%s,%s,%s,%d,%d,%d\n",
+		r.fh, r.pid, r.key, r.size, r.off, r.length, r.blk, r.gap, r.path, r.before, r.after,
 		r.window, r.dispatched, r.peak)
 	f.pfTraceMu.Unlock()
 }
@@ -821,7 +823,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		pbs := h.pf.observe(blk, off, end-off, gap, f.perHandleWindow())
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
-				fh: input.Fh, pid: input.Pid, key: h.key.Key, off: off, length: end - off,
+				fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size, off: off, length: end - off,
 				blk: blk, gap: gap, path: "window", before: before, after: h.pf.state(),
 				window: h.pf.window(), dispatched: len(pbs), peak: h.pf.peakWindow(),
 			})
@@ -843,7 +845,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		}
 		st := h.pf.state()
 		f.tracePF(pfTraceRow{
-			fh: input.Fh, pid: input.Pid, key: h.key.Key, off: off, length: end - off,
+			fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size, off: off, length: end - off,
 			blk: blk, gap: gap, path: path, before: st, after: st,
 			window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
 		})
