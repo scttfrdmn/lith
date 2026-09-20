@@ -100,7 +100,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
 	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "EXPERIMENTAL (#256): bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (~223 blocks at 50 Gbps). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that tiles a slab and jumps never earns it. 0 disables (default)")
-	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex, so it adds a global lock to every read: for characterization, not production")
+	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex. Measured cost at 48 MPI ranks over ~60k traced reads: +0.5-1.6% wall, so the lock is negligible below ~10^5 reads/run; size the trace file for one row per read")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
@@ -124,7 +124,30 @@ func newMountCmd() *cobra.Command {
 	return cmd
 }
 
+// checkPFTracePath fails when --pf-trace names a path that cannot be written. It
+// creates the file, which is also what the mount will do, so a success here means
+// the trace will actually be produced.
+func checkPFTracePath(path string) error {
+	if path == "" {
+		return nil
+	}
+	tf, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("--pf-trace %q: %w (the trace is the point of the run; refusing to mount without it)", path, err)
+	}
+	return tf.Close()
+}
+
 func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint string) error {
+	// Validate an explicitly-requested trace path BEFORE the daemon fork. Under
+	// --daemon the child's logs go to /tmp/lith-<uid>-mount.log, so an unwritable
+	// path used to mount *successfully* and bury the reason there: a whole
+	// characterization job would run and yield no trace, non-fatally and invisibly,
+	// in exactly the mode a capture uses (#264). A diagnostic the operator asked for
+	// by name is not best-effort.
+	if err := checkPFTracePath(f.pfTrace); err != nil {
+		return err
+	}
 	if f.daemon && !isDaemonChild() {
 		return daemonize()
 	}

@@ -111,3 +111,29 @@ func TestEveryFlagBindingIsConsumed(t *testing.T) {
 			"Wire the field through to the config it belongs in (#264).", strings.Join(unconsumed, "\n  "))
 	}
 }
+
+// TestCheckPFTracePathFailsFast: --pf-trace is a diagnostic the operator asked for
+// by name, and under --daemon a failure to open it used to be both non-fatal and
+// invisible — the mount succeeded and the reason went to /tmp/lith-<uid>-mount.log,
+// so a whole characterization job ran and produced nothing (#264). Validation now
+// happens in the foreground, before the fork.
+func TestCheckPFTracePathFailsFast(t *testing.T) {
+	if err := checkPFTracePath(""); err != nil {
+		t.Errorf("empty path means tracing off, not an error: %v", err)
+	}
+	ok := filepath.Join(t.TempDir(), "pf.csv")
+	if err := checkPFTracePath(ok); err != nil {
+		t.Errorf("writable path rejected: %v", err)
+	}
+	if _, err := os.Stat(ok); err != nil {
+		t.Errorf("validation should leave the file the mount will write: %v", err)
+	}
+	bad := filepath.Join(t.TempDir(), "no-such-dir", "pf.csv")
+	err := checkPFTracePath(bad)
+	if err == nil {
+		t.Fatal("an unwritable --pf-trace path must fail the mount, not mount successfully without a trace")
+	}
+	if !strings.Contains(err.Error(), "pf-trace") {
+		t.Errorf("error should name the flag so the cause is obvious: %v", err)
+	}
+}

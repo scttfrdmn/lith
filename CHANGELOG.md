@@ -58,9 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparable across runs, and an offline replay can be **validated for fidelity**
   before its verdict on a new policy is trusted. A failed trace-file create is now
   logged instead of silently yielding an empty trace and a successful-looking run.
-  Documented in `docs/knobs.md`, with its cost stated: unbounded, and serialized
-  under one mutex, so it adds a global lock to every read — characterization, not
-  production.
+  Documented in `docs/knobs.md`, with its cost stated from measurement (see Fixed
+  below): the mutex costs +0.5-1.6% wall at 48 MPI ranks over ~60k traced reads, so
+  the trace file's size is the real constraint rather than the lock.
 
 
 - **`--readahead-evidence-ratio`, experimental and off by default**
@@ -105,6 +105,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the small ones.
 
 ### Fixed
+
+- **An unwritable `--pf-trace` path now fails the mount instead of mounting
+  successfully without a trace** ([#264](https://github.com/scttfrdmn/lith/issues/264)).
+  Under `--daemon` the error went to `/tmp/lith-<uid>-mount.log` and the mount came
+  up fine, so a whole characterization job could run and yield nothing —
+  non-fatally and invisibly, in exactly the mode a capture uses. The path is now
+  validated in the foreground, before the daemon fork. A diagnostic the operator
+  asked for by name is not best-effort.
+- **`--pf-trace`'s cost is now stated from measurement, not caution.** The help and
+  `docs/knobs.md` warned that its mutex "adds a global lock to every read: for
+  characterization, not production", which read as unusable under load — a reporter
+  nearly designed a two-job capture around it. Measured at **48 MPI ranks over ~60k
+  traced reads: +0.5–1.6% wall**, with the traced run reproducing an untraced one on
+  every axis. Now says the lock is negligible below roughly 10⁵ reads/run and points
+  at the file size instead.
 
 - **Three more defects in `lith-pfreplay`, all found before the expensive capture**
   ([#267](https://github.com/scttfrdmn/lith/pull/267)). A **degenerate arm could
