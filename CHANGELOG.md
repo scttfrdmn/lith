@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-pfreplay -keys`: fit the #256 rule at the object level**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)), contributed as a patch by the
+  reporting workload and taken as written. If 84–85% of redeemed prefetch bytes are read
+  by a handle other than the one that fetched them, then follow-through is not a property
+  of the handle — so the rule is fit per `(label, arm, key)` instead, against the
+  cold-start tax as well as follow-through. Per-key aggregates come out of `globalScore`'s
+  own loops (a fourth return value) so the dedup, the EOF clamp and the first-run-cold
+  rule cannot drift between units. Two features qualify on two arms each where the
+  handle-level fit had none: `distinct_frac` at **−0.689/−0.707** on the tax and
+  `reads_per_reader` at **+0.615/+0.627** on follow-through. Post-hoc features are printed
+  but **barred in code** from qualifying a feature or setting the best |ρ| the verdict
+  reads off, and a within-class constant now prints `const(v)` rather than a bare `n/a`,
+  because "this does not vary" is a fact about the workload and not a missing measurement.
+
+  **The tax predictor survives the obvious objection.** `distinct_frac` (D/S) shares D
+  with the target (W/D), so the sign could be induced. A permutation null (shuffle W, keep
+  (D,S) paired, 2,000 draws) centres at **+0.171/+0.173**, 95% [+0.037, +0.303], p <
+  0.0005 — re-derived here independently of the reporter's script, agreeing to within
+  0.002. The null's own positive centre is **not** explained by ρ(D,W) as first reported:
+  a permutation destroys that pairing, and re-attaching W to drive ρ(D,W) from +0.993 to
+  −0.993 moves the centre by 0.002. It is the size/coverage structure
+  (−ρ(`distinct_frac`, D) = +0.287).
+
+  **It does not license an object-scoped hint, and that is the load-bearing result.** The
+  floor is diffuse — the top 10% of objects hold **21.8%** of it, not the ≥50%
+  pre-registered — and every rule that catches it (`coverage < 0.25`, `size > 8 MiB`)
+  fires on **70–81% of the working set**, including on half of the well-behaved mount's
+  objects. The direction that remains is to make the granularity commitment conditional
+  on evidence rather than attaching hints to objects.
+
+- **`lith-pfreplay -granularity`: price the cold-start fetch unit**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). The fix direction left standing
+  is the granularity commitment at `internal/fuse/fs.go:778-786`, where a cold handle
+  fetches a whole 1 MiB chunk for a 100 KiB read. Inverting it outright is not obviously
+  right, because of a number in the shared accounting nobody had read: of the measured
+  24,801 first-run cold small reads, **20,610 are suppressed** — they land in a chunk
+  another handle already paid for and cost nothing. The chunk is the right unit 83% of the
+  time by hit count and the wrong unit by byte count. So this sweeps the fetch unit
+  instead of assuming a binary, charging each `(key, extent)` once mount-wide and counting
+  the bytes no reader ever touches. The answer is a **knee, not a cliff**: half the floor
+  for 1.6× the cold fetches at 512 KiB, 75% for 2.8× at 256 KiB, with the exchange rate
+  collapsing below that — and the well-behaved mount pays 722 extra fetches to save 23
+  MiB, so a global shrink would tax the good reader to pay for the sparse one. **It
+  proposes no default**; it prices the trade, offline, at no cost. Two limitations are
+  explicit: no eviction (inherited, and now the binding limitation on the instrument), and
+  fetches are not GETs, since lith coalesces adjacent fills.
+
 - **`lith-pfreplay -global`: the shared-cache accounting unit**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)), contributed as a patch by
   the reporting workload and taken essentially as written. lith's block cache is per
@@ -32,6 +79,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pay off" is not a property of the handle.*
 
 ### Fixed
+
+- **Documentation said "scattered reads" where it meant "low coverage"**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). `docs/knobs.md`, this
+  changelog's own #256 entries and the issue title all described the losing access shape
+  in **read-size and read-order** terms. A key-level fit over two mounts of one workload
+  shows that was the wrong column. The two mounts have **the same read size** (104 vs 122
+  KiB median); every read on both is **sub-chunk** (the eligibility feature is a *constant*
+  1.000 across all 216 objects, so it cannot distinguish anything); and both walk their
+  objects **monotonically end to end** — meaning `sequential` was the **correct**
+  classification and the detector was never fooled, which is the assumption four refuted
+  hypotheses had rested on. Readers also **partition each object byte for byte** (zero
+  measured overlap), so none of the waste is redundant reading. What separates the mounts
+  is how much of each object is ever touched: **16% against 65%**. `docs/knobs.md` now
+  states the correction and says to measure `union(bytes read) / object size` rather than
+  read size when judging whether a reader will over-fetch.
+
+- **A MiB/MB unit error in the reported cold-waste comparison**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). The shared-cache cold waste was
+  reported as 1,257.3 MiB and described as closer to the live measurement (1,224 MB) than
+  the reporter's own 1,318 MB figure. **1,257.3 MiB *is* 1,318.4 MB** — the same number
+  against decimal-MB counters, so there was no improvement to report. The conditional
+  `Open()` fix moves the cold-waste estimate by **zero** (the cold tax is counted on demand
+  reads, not dispatches, so it could not have); what it fixes is fidelity, completely. The
+  standing comparison is **1,318 MB replay vs 1,224 MB live = 7.7% high**.
 
 - **`readTrace` never parsed the `key` column.** It has been in the trace format since
   [#262](https://github.com/scttfrdmn/lith/issues/262) and went unused through three
