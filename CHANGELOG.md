@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-pfreplay -mem-cache`: drive the real memory tier, instead of assuming no
+  eviction** ([#256](https://github.com/scttfrdmn/lith/issues/256)). Three gates reported
+  their shared-cache numbers with the same caveat — *no eviction, therefore an upper bound
+  on redemption* — and that caveat had become the binding limitation on the instrument
+  rather than a footnote on one figure. `blockstore.CacheModel` drives the **production
+  `memCache`**, sharded 64 ways as production shards it, so the replay cannot diverge from
+  the policy it claims to model; it reports re-fetches of evicted chunks, prefetched chunks
+  evicted before any read consumed them, and demand residency. A model of a 32 GB cache
+  cannot allocate 32 GB, so every chunk handed to the tier is a sub-slice of one shared
+  backing buffer — `len(data)` is the only thing the tier's size accounting reads, so it
+  stays exact while the model stays O(chunk).
+
+  **Driving the real tier rather than simulating it is the point, and it paid immediately.**
+  A 2Q model written from Johnson & Shasha — or from this package's own type comment —
+  would have been wrong twice: the tier never enforces its `Kin` bound
+  ([#279](https://github.com/scttfrdmn/lith/issues/279)) and a freshly filled prefetch chunk
+  is not yet flagged unread when eviction runs
+  ([#280](https://github.com/scttfrdmn/lith/issues/280)). Such a model would have been both
+  more scan-resistant *and* more protective of prefetch than lith actually is — optimistic
+  on hit rate, in a tool whose entire purpose is to bound optimism, which is
+  [#267](https://github.com/scttfrdmn/lith/issues/267)'s "a replay that does not know it
+  runs a different program" one layer down.
+
+  Three limits are stated in the source rather than left to be discovered: the chunk key
+  omits bucket and ETag (statistically equivalent shard distribution, not identical), pins
+  are not modelled (so it errs toward reporting eviction as *binding*, the safe direction),
+  and the walk is decision order rather than wall clock (so redemption remains an upper
+  bound — now bounded by capacity as well as by order). **Not yet run against the banked
+  capture-2 traces**, so the tightness claim those three gates carried is still unverified
+  on real data: the instrument exists and has not been pointed at it.
+
 - **`lith-pfreplay -keys`: fit the #256 rule at the object level**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)), contributed as a patch by the
   reporting workload and taken as written. If 84–85% of redeemed prefetch bytes are read
@@ -79,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pay off" is not a property of the handle.*
 
 ### Fixed
+
+- **`lith-pfreplay` printed a 24 GB capacity as `23437500KiB`.** 24 GB is an exact multiple
+  of 1 KiB, so the exact-multiple formatter chose a unit nobody reads. An exact binary
+  multiple now has to be a sane magnitude as well as exact, falling back to one decimal
+  place in the largest unit that fits.
 
 - **Documentation said "scattered reads" where it meant "low coverage"**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)). `docs/knobs.md`, this
