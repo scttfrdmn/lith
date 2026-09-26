@@ -24,8 +24,8 @@ func TestSweepChargesEveryExtentAReadCovers(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("want 1 unit, got %d", len(got))
 	}
-	if got[0].fetches != 2 {
-		t.Errorf("straddling read: fetches = %d, want 2 (chunk 0 and chunk 1)", got[0].fetches)
+	if got[0].gets != 2 {
+		t.Errorf("straddling read: GETs = %d, want 2 (one fill per chunk touched)", got[0].gets)
 	}
 	if want := int64(2 * mib); got[0].grossFetched != want {
 		t.Errorf("grossFetched = %d, want %d", got[0].grossFetched, want)
@@ -62,9 +62,9 @@ func TestSweepTradesMonotonically(t *testing.T) {
 			t.Errorf("unit %d wasted %d > larger unit %d's %d: waste must not grow as the unit shrinks",
 				cur.unit, cur.netWaste, prev.unit, prev.netWaste)
 		}
-		if cur.fetches < prev.fetches {
-			t.Errorf("unit %d made %d fetches < larger unit %d's %d: fetches must not fall as the unit shrinks",
-				cur.unit, cur.fetches, prev.unit, prev.fetches)
+		if cur.gets < prev.gets {
+			t.Errorf("unit %d made %d GETs < larger unit %d's %d: requests must not fall as the unit shrinks",
+				cur.unit, cur.gets, prev.unit, prev.gets)
 		}
 		if cur.hits > prev.hits {
 			t.Errorf("unit %d had %d free hits > larger unit %d's %d: free hits must not grow as the unit shrinks",
@@ -98,8 +98,8 @@ func TestSweepInheritsTheColdTaxPopulation(t *testing.T) {
 		t.Errorf("readBytes = %d, want %d: only the one eligible read may be scored",
 			got[0].readBytes, 64*1024)
 	}
-	if got[0].fetches != 1 {
-		t.Errorf("fetches = %d, want 1", got[0].fetches)
+	if got[0].gets != 1 {
+		t.Errorf("GETs = %d, want 1", got[0].gets)
 	}
 }
 
@@ -116,5 +116,57 @@ func TestParseUnitsSortsDescendingAndDropsJunk(t *testing.T) {
 	}
 	if u := parseUnits(""); len(u) != 0 {
 		t.Errorf("empty spec must yield no units, got %v", u)
+	}
+}
+
+// THE CORRECTION THIS SWEEP WAS REWRITTEN FOR.
+//
+// The first cut counted one "fetch" per granularity unit and published that as the request
+// cost. lith does not work that way: fetchExtents runs once per CHUNK and fillExtentSpan
+// issues EXACTLY ONE ranged GET spanning first-missing to last-missing extent. So a read
+// covering many units is one request, not one per unit — and the published table overstated
+// the cost of going byte-exact.
+//
+// Asserted on a single read wide enough that the two counts cannot coincide.
+func TestSweepCountsRequestsNotUnits(t *testing.T) {
+	const mib = 1 << 20
+	// One 512 KiB read, scored at a 64 KiB unit: 8 units, but one contiguous GET.
+	rows := []row{coldRead(1, "k", 8*mib, 0, 512*1024, 1)}
+	got := sweepGranularity(rows, chunkSize, []int64{64 * 1024})
+	if got[0].gets != 1 {
+		t.Errorf("GETs = %d, want 1: one ranged GET covers the whole contiguous span", got[0].gets)
+	}
+	if got[0].units != 8 {
+		t.Errorf("units = %d, want 8 (512 KiB / 64 KiB)", got[0].units)
+	}
+	if got[0].grossFetched != 512*1024 {
+		t.Errorf("grossFetched = %d, want %d", got[0].grossFetched, 512*1024)
+	}
+}
+
+// fillExtentSpan fetches ONE span from the first missing extent to the last, so a resident
+// extent sitting between two missing ones is RE-FETCHED and re-marked filled. The sweep has
+// to charge that, or it under-reports bytes on exactly the interleaved case the shared
+// cache creates.
+func TestSweepChargesTheSpanIncludingResidentUnitsInside(t *testing.T) {
+	const mib = 1 << 20
+	// Read A takes the middle 64 KiB. Read B then wants the surrounding 192 KiB, whose
+	// missing extents straddle A's: one GET must span all three units, re-fetching A's.
+	rows := []row{
+		coldRead(1, "k", 8*mib, 64*1024, 64*1024, 1),
+		coldRead(2, "k", 8*mib, 0, 192*1024, 2),
+	}
+	got := sweepGranularity(rows, chunkSize, []int64{64 * 1024})
+	if got[0].gets != 2 {
+		t.Fatalf("GETs = %d, want 2 (one per read)", got[0].gets)
+	}
+	// A fetched 64 KiB; B's span covers all 192 KiB including A's resident middle.
+	if want := int64(64*1024 + 192*1024); got[0].grossFetched != want {
+		t.Errorf("grossFetched = %d, want %d: the span must include the resident unit inside it",
+			got[0].grossFetched, want)
+	}
+	// Only 3 distinct units ever became resident, even though 4 unit-fetches were paid for.
+	if got[0].units != 3 {
+		t.Errorf("units = %d, want 3: units counts residency, not bytes paid", got[0].units)
 	}
 }
