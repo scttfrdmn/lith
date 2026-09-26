@@ -48,6 +48,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/scttfrdmn/lith/internal/blockstore"
 	"github.com/scttfrdmn/lith/internal/prefetch"
 )
 
@@ -86,7 +87,18 @@ func (g globalStats) followThrough() float64 {
 // scoreTrace's features, cold tax and mismatch count untouched — so the #256 rule is fit
 // on identical predictors and the fidelity filter still applies — and carry shared-cache
 // dispatchedBytes / usedBytes / followThrough in place of the per-handle ones.
-func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact int64) ([]handleScore, globalStats, map[string]*keyAgg, error) {
+// dispatch is one prefetch decision the replayed detector made, in mount-wide decision
+// order. Package-scope so the eviction walk (eviction.go) can be handed the very same
+// slice globalScore built, rather than reconstructing it — the reconstruction is the part
+// that must not exist twice.
+type dispatch struct {
+	at    int // index into ord
+	block int64
+	fh    uint64
+	key   string
+}
+
+func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact int64, model *blockstore.CacheModel) ([]handleScore, globalStats, map[string]*keyAgg, error) {
 	var stats globalStats
 	// Per-OBJECT aggregates of the very same accounting, for the key-level fit (keys.go).
 	// Filled here rather than recomputed there so that the dedup, the EOF clamp and the
@@ -117,12 +129,6 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 	copy(ord, rows)
 	sort.SliceStable(ord, func(i, j int) bool { return ord[i].seq < ord[j].seq })
 
-	type dispatch struct {
-		at    int // index into ord
-		block int64
-		fh    uint64
-		key   string
-	}
 	var dispatches []dispatch
 	dets := map[uint64]*prefetch.Prefetcher{}
 	byKey := map[string][]int{}  // key -> indices into ord, in decision order
@@ -167,6 +173,12 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 		if sizeOf[k] == 0 {
 			sizeOf[k] = hw
 		}
+	}
+
+	// Lift the "no eviction" assumption, using the same ord/dispatches this function
+	// already built rather than a second reconstruction (eviction.go).
+	if model != nil {
+		driveCache(model, ord, dispatches, sizeOf, cfg.blockSize)
 	}
 
 	claimed := map[string]map[int64]bool{}

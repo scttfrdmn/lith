@@ -57,6 +57,8 @@ import (
 	"strings"
 
 	"github.com/scttfrdmn/lith/internal/prefetch"
+
+	"github.com/scttfrdmn/lith/internal/blockstore"
 )
 
 const chunkSize = 1 << 20 // lith's cache-chunk granularity, for the straddle feature
@@ -129,6 +131,7 @@ func main() {
 	keys_ := flag.Bool("keys", false, "also fit the rule at the KEY (object) level and score it against the cold-start tax as well as follow-through; implies -global, since the accounting is the shared one (see keys.go)")
 	keysOut := flag.String("keys-out", "", "write per-key scores and features to this CSV")
 	gran := flag.String("granularity", "", "sweep the cold-start fetch unit over this comma-separated list of sizes (e.g. `1MiB,512KiB,256KiB,64KiB`) and print bytes-saved against round-trips-added: the trade the \"unknown until proven sequential\" fix makes (see granularity.go)")
+	memCache := flag.String("mem-cache", "", "model the REAL memory tier at this capacity (e.g. `24GB`, `512MiB`) and report what eviction costs, instead of assuming none; implies -global (see eviction.go)")
 	global_ := flag.Bool("global", false, "also score against one SHARED cache per mount: charge each (key, block) fetch once and credit reads by ANY handle on that key (needs the seq and key columns)")
 	issuedPer := flag.String("issued-per", "", "per-trace lith_prefetch_issued_total, e.g. `met/a=2939,hemco/a=4632`: with -global, the independent check on which unit reproduces the mount's fetch volume")
 	flag.Parse()
@@ -173,7 +176,11 @@ func main() {
 			reportGranularity(spec, sweepGranularity(rows, *byteExact, units))
 		}
 		if *global_ {
-			gs, gstats, kaggs, err := globalScore(scores, cfg, rows, *byteExact)
+			var model *blockstore.CacheModel
+			if cap_ := parseBytes(*memCache); cap_ > 0 {
+				model = blockstore.NewCacheModel(cap_, memShards, chunkSize)
+			}
+			gs, gstats, kaggs, err := globalScore(scores, cfg, rows, *byteExact, model)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: -global: %v\n", path, err)
 				os.Exit(1)
@@ -184,6 +191,9 @@ func main() {
 				phUsed += sc.usedBytes
 			}
 			reportGlobal(gstats, phDisp, phUsed, parseIssuedPer(*issuedPer)[spec], cfg.blockSize)
+			if model != nil {
+				reportEviction(spec, parseBytes(*memCache), model.Stats(), model.Binding())
+			}
 			allGlobal = append(allGlobal, gs...)
 			if *keys_ {
 				ks := scoreKeys(label, arm, cfg, rows, scores, kaggs, *k, *byteExact)

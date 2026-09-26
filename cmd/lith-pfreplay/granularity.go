@@ -209,12 +209,28 @@ func parseUnits(s string) []int64 {
 
 func mib(b int64) float64 { return float64(b) / (1 << 20) }
 
+// human formats a byte count. Exact binary multiples print exactly (a 1 MiB fetch unit
+// must read as "1MiB", not "1.0MiB"); anything else — a decimal capacity like 24GB, or a
+// per-shard share that divides unevenly — gets one decimal in the largest binary unit that
+// fits, rather than a raw byte count nobody can read at a glance.
 func human(b int64) string {
+	for _, u := range []struct {
+		n int64
+		s string
+	}{{1 << 30, "GiB"}, {1 << 20, "MiB"}, {1 << 10, "KiB"}} {
+		// Exact only when the quotient is also a sane magnitude: 24 GB is an exact
+		// multiple of 1 KiB, and "23437500KiB" is not a unit anyone reads.
+		if q := b / u.n; b >= u.n && b%u.n == 0 && q < 1024 {
+			return fmt.Sprintf("%d%s", q, u.s)
+		}
+	}
 	switch {
-	case b >= 1<<20 && b%(1<<20) == 0:
-		return fmt.Sprintf("%dMiB", b/(1<<20))
-	case b >= 1<<10 && b%(1<<10) == 0:
-		return fmt.Sprintf("%dKiB", b/(1<<10))
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1fGiB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1fMiB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1fKiB", float64(b)/(1<<10))
 	default:
 		return fmt.Sprintf("%dB", b)
 	}
