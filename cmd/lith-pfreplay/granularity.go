@@ -23,16 +23,26 @@ package main
 // down.
 //
 // So the question is not WHETHER to commit a chunk, it is AT WHAT GRANULARITY. That is a
-// pure counterfactual over the trace: for each candidate fetch unit G, charge each
-// (key, G-extent) once mount-wide, count the fetches, and count the bytes no reader ever
-// touches. Both axes of the trade, from the same rows, at no cost.
+// pure counterfactual over the trace, on both axes of the trade, from the same rows.
 //
-// Faithfulness note, and it is a real difference from globalScore's own cold loop: that
-// loop indexes a read by r.off/chunkSize alone, so a read straddling a chunk boundary
-// (~9% of HEMCO's) is charged one chunk when the mount fetches two. This sweep charges
-// every extent the read covers, which is what the mount does. At G = chunkSize it
-// therefore reports slightly MORE waste than globalScore's 1,257.3 MiB, and the gap is
-// exactly the straddle undercount rather than a disagreement about the rule.
+// THE REQUEST AXIS, and the correction that produced this version. The first cut of this
+// sweep counted one "fetch" per granularity UNIT and reported that as the cost, which
+// overstates requests -- at 64 KiB it claimed 42,570 where the real number is far lower.
+// lith does not issue a GET per extent. fetchExtents is called once per CHUNK and
+// fillExtentSpan then issues EXACTLY ONE ranged GET, spanning first-missing to
+// last-missing extent (blockstore/fill.go, extent.go:missingByteSpan) -- so it re-fetches
+// any resident extent that happens to lie between two missing ones, and marks it filled.
+// The consequence for the trade is large: going byte-exact does not multiply requests by
+// the number of extents, it multiplies them by how often a LATER read has to come back to
+// a chunk an earlier one no longer fully covers. So `gets` is the cost axis and `units`
+// is the bytes axis, and they are separate fields because conflating them was the bug.
+//
+// Faithfulness note, and a real difference from globalScore's own cold loop: that loop
+// indexes a read by r.off/chunkSize alone, so a read straddling a chunk boundary (~9% of
+// HEMCO's) is charged one chunk where the mount fills two. This sweep fills per chunk
+// touched, which is what the mount does. At G = chunkSize it therefore reports slightly
+// MORE waste than globalScore's 1,257.3 MiB, and the gap is the straddle undercount
+// rather than a disagreement about the rule.
 
 import (
 	"fmt"
@@ -44,9 +54,16 @@ import (
 
 // granRow is one candidate fetch unit's outcome on one trace.
 type granRow struct {
-	unit         int64 // the fetch granularity in bytes
-	fetches      int   // distinct (key, extent) fetches charged mount-wide
-	hits         int   // eligible cold reads served free by an extent already fetched
+	unit int64 // the fetch granularity in bytes
+	// gets is the number of S3 REQUESTS: fillExtentSpan issues exactly one ranged GET per
+	// per-chunk fill, spanning first-missing to last-missing unit. This is the cost axis,
+	// and counting units here instead (as the first version of this sweep did) overstates
+	// requests by the number of units a single GET happens to cover.
+	gets int
+	// units is how many granularity units became resident -- the bytes axis, not a request
+	// count. Kept distinct from gets precisely because conflating them was the bug.
+	units        int
+	hits         int   // eligible cold reads that needed no GET at all: every wanted unit resident
 	grossFetched int64 // bytes fetched by those fetches (EOF-clamped)
 	netWaste     int64 // of those, bytes no reader on the key ever reads
 	readBytes    int64 // bytes the eligible cold reads actually asked for
@@ -104,25 +121,54 @@ func sweepGranularity(rows []row, byteExact int64, units []int64) []granRow {
 			if seen[r.key] == nil {
 				seen[r.key] = map[int64]bool{}
 			}
-			// Every extent the read covers, not just the one its offset lands in.
-			first, last := r.off/g, (r.off+r.length-1)/g
+			size := sizeOf[r.key]
+			// One fill per CHUNK the read touches, because the extent bitmap and the
+			// singleflight claim are both per chunk: fetchExtents is called per chunk and
+			// each call issues at most one GET.
 			fetchedAny := false
-			for ei := first; ei <= last; ei++ {
-				if seen[r.key][ei] {
+			for ci := r.off / chunkSize; ci <= (r.off+r.length-1)/chunkSize; ci++ {
+				cLo, cHi := ci*chunkSize, ci*chunkSize+chunkSize
+				if size > 0 && cHi > size {
+					cHi = size
+				}
+				if cHi <= cLo {
 					continue
 				}
-				seen[r.key][ei] = true
-				lo, hi := ei*g, ei*g+g
-				if size := sizeOf[r.key]; size > 0 && hi > size {
-					hi = size
+				// What this fill WANTS in this chunk. At g >= chunkSize that is the whole
+				// chunk — today's `sequential` commitment at fs.go:778-786. Below it, only
+				// the g-aligned units the read actually overlaps.
+				wLo, wHi := cLo, cHi
+				if g < chunkSize {
+					rLo, rHi := max64(r.off, cLo), min64(r.off+r.length, cHi)
+					wLo, wHi = (rLo/g)*g, ((rHi+g-1)/g)*g
+					wLo, wHi = max64(wLo, cLo), min64(wHi, cHi)
 				}
-				if hi <= lo {
-					continue
+				// The missing units, and the span one GET would cover. fillExtentSpan
+				// fetches ONE contiguous range from the first missing unit to the last,
+				// re-fetching any resident unit in between and marking it filled -- so the
+				// span, not the missing set, is what gets paid for.
+				fLo, fHi := int64(-1), int64(-1)
+				for u := wLo; u < wHi; u += g {
+					if !seen[r.key][u/g] {
+						if fLo < 0 {
+							fLo = u
+						}
+						fHi = min64(u+g, cHi)
+					}
+				}
+				if fLo < 0 {
+					continue // every wanted unit already resident: no GET
 				}
 				fetchedAny = true
-				row.fetches++
-				row.grossFetched += hi - lo
-				row.netWaste += (hi - lo) - coveredBytes(allOf[r.key], lo, hi)
+				row.gets++
+				row.grossFetched += fHi - fLo
+				row.netWaste += (fHi - fLo) - coveredBytes(allOf[r.key], fLo, fHi)
+				for u := fLo; u < fHi; u += g {
+					if !seen[r.key][u/g] {
+						row.units++
+					}
+					seen[r.key][u/g] = true
+				}
 			}
 			if !fetchedAny {
 				row.hits++
@@ -149,31 +195,33 @@ func reportGranularity(label string, g []granRow) {
 	fmt.Printf("   -- cold-start fetch GRANULARITY sweep (%s): the trade the inversion makes\n", label)
 	fmt.Printf("      eligible first-run cold reads asked for %.1f MiB; today's %s chunk fetches %.1f MiB of it\n",
 		mib(base.readBytes), human(chunkSize), mib(base.grossFetched))
-	fmt.Printf("      %-9s %9s %9s %11s %11s %9s   %s\n",
-		"unit", "fetches", "free hits", "fetched MiB", "waste MiB", "waste %", "vs today")
+	fmt.Printf("      %-9s %8s %8s %9s %11s %11s %8s   %s\n",
+		"unit", "GETs", "units", "free hits", "fetched MiB", "waste MiB", "waste %", "vs today")
 	for _, r := range g {
 		wpct := 0.0
 		if r.grossFetched > 0 {
 			wpct = 100 * float64(r.netWaste) / float64(r.grossFetched)
 		}
 		delta := ""
-		if base.fetches > 0 && r.unit != chunkSize {
+		if base.gets > 0 && r.unit != chunkSize {
 			saved := mib(base.netWaste - r.netWaste)
-			extra := r.fetches - base.fetches
+			extra := r.gets - base.gets
 			per := 0.0
 			if extra > 0 {
 				per = (float64(base.netWaste-r.netWaste) / 1024) / float64(extra)
 			}
-			delta = fmt.Sprintf("saves %.1f MiB for %+d fetches (%.0f KiB/fetch)", saved, extra, per)
+			delta = fmt.Sprintf("saves %.1f MiB for %+d GETs (%.0f KiB/GET)", saved, extra, per)
 		} else if r.unit == chunkSize {
 			delta = "today"
 		}
-		fmt.Printf("      %-9s %9d %9d %11.1f %11.1f %8.1f%%   %s\n",
-			human(r.unit), r.fetches, r.hits, mib(r.grossFetched), mib(r.netWaste), wpct, delta)
+		fmt.Printf("      %-9s %8d %8d %9d %11.1f %11.1f %7.1f%%   %s\n",
+			human(r.unit), r.gets, r.units, r.hits, mib(r.grossFetched), mib(r.netWaste), wpct, delta)
 	}
-	fmt.Printf("      Read the KiB/fetch column as the exchange rate: bytes bought per extra\n")
-	fmt.Printf("      round-trip. It is not a verdict -- a request costs latency and money that\n")
-	fmt.Printf("      this trace cannot price, and the free-hits column is what shrinks.\n")
+	fmt.Printf("      GETs is REQUESTS, one per per-chunk fill (fillExtentSpan issues exactly one\n")
+	fmt.Printf("      ranged GET, spanning first-missing to last-missing unit). `units` is the bytes\n")
+	fmt.Printf("      axis and is NOT a request count -- conflating the two overstated requests.\n")
+	fmt.Printf("      Read KiB/GET as the exchange rate: bytes bought per extra round-trip. Not a\n")
+	fmt.Printf("      verdict -- a request costs latency this trace cannot price, and free hits shrink.\n")
 }
 
 // parseUnits reads the -granularity list. Sizes come back in DESCENDING order so the
@@ -208,6 +256,20 @@ func parseUnits(s string) []int64 {
 }
 
 func mib(b int64) float64 { return float64(b) / (1 << 20) }
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // human formats a byte count. Exact binary multiples print exactly (a 1 MiB fetch unit
 // must read as "1MiB", not "1.0MiB"); anything else — a decimal capacity like 24GB, or a
