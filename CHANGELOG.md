@@ -9,30 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The evidence gate's window floor now covers a first-byte round trip**
-  ([#256](https://github.com/scttfrdmn/lith/issues/256)). `--readahead-evidence-ratio`
-  clamped its window up to a constant `initialWindow` of **2 blocks**, and a constant
-  is the wrong shape: a window has to cover at least one round trip of the reader's own
-  consumption, or the reader drains it before a refill lands and then blocks on demand
-  for a whole round trip. 16 MiB is ~38 round trips of reading at 2.2 ms RTT and **~1.4
-  at 58.6 ms**, which is why the flag cost a flat ~0.35 s in-region and produced a
-  bimodal 4 s / 20 s wall-clock split cross-region — under 1.5x of margin, whether the
-  reader catches the prefetch frontier is a **race**, and a race gives two modes where
-  a latency tax would give a smooth curve. The floor is now derived from the device
-  (NIC baseline x rolling TTFB median, exposed as `BlockStore.RoundTripBytes`).
+- **Reverted: the evidence gate's window floor is a constant again**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). A floor derived from the
+  device (NIC baseline x rolling TTFB median) briefly replaced the constant
+  `initialWindow` of 2 blocks, on the reasoning that a window under one first-byte
+  round trip cannot keep a reader fed and that this explained a bimodal cross-region
+  wall-clock split. **Measurement refuted it and the change is backed out.**
 
-  **Provably inert at in-region latency** — at 2.2 ms the derived floor equals the old
-  constant, asserted by a test across four consumption levels — so it cannot regress the
-  configuration the flag was measured in. **Whether it collapses the high mode is
-  unverified**; that needs a ~58 ms endpoint.
+  Raising the floor so that no window fell below a round trip left the stall rate
+  **unchanged** — 4 of 8 cells over 9 s before and after — and the decisive evidence
+  is the `--pf-trace` window series, which is **bit-identical between a 20.3 s cell
+  and a 3.4 s cell of the same arm**: same 6432 windows, same min and max, same
+  dispatch count. A 6x wall difference with an identical window trajectory means the
+  window is not the channel.
 
-  This also corrects the mechanism in the report that prompted it. The proposal was that
-  low throughput makes *evidence accrue more slowly*, so the window grows more slowly.
-  It cannot: `windowCap()` is `floor(consumed x ratio / blockSize)` and `consumed` is
-  incremented by every read's length before any gate, so the cap schedule is a pure
-  function of the byte stream and is **bit-identical at any RTT**. The same reader reads
-  the same bytes in the same order whatever the latency. What is RTT-dependent is only
-  whether the window is wide enough to stay ahead — which is the floor, not the accrual.
+  Two further reasons not to keep it. It was **not actually device-derived**:
+  `RoundTripBytes` was read once at `Open()`, and `currentTTFB()` returns a hard-coded
+  40 ms seed until a fill has recorded a sample, so a single-handle reader on a fresh
+  mount — the ordinary case — always got the seed. The floor was therefore a constant
+  **30 blocks at 2.2 ms and at 58.6 ms alike**, confirmed by the measured minimum
+  window being exactly 30 at both endpoints. And it **cost bytes on the case the flag
+  exists for**: a cold low-coverage read went from 59.8 MB to 210.8 MB of S3 traffic,
+  turning a 95.1% byte saving into 82.7% — 13% of the win — because a 30-block floor
+  commits 240 MiB to a read that wants 22.5 MB. The inertness test that was supposed
+  to prevent that set the floor directly instead of going through the device path, so
+  it validated the arithmetic while the wiring delivered a constant.
+
 
 ## [1.2.0] - 2026-09-30
 
