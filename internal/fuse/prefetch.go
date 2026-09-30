@@ -14,6 +14,18 @@ import (
 type pfWrapper struct {
 	mu sync.Mutex
 	pf *prefetch.Prefetcher
+	// lastReadEnd is the byte offset just past the previous read the prefetcher was
+	// driven with. It lives here, under the same mutex that serializes the handle's
+	// decisions, because the byte gap is an INPUT to Observe and has to be computed and
+	// updated atomically with it (#278). It was previously an atomic.Int64 on the handle,
+	// loaded before the lock and stored after: two concurrent reads on one handle both
+	// saw the same stale endpoint, and whichever store landed last could move the
+	// endpoint BACKWARDS, yielding a gap matching no serialization of the reads. That gap
+	// gates the sequential branch (absInt64(byteGap) <= seqGapMax at
+	// internal/prefetch/prefetch.go:425), so a genuinely sequential handle read
+	// concurrently enough could synthesize a gap over the threshold, be classified as
+	// seeking, and lose the readahead it had earned.
+	lastReadEnd int64
 }
 
 // coverageWindow / coverageMin are the #221 coverage gate parameters, chosen
@@ -61,20 +73,58 @@ type observation struct {
 	after    prefetch.State
 	window   int64
 	peak     int64
+	// gap is the byte gap the detector actually saw, computed inside the lock and
+	// returned so the trace records the input to the decision rather than a re-derivation
+	// of it (#278).
+	gap int64
 }
 
-func (w *pfWrapper) observe(block, off, length, byteGap, maxWindow int64, seq *atomic.Int64) observation {
+// observe drives the detector for one read and returns everything the trace needs, all of
+// it captured under the handle's lock. The read's end offset is taken rather than its
+// length so the byte gap and the new endpoint are both derived here, atomically with the
+// Observe they feed (#278).
+func (w *pfWrapper) observe(block, off, end, maxWindow int64, seq *atomic.Int64) observation {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	gap := off - w.lastReadEnd
+	w.lastReadEnd = end
 	w.pf.SetMax(maxWindow)
-	d := w.pf.Observe(block, off, length, byteGap)
+	d := w.pf.Observe(block, off, end-off, gap)
 	return observation{
 		dispatch: d,
 		seq:      seq.Add(1),
 		after:    w.pf.State(),
 		window:   w.pf.Window(),
 		peak:     w.pf.PeakWindow(),
+		gap:      gap,
 	}
+}
+
+// observeContiguous drives the detector with a byte gap of ZERO regardless of the handle's
+// last endpoint. The CargoShip path reads a decoded frame stream rather than scattered
+// object metadata, so neither the #210/M16-1b byte-gap gate nor the #221 coverage gate
+// should fire; it still advances the endpoint so a later windowed read on the same handle
+// measures from the right place.
+func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, seq *atomic.Int64) observation {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lastReadEnd = end
+	w.pf.SetMax(maxWindow)
+	d := w.pf.Observe(block, off, end-off, 0)
+	return observation{
+		dispatch: d, seq: seq.Add(1), after: w.pf.State(),
+		window: w.pf.Window(), peak: w.pf.PeakWindow(), gap: 0,
+	}
+}
+
+// gapFrom reports the byte gap a read at off would see, without advancing the endpoint.
+// Only the trace uses it, for reads the prefetcher is deliberately not driven with (a
+// whole-file parts fetch, or a footer handle's byte-exact plan): those rows keep today's
+// semantics of a gap measured against the last read the detector DID see.
+func (w *pfWrapper) gapFrom(off int64) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return off - w.lastReadEnd
 }
 
 // isEstablished reports whether the handle's access pattern is known to tile —

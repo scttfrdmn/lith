@@ -40,45 +40,43 @@ func TestCacheModelEvictsAndCountsRefetches(t *testing.T) {
 	}
 }
 
-// #280, pinned as a regression test rather than as an expectation.
+// #280, now fixed, and this test is the one that predicted its own replacement value.
 //
-// I wrote this case expecting a cache overflowed with nothing but prefetched chunks to
-// report unread evictions, since #55 says unread chunks are evicted last. It reports
-// ZERO, and the model is right: the production fill path Merges (which evicts) and only
-// then MarkUnreads, so the chunk being inserted is not yet flagged and is therefore a
-// valid "already-read" victim — the newest fetch is discarded on arrival while the
-// correctly-flagged older ones survive. `PutUnread`, which makes insert-and-flag atomic,
-// exists for exactly this and has no callers.
+// Before the fix the production fill path did Merge (which evicts) and only then
+// MarkUnread, so a just-filled prefetch chunk was resident and unflagged across eviction --
+// and backEvictable(in, wantUnread=false) reads "not flagged" as "already read". Once a
+// shard held nothing but unread chunks, the newly arrived fetch was the only eligible
+// victim, so it was discarded on arrival while the older correctly-flagged ones survived,
+// and the thrash counter never fired because evictInEl saw unread=false.
 //
-// Asserted as-is so the model keeps matching production. When #280 is fixed this test
-// must fail, and the assertions below say what it should then say.
-func TestCacheModelReproducesTheUnflaggedEvictionWindow(t *testing.T) {
+// MergeUnread sets the flag under the same lock acquisition, before evict(). So now the
+// NEWEST fetch survives, the oldest unread chunks are evicted, and every one of those
+// evictions is counted.
+func TestUnreadFlagIsSetBeforeEvictionCanSeeTheChunk(t *testing.T) {
 	m := NewCacheModel(2*cmMiB, 1, cmMiB)
 	for i := 0; i < 6; i++ {
 		m.Fill(fmt.Sprintf("p/%d", i), cmMiB, true)
 	}
-	// Today (#280): the two chunks inserted before the cache filled are the only
-	// survivors, and every later fetch was evicted on insertion.
-	for _, k := range []string{"p/0", "p/1"} {
+	// 6 MiB of prefetch into a 2 MiB shard: four must be evicted, and all four counted.
+	if s := m.Stats(); s.UnreadEvicts != 4 {
+		t.Errorf("UnreadEvicts = %d, want 4: every unread eviction must reach the thrash counter", s.UnreadEvicts)
+	} else if s.UnreadBytes != 4*cmMiB {
+		t.Errorf("UnreadBytes = %d, want %d", s.UnreadBytes, 4*cmMiB)
+	}
+	// The two most recent fetches survive; a fetch is no longer discarded on arrival.
+	for _, k := range []string{"p/4", "p/5"} {
 		if !m.Read(k) {
-			t.Errorf("%s not resident: the early, correctly-flagged chunks should survive", k)
+			t.Errorf("%s not resident: the newest fetch must not be evicted on arrival (#280)", k)
 		}
 	}
-	// Reads above would clear the unread flag, so re-check residency of the rest via a
-	// fresh model to keep the two assertions independent.
+	// And the oldest are the ones gone, which is the intended eviction order.
 	m2 := NewCacheModel(2*cmMiB, 1, cmMiB)
 	for i := 0; i < 6; i++ {
 		m2.Fill(fmt.Sprintf("p/%d", i), cmMiB, true)
 	}
-	if s := m2.Stats(); s.UnreadEvicts != 0 {
-		t.Errorf("UnreadEvicts = %d; #280 says 0 today (the victim is unflagged, so the thrash "+
-			"counter cannot fire). If this now reports evictions, #280 is fixed and this test "+
-			"should assert UnreadEvicts == 4 instead", s.UnreadEvicts)
-	}
-	for i := 2; i < 6; i++ {
-		if m2.Read(fmt.Sprintf("p/%d", i)) {
-			t.Errorf("p/%d resident; #280 says a chunk fetched into a full all-unread shard is "+
-				"evicted on insertion", i)
+	for _, k := range []string{"p/0", "p/1"} {
+		if m2.Read(k) {
+			t.Errorf("%s still resident: the oldest unread chunks should be the victims", k)
 		}
 	}
 }

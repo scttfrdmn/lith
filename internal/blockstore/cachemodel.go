@@ -91,9 +91,13 @@ func (m *CacheModel) Fill(ck string, n int64, isPrefetch bool) {
 	m.sizes[ck] = n
 	m.filled[ck] = true
 	m.fills++
-	m.mem.Merge(ck, m.back[:n], fullExtents)
+	// Mirrors BlockStore.complete exactly, including #280's fix: a prefetch fill sets the
+	// unread flag under the same lock acquisition as the merge. The model must move in
+	// lockstep with the policy -- that is the whole reason it drives the real tier.
 	if isPrefetch {
-		m.mem.MarkUnread(ck)
+		m.mem.MergeUnread(ck, m.back[:n], fullExtents)
+	} else {
+		m.mem.Merge(ck, m.back[:n], fullExtents)
 	}
 }
 

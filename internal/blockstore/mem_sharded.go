@@ -35,11 +35,13 @@ func (m *memCache) Put(key string, data []byte, filled uint16) { m.shard(key).Pu
 func (m *memCache) Merge(key string, data []byte, filled uint16) {
 	m.shard(key).Merge(key, data, filled)
 }
-func (m *memCache) Pin(key string)                              { m.shard(key).Pin(key) }
-func (m *memCache) Unpin(key string)                            { m.shard(key).Unpin(key) }
-func (m *memCache) PutUnread(key string, data []byte, f uint16) { m.shard(key).PutUnread(key, data, f) }
-func (m *memCache) MarkUnread(key string)                       { m.shard(key).MarkUnread(key) }
-func (m *memCache) ClearUnread(key string)                      { m.shard(key).ClearUnread(key) }
+func (m *memCache) Pin(key string)   { m.shard(key).Pin(key) }
+func (m *memCache) Unpin(key string) { m.shard(key).Unpin(key) }
+func (m *memCache) MergeUnread(key string, data []byte, f uint16) {
+	m.shard(key).MergeUnread(key, data, f)
+}
+func (m *memCache) MarkUnread(key string)  { m.shard(key).MarkUnread(key) }
+func (m *memCache) ClearUnread(key string) { m.shard(key).ClearUnread(key) }
 
 // setOnEvictUnread installs the thrash callback on every shard.
 func (m *memCache) setOnEvictUnread(fn func(key string)) {

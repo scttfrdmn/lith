@@ -455,9 +455,15 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, fil
 		// cached (#118); the merged buffer is complete and immutable. blocking ==
 		// prefetch fill: also flag it unread (evicted last) so it holds a budget
 		// reservation until a demand read consumes it or it is evicted (#55).
-		bs.mem.Merge(ck, data, filled)
+		// #280: MergeUnread sets the unread flag under the same lock acquisition as the
+		// merge, before eviction runs. The Merge-then-MarkUnread sequence this replaces
+		// left a just-filled prefetch chunk resident and unflagged across evict(), which
+		// made it the preferred "already-read" victim and discarded the fetch that had
+		// just arrived -- silently, since the thrash counter only fires for flagged ones.
 		if blocking {
-			bs.mem.MarkUnread(ck)
+			bs.mem.MergeUnread(ck, data, filled)
+		} else {
+			bs.mem.Merge(ck, data, filled)
 		}
 	} else if blocking {
 		// Prefetch fill failed: drop its prefetched marker.
