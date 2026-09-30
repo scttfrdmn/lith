@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-30
+
+**A minor, not a patch:** this adds two flags (`--pf-trace`,
+`--readahead-evidence-ratio`, both off by default) and three metrics, which is new
+backward-compatible functionality.
+
+The substance is an investigation ([#256](https://github.com/scttfrdmn/lith/issues/256))
+into when readahead over-fetches, conducted with an external workload, and the
+corrections it forced. Two real read-path bugs are fixed: a byte gap computed
+outside the decision lock could make a concurrently-read sequential handle look
+like it was seeking and lose its readahead, and a just-prefetched chunk could be
+discarded on arrival under memory pressure while the thrash metric that exists to
+report exactly that had never been able to fire.
+
+Three documentation claims turned out to be wrong when measured, and are corrected
+here rather than quietly: the losing access shape is **low coverage**, not
+"scattered reads" (same read size, monotone end to end, so the detector was
+classifying it correctly all along); `--mem-cache` needs ~2.5x the distinct working
+set rather than 1x, because the tier is sharded 64 ways; and the claim that
+evidence-proportional readahead "does not improve precision" held only at 48 MPI
+ranks — with a single reader it cuts over-fetch by up to 95% while follow-through
+rises.
+
+Also fixed: five earlier releases published with an **empty** body, and the
+`lith-pfreplay` diagnostic (not a shipped binary) gained the offline replay,
+shared-cache, key-level, granularity and eviction passes the investigation ran on.
+
+**One caveat shipped knowingly.** `--readahead-evidence-ratio` is experimental and
+off by default, and it should stay off for **high-latency or non-AWS endpoints**:
+measured cross-region it leaves bytes and request counts identical but makes wall
+clock bimodal, with `wall > 9 s` in 0 of 16 unclamped cells against 8 of 16 when
+enabled. In-region it costs a fixed ~+0.35 s and no stall appears. The corollary is
+the transferable part — a bytes-and-requests regression check is **not** sufficient
+for this flag, because those are identical on both sides of the stall.
+
 ### Added
 
 - **`lith-pfreplay -mem-cache`: drive the real memory tier, instead of assuming no
