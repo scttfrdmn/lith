@@ -98,6 +98,13 @@ type dispatch struct {
 	key   string
 }
 
+// wantLead / leadLabel gate the dispatch-lead pass. Package-level rather than another
+// parameter on an already-wide signature; set once per trace by main before the call.
+var (
+	wantLead  bool
+	leadLabel string
+)
+
 func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact int64, model *blockstore.CacheModel) ([]handleScore, globalStats, map[string]*keyAgg, error) {
 	var stats globalStats
 	// Per-OBJECT aggregates of the very same accounting, for the key-level fit (keys.go).
@@ -179,6 +186,10 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 	// already built rather than a second reconstruction (eviction.go).
 	if model != nil {
 		driveCache(model, ord, dispatches, sizeOf, cfg.blockSize)
+	}
+	// The dispatch-lead distribution, from the same reconstruction (lead.go).
+	if wantLead {
+		reportLead(leadLabel, scoreLead(ord, dispatches, cfg.blockSize))
 	}
 
 	claimed := map[string]map[int64]bool{}

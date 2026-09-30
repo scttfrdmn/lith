@@ -132,6 +132,7 @@ func main() {
 	keysOut := flag.String("keys-out", "", "write per-key scores and features to this CSV")
 	gran := flag.String("granularity", "", "sweep the cold-start fetch unit over this comma-separated list of sizes (e.g. `1MiB,512KiB,256KiB,64KiB`) and print bytes-saved against round-trips-added: the trade the \"unknown until proven sequential\" fix makes (see granularity.go)")
 	memCache := flag.String("mem-cache", "", "model the REAL memory tier at this capacity (e.g. `24GB`, `512MiB`) and report what eviction costs, instead of assuming none; implies -global (see eviction.go)")
+	lead := flag.Bool("lead", false, "report the dispatch-LEAD distribution: how many reads before each demand read its block was prefetched (#256 -- a short lead means the read blocks on the prefetch's round trip instead of its own); implies -global")
 	global_ := flag.Bool("global", false, "also score against one SHARED cache per mount: charge each (key, block) fetch once and credit reads by ANY handle on that key (needs the seq and key columns)")
 	issuedPer := flag.String("issued-per", "", "per-trace lith_prefetch_issued_total, e.g. `met/a=2939,hemco/a=4632`: with -global, the independent check on which unit reproduces the mount's fetch volume")
 	flag.Parse()
@@ -149,6 +150,9 @@ func main() {
 	// defect class this tool exists to measure (#264: a flag that reaches nothing), so the
 	// implication is applied here and TestFlagsThatClaimToImplyGlobalDoSo enforces it.
 	if parseBytes(*memCache) > 0 {
+		*global_ = true
+	}
+	if *lead {
 		*global_ = true
 	}
 	if *keys_ {
@@ -183,6 +187,7 @@ func main() {
 			reportGranularity(spec, sweepGranularity(rows, *byteExact, units))
 		}
 		if *global_ {
+			wantLead, leadLabel = *lead, spec
 			var model *blockstore.CacheModel
 			if cap_ := parseBytes(*memCache); cap_ > 0 {
 				model = blockstore.NewCacheModel(cap_, memShards, chunkSize)
