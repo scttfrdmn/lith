@@ -75,3 +75,31 @@ func TestMem2QPinSurvivesEviction(t *testing.T) {
 		t.Error("unpinned chunk survived heavy eviction pressure")
 	}
 }
+
+// #280 at the tier level, independent of the offline model: the unread flag must be visible
+// to eviction at the moment the chunk is inserted. Merge-then-MarkUnread was not, and the
+// consequence was that a full shard of unread chunks discarded each new arrival instead of
+// an older one -- without firing the thrash callback, since the victim looked already-read.
+func TestMergeUnreadIsAtomicWithRespectToEviction(t *testing.T) {
+	const mib = 1 << 20
+	var evicted []string
+	c := newMem2Q(2 * mib)
+	c.onEvictUnread = func(k string) { evicted = append(evicted, k) }
+	buf := make([]byte, mib)
+	for i := 0; i < 5; i++ {
+		c.MergeUnread("k"+strconv.Itoa(i), buf, fullExtents)
+	}
+	// Three evictions, all of them counted, none of them the chunk just inserted.
+	if len(evicted) != 3 {
+		t.Fatalf("unread evictions = %d (%v), want 3: every unread eviction must be reported",
+			len(evicted), evicted)
+	}
+	for _, k := range evicted {
+		if k == "k4" {
+			t.Error("the most recently inserted chunk was evicted: the flag was not visible to evict()")
+		}
+	}
+	if _, _, ok := c.Get("k4"); !ok {
+		t.Error("k4 not resident: a just-filled prefetch chunk must not be discarded on arrival")
+	}
+}

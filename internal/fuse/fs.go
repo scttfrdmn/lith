@@ -178,10 +178,6 @@ type fileHandle struct {
 	// chunks, and a read maps to frame range GETs on those chunks. A cargo handle
 	// bypasses the bgzf/footer/sibling readahead paths entirely.
 	cargo []cargoPart
-	// lastReadEnd is the byte offset just past the previous read on this handle,
-	// for the M16 step-1b detector-gap characterization/rule (byte gap = off -
-	// lastReadEnd). Atomic because the kernel issues a handle's reads concurrently.
-	lastReadEnd atomic.Int64
 }
 
 // cargoPart is one contiguous run of a virtual file's bytes in a packed chunk,
@@ -813,11 +809,8 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 	// footer-family handle whose byte-exact projection plan replaces the window
 	// (a whole-block window would re-fetch the columns the plan skips; #118).
 	blk := off / f.blockSize
-	// Byte gap from the previous read on this handle: a large gap is a seek even
-	// when it lands in an adjacent block or the grown reorder band, so the detector
-	// does not grow the readahead window for a scattered metadata walk (#210/M16
-	// 1b). The gated trace records what the detector saw; nil in production.
-	gap := off - h.lastReadEnd.Load()
+	// The byte gap is computed INSIDE pfWrapper.observe, atomically with the Observe it
+	// feeds and the endpoint it updates (#278). It is not available before that call.
 	if !h.partsDispatched.Load() && (h.footerKind == footer.FormatNone || h.footerStream) {
 		var before prefetch.State
 		if f.pfTrace != nil {
@@ -829,11 +822,11 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// measured at 2.70x more dispatch than the mount, on a capture where the mount
 		// never exceeded 17 blocks and the replay assumed 223 (#267). So it is recorded.
 		maxWin := f.perHandleWindow()
-		obs := h.pf.observe(blk, off, end-off, gap, maxWin, &f.pfSeq)
+		obs := h.pf.observe(blk, off, end, maxWin, &f.pfSeq)
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
 				seq: obs.seq, fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
-				off: off, length: end - off, blk: blk, gap: gap, path: "window",
+				off: off, length: end - off, blk: blk, gap: obs.gap, path: "window",
 				before: before, after: obs.after, maxWindow: maxWin,
 				window: obs.window, dispatched: len(obs.dispatch), peak: obs.peak,
 			})
@@ -841,7 +834,6 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		for _, pb := range obs.dispatch {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
-		h.lastReadEnd.Store(end)
 	} else if f.pfTrace != nil {
 		// The prefetcher is deliberately not driven here — a whole-file parts fetch
 		// already covers every block, or a footer handle's byte-exact plan replaces
@@ -856,7 +848,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		st := h.pf.state()
 		f.tracePF(pfTraceRow{
 			seq: f.pfSeq.Add(1), fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
-			off: off, length: end - off, blk: blk, gap: gap, path: path, before: st, after: st,
+			off: off, length: end - off, blk: blk, gap: h.pf.gapFrom(off), path: path, before: st, after: st,
 			maxWindow: f.perHandleWindow(), window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
 		})
 	}

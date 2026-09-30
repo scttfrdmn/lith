@@ -52,11 +52,11 @@ re-fetch anyway. Measured by replaying a real workload's trace through the produ
 | 24–32 GB | 6.7× | **nothing** — eviction never fires |
 | 8 GB | 2.2× | 5.0 MiB |
 | 6 GB | 1.7× | 48.9 MiB |
-| 4 GB | 1.1× | **2.2 GiB** |
-| 2 GB | 0.6× | 18.7 GiB — more than double the run's entire S3 traffic |
+| 4 GB | 1.1× | **2.9 GiB** (plus 251 prefetched chunks discarded unread) |
+| 2 GB | 0.6× | 16.5 GiB — more than double the run's entire S3 traffic |
 
 So the cliff is not at 1.0× but a little above 2×, and it is steep: between 1.7× and 1.1× the
-re-fetch cost rises by 45×. A pooled cache would hold this working set at 1.0×; the ~2.2×
+re-fetch cost rises by 60×. A pooled cache would hold this working set at 1.0×; the ~2.2×
 is what sharding costs. If you are tuning against a bill, measure the distinct bytes your job
 touches and multiply by 2.5.
 

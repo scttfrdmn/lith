@@ -7,16 +7,39 @@ import (
 	"sync"
 )
 
-// mem2Q is a byte-bounded 2Q cache (Johnson & Shasha). Newly admitted blocks
-// enter a FIFO "in" queue; a reference to a block whose key is on the ghost
-// "out" list promotes it to an LRU "main" queue. This resists a sequential
-// scan evicting the hot set, which matters for a mixed sequential/random
-// workload. All operations are O(1) amortized.
+// mem2Q is a byte-bounded cache with 2Q's STRUCTURE but deliberately not its Kin bound.
+//
+// Newly admitted blocks enter a FIFO "in" queue. Eviction prefers already-read blocks over
+// prefetched-but-unconsumed ones (#55), scanning `in` from the back and then the `main` LRU.
+// Evicting from `in` records a ghost key, and a later reference to a ghost admits the block
+// straight to `main`. All operations are O(1) amortized.
+//
+// WHAT IS MISSING ON PURPOSE. Classic 2Q (Johnson & Shasha) caps the probationary queue at
+// Kin ~ 25% of capacity and sheds its tail to the ghost list early, so a hot set accumulates
+// in `main` before the cache comes under pressure. lith does not, which means `main` stays
+// empty until the first eviction and the tier behaves as a FIFO until then.
+//
+// That was #279, filed as a bug on the reasonable assumption that the enforcement had simply
+// been forgotten. It was then measured, and enforcing it is strictly worse on every workload
+// available -- because trimming `in` to 25% DROPS chunk data early, and the reads that would
+// have hit it are the cross-handle shares this filesystem exists to serve:
+//
+//	hemco/a, 6229 handles, 47% of touched chunks shared, re-fetched bytes:
+//	  24 GB cache   0 MiB -> 48.9 MiB     (a non-binding cache becomes binding)
+//	   8 GB         5.0   -> 2754.7 MiB   (551x)
+//	   4 GB        2957   -> 6014 MiB     (2x)
+//	second workload, 0% cross-handle sharing, 2 GB cache:
+//	  three of four arms go from NOT BINDING to 8 MiB re-fetched
+//
+// Kin buys scan resistance, which requires a hot set that a scan could evict. lith's measured
+// workloads do not have that shape -- they have broad sharing, which Kin destroys. So the
+// fields that computed the bound are gone rather than wired up, and this comment is the
+// record of why. Revisiting needs a workload with a genuine hot set; the replay tool and the
+// published traces make that a ~20-line experiment.
 type mem2Q struct {
 	mu       sync.Mutex
 	capacity int64
 	size     int64 // bytes held across in+main
-	inSize   int64 // bytes held in the in FIFO
 
 	in     *list.List               // A1in: FIFO of recently admitted
 	main   *list.List               // Am: LRU of frequently used
@@ -26,8 +49,7 @@ type mem2Q struct {
 	pins   map[string]int           // key -> pin count (not evictable while > 0)
 	unread map[string]struct{}      // prefetched, not yet demand-read: evicted last (#55)
 
-	inCap    int64 // byte cap for the in queue
-	ghostCap int   // entry cap for the ghost list
+	ghostCap int // entry cap for the ghost list
 
 	// onEvictUnread, if set, is called when an unread (prefetched-but-unconsumed)
 	// chunk is evicted — the thrash signal for #55.
@@ -54,37 +76,8 @@ func newMem2Q(capacity int64) *mem2Q {
 		ghost:    make(map[string]*list.Element),
 		pins:     make(map[string]int),
 		unread:   make(map[string]struct{}),
-		inCap:    capacity / 4, // classic 2Q: Kin ~ 25% of capacity
 		ghostCap: 4096,
 	}
-}
-
-// PutUnread inserts a block and flags it unread atomically, so there is no
-// window in which a just-prefetched chunk can be evicted as if already read
-// (which would re-fetch without tripping the thrash metric). See #55.
-func (c *mem2Q) PutUnread(key string, data []byte, filled uint16) {
-	if c.capacity == 0 || int64(len(data)) > c.capacity {
-		return
-	}
-	c.mu.Lock()
-	if _, ok := c.table[key]; !ok {
-		e := &entry{key: key, filled: filled}
-		e.data = data
-		if gel, isGhost := c.ghost[key]; isGhost {
-			c.out.Remove(gel)
-			delete(c.ghost, key)
-			e.owner = c.main
-			c.table[key] = c.main.PushFront(e)
-		} else {
-			e.owner = c.in
-			c.table[key] = c.in.PushFront(e)
-			c.inSize += int64(len(data))
-		}
-		c.size += int64(len(data))
-	}
-	c.unread[key] = struct{}{}
-	c.evict()
-	c.mu.Unlock()
 }
 
 // MarkUnread flags a chunk as prefetched-but-not-yet-demanded, so eviction
@@ -177,7 +170,6 @@ func (c *mem2Q) Put(key string, data []byte, filled uint16) {
 	} else {
 		e.owner = c.in
 		c.table[key] = c.in.PushFront(e)
-		c.inSize += int64(len(data))
 	}
 	c.size += int64(len(data))
 	c.evict()
@@ -189,17 +181,35 @@ func (c *mem2Q) Put(key string, data []byte, filled uint16) {
 // produced the merged buffer (copy-on-merge), so a reader holding the old buffer
 // keeps seeing consistent, immutable bytes. If absent, it is inserted like Put.
 func (c *mem2Q) Merge(key string, data []byte, filled uint16) {
+	c.merge(key, data, filled, false)
+}
+
+// MergeUnread is Merge plus the unread flag, set under the SAME lock acquisition and
+// BEFORE eviction runs (#280). The two-call sequence it replaces -- Merge then MarkUnread --
+// left the chunk resident and unflagged across an evict(), where backEvictable(in, false)
+// treats "not flagged unread" as "already read" and the newly filled chunk is the only such
+// candidate once a shard's residents are all unread. The victim was therefore the fetch that
+// had just arrived, and because evictInEl was called with unread=false the #55 thrash
+// counter never fired. Measured before the fix: six prefetch fills into a 2 MiB shard kept
+// the two oldest and discarded all four later ones, with lith_prefetch_evicted_unread_total
+// at zero.
+func (c *mem2Q) MergeUnread(key string, data []byte, filled uint16) {
+	c.merge(key, data, filled, true)
+}
+
+func (c *mem2Q) merge(key string, data []byte, filled uint16, unread bool) {
 	if c.capacity == 0 || int64(len(data)) > c.capacity {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Before evict(), so the chunk being filled is never an eligible "already-read" victim.
+	if unread {
+		c.unread[key] = struct{}{}
+	}
 	if el, ok := c.table[key]; ok {
 		e := el.Value.(*entry)
 		c.size += int64(len(data)) - int64(len(e.data))
-		if e.owner == c.in {
-			c.inSize += int64(len(data)) - int64(len(e.data))
-		}
 		e.data = data
 		e.filled |= filled
 		if e.owner == c.main {
@@ -217,12 +227,14 @@ func (c *mem2Q) Merge(key string, data []byte, filled uint16) {
 	} else {
 		e.owner = c.in
 		c.table[key] = c.in.PushFront(e)
-		c.inSize += int64(len(data))
 	}
 	c.size += int64(len(data))
 	c.evict()
 }
 
+// evict enforces the one bound this cache has: total capacity. See the type comment for why
+// there is no Kin bound on the probationary queue (#279 -- measured, and enforcing it is
+// worse).
 func (c *mem2Q) evict() {
 	for c.size > c.capacity {
 		// Evict already-read chunks before unread (prefetched-but-unconsumed)
@@ -283,7 +295,6 @@ func (c *mem2Q) evictInEl(el *list.Element, unread bool) {
 	c.in.Remove(el)
 	delete(c.table, e.key)
 	c.size -= int64(len(e.data))
-	c.inSize -= int64(len(e.data))
 	c.dropUnread(e.key, unread)
 	// Record a ghost (key only) so a later reference promotes it to main.
 	c.ghost[e.key] = c.out.PushFront(&entry{key: e.key})
