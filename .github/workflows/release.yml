@@ -103,13 +103,34 @@ jobs:
       # this catches the wiring itself regressing (a dropped --release-notes flag,
       # a goreleaser flag rename), which is how the empty bodies went unnoticed
       # across five releases.
-      - name: verify the published release has a body
+      - name: verify the published body IS the CHANGELOG section
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          n=$(gh release view "$GITHUB_REF_NAME" --json body -q '.body | length')
-          if [ "${n:-0}" -lt 20 ]; then
-            echo "::error::release $GITHUB_REF_NAME published with an empty body ($n chars)"
+          # "Non-empty" is too weak a check, and v1.2.0-rc.1 proved it from the other
+          # side: with `changelog: disable: true` fighting `--release-notes` the body
+          # came out as 2 bytes of whitespace, and had goreleaser instead fallen back
+          # to generating from git log the body would have been non-empty and WRONG.
+          # So assert the published body actually contains the notes we supplied.
+          gh release view "$GITHUB_REF_NAME" --json body -q .body > /tmp/published-body.md
+          n=$(wc -c < /tmp/published-body.md)
+          if [ "$n" -lt 200 ]; then
+            echo "::error::release $GITHUB_REF_NAME published with an empty or stub body ($n bytes)"
             exit 1
           fi
-          echo "release body: $n chars"
+          # The first substantive line of the notes must appear in the body. This is
+          # what distinguishes "our CHANGELOG section" from "goreleaser's git-log
+          # changelog", which a length check cannot tell apart.
+          probe=$(grep -m1 -E '^[A-Za-z*_`#]' "$RUNNER_TEMP/release-notes.md" | cut -c1-60)
+          if [ -z "$probe" ]; then
+            echo "::error::could not derive a probe line from the notes file"
+            exit 1
+          fi
+          if ! grep -qF -- "$probe" /tmp/published-body.md; then
+            echo "::error::published body does not contain the CHANGELOG notes"
+            echo "::error::expected to find: $probe"
+            echo "--- first 40 lines of what was actually published ---"
+            head -40 /tmp/published-body.md
+            exit 1
+          fi
+          echo "release body: $n bytes, and it contains the CHANGELOG section"

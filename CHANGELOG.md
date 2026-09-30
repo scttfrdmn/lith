@@ -409,14 +409,25 @@ for this flag, because those are identical on both sides of the stall.
   an observability complaint, so it now has a test.
 
 
-- **GitHub releases carry release notes again.** `.goreleaser.yaml` disables
-  goreleaser's git-log changelog (this hand-written file is the source of truth)
-  but nothing supplied notes in its place, so every release from **v0.5.0** on
-  (`v0.5.0`, `v1.1.0`–`v1.1.3`) published with an **empty body**. The release
-  workflow now extracts the tag's section from this file
-  (`scripts/release-notes.sh`) and passes it to goreleaser as `--release-notes`,
-  **fails the release** when the section is missing, and **asserts the published
-  body is non-empty** afterwards. The five affected releases were backfilled from
+- **GitHub releases carry release notes again — on the second attempt.**
+  `.goreleaser.yaml` disabled goreleaser's git-log changelog (this hand-written file
+  is the source of truth) but nothing supplied notes in its place, so every release
+  from **v0.5.0** on (`v0.5.0`, `v1.1.0`–`v1.1.3`) published with an **empty body**.
+  The release workflow now extracts the tag's section from this file
+  (`scripts/release-notes.sh`) and passes it to goreleaser as `--release-notes`.
+
+  **The first fix did not work, and the rehearsal tag is what found it.** Adding
+  `--release-notes` while *keeping* `changelog: disable: true` leaves the two
+  fighting: with the changelog disabled goreleaser short-circuits before applying
+  the notes, and `v1.2.0-rc.1` published a **2-byte body** (`"\n\n"`) alongside a
+  complete and correct 16-asset set. The `disable` key is now gone — supplying notes
+  already skips generation, which is all disabling was trying to achieve.
+
+  The post-publish check is also stronger than it was, because the original was too
+  weak in a way this exposed from the other side: asserting the body is merely
+  **non-empty** cannot distinguish the CHANGELOG section from a git-log changelog, so
+  a fallback to generation would have passed while shipping the wrong body. It now
+  asserts the published body **contains the notes that were supplied**. The five affected releases were backfilled from
   this file, so every published release now carries its notes.
 - **Two stale instrumentation strings that misled a bug reporter**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)). `--parts-max`'s help still
