@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The evidence gate's window floor now covers a first-byte round trip**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). `--readahead-evidence-ratio`
+  clamped its window up to a constant `initialWindow` of **2 blocks**, and a constant
+  is the wrong shape: a window has to cover at least one round trip of the reader's own
+  consumption, or the reader drains it before a refill lands and then blocks on demand
+  for a whole round trip. 16 MiB is ~38 round trips of reading at 2.2 ms RTT and **~1.4
+  at 58.6 ms**, which is why the flag cost a flat ~0.35 s in-region and produced a
+  bimodal 4 s / 20 s wall-clock split cross-region — under 1.5x of margin, whether the
+  reader catches the prefetch frontier is a **race**, and a race gives two modes where
+  a latency tax would give a smooth curve. The floor is now derived from the device
+  (NIC baseline x rolling TTFB median, exposed as `BlockStore.RoundTripBytes`).
+
+  **Provably inert at in-region latency** — at 2.2 ms the derived floor equals the old
+  constant, asserted by a test across four consumption levels — so it cannot regress the
+  configuration the flag was measured in. **Whether it collapses the high mode is
+  unverified**; that needs a ~58 ms endpoint.
+
+  This also corrects the mechanism in the report that prompted it. The proposal was that
+  low throughput makes *evidence accrue more slowly*, so the window grows more slowly.
+  It cannot: `windowCap()` is `floor(consumed x ratio / blockSize)` and `consumed` is
+  incremented by every read's length before any gate, so the cap schedule is a pure
+  function of the byte stream and is **bit-identical at any RTT**. The same reader reads
+  the same bytes in the same order whatever the latency. What is RTT-dependent is only
+  whether the window is wide enough to stay ahead — which is the floor, not the accrual.
+
 ## [1.2.0] - 2026-09-30
 
 **A minor, not a patch:** this adds two flags (`--pf-trace`,

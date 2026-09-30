@@ -116,6 +116,7 @@ type Prefetcher struct {
 	evidenceRatio float64
 	evidenceBlock int64 // block size in bytes, to convert the byte bound to blocks
 	consumed      int64 // cumulative bytes this handle has read
+	evidenceFloor int64 // floor for the evidence cap, in blocks; 0 = initialWindow
 	evidenceHeld  int64 // times the gate held the window below maxReadahead
 	evidenceCut   int64 // cumulative blocks withheld by those holds
 
@@ -202,6 +203,26 @@ func (p *Prefetcher) SetEvidence(ratio float64, blockSize int64) {
 	p.evidenceBlock = blockSize
 }
 
+// SetEvidenceFloor raises the floor the evidence gate clamps a window up to, in
+// blocks (#256). The default is initialWindow, a constant 2, and a constant is the
+// wrong shape for this: a window has to cover at least one first-byte round trip of
+// the reader's own consumption, or the reader drains it before a refill lands and
+// then blocks on demand for a whole round trip.
+//
+// At 2.2 ms RTT, 2 blocks (16 MiB) is 38 round trips of reading and the floor never
+// matters. At 58.6 ms it is 1.4, so the margin is under 1.5x and whether the reader
+// catches the prefetch frontier becomes a race -- which is what produced a bimodal
+// 4 s / 20 s wall-clock split rather than the smooth cost a latency tax would give.
+//
+// The caller supplies the device's round-trip byte count; 0 or negative leaves the
+// constant floor in place.
+func (p *Prefetcher) SetEvidenceFloor(blocks int64) {
+	if blocks < initialWindow {
+		blocks = initialWindow
+	}
+	p.evidenceFloor = blocks
+}
+
 // EvidenceHeld reports how many times the evidence gate held a window below the
 // configured maximum (#256). Zero when the gate is disabled.
 func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
@@ -236,8 +257,12 @@ func (p *Prefetcher) windowCap() int64 {
 		return p.maxReadahead
 	}
 	earned := int64(float64(p.consumed)*p.evidenceRatio) / p.evidenceBlock
-	if earned < initialWindow {
-		earned = initialWindow
+	floor := p.evidenceFloor
+	if floor < initialWindow {
+		floor = initialWindow
+	}
+	if earned < floor {
+		earned = floor
 	}
 	if earned >= p.maxReadahead {
 		return p.maxReadahead
