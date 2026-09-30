@@ -34,6 +34,14 @@ Also fixed: five earlier releases published with an **empty** body, and the
 `lith-pfreplay` diagnostic (not a shipped binary) gained the offline replay,
 shared-cache, key-level, granularity and eviction passes the investigation ran on.
 
+**One caveat shipped knowingly.** `--readahead-evidence-ratio` is experimental and
+off by default, and it should stay off for **high-latency or non-AWS endpoints**:
+measured cross-region it leaves bytes and request counts identical but makes wall
+clock bimodal, with `wall > 9 s` in 0 of 16 unclamped cells against 8 of 16 when
+enabled. In-region it costs a fixed ~+0.35 s and no stall appears. The corollary is
+the transferable part — a bytes-and-requests regression check is **not** sufficient
+for this flag, because those are identical on both sides of the stall.
+
 ### Added
 
 - **`lith-pfreplay -mem-cache`: drive the real memory tier, instead of assuming no
