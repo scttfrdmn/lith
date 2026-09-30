@@ -34,11 +34,31 @@ instead of another GET.
 
 | flag | default | why |
 |---|---|---|
-| `--mem-cache` | 25 % of system RAM | The in-memory tier. 25 % leaves room for the app and the page cache; raise it for re-read-heavy work with spare RAM. **Per-daemon:** the default is 25 % of RAM *for each mount*, so several mounts on one host add up — five mounts default to a 125 % cap. If you run more than one mount on a box, set `--mem-cache` explicitly so they sum to a sane fraction ([#242](https://github.com/scttfrdmn/lith/issues/242)). |
+| `--mem-cache` | 25 % of system RAM | The in-memory tier. 25 % leaves room for the app and the page cache; raise it for re-read-heavy work with spare RAM. **Per-daemon:** the default is 25 % of RAM *for each mount*, so several mounts on one host add up — five mounts default to a 125 % cap. If you run more than one mount on a box, set `--mem-cache` explicitly so they sum to a sane fraction ([#242](https://github.com/scttfrdmn/lith/issues/242)). **Size it at ~2.5× your distinct working set, not 1×** — see below. |
 | `--prefetch-budget` | 50 % of `--mem-cache` | Bytes prefetch may hold un-demanded. Bounding it to half the tier stopped concurrent readers thrashing a small cache ([#55](https://github.com/scttfrdmn/lith/issues/55)). |
 | `--disk-cache` | `0` (off) | An on-disk second tier. Worth it only on **fast local NVMe** for working sets larger than RAM that you re-read; never on EBS/EFS/NFS. |
 | `--disk-path` | `$TMPDIR/lith-cache` | Where the disk tier lives. Point it at your instance-store mount or `/dev/shm`. |
 | `--disk-writers` | `4` | Write-behind workers that persist chunks off the read path, so disk writes never stall a reader. |
+
+**Sizing `--mem-cache`: budget ~2.5× your distinct working set, not 1×.** The memory tier is
+**64 independently-evicting shards**, with a chunk assigned by a hash of its key — so capacity
+is divided 64 ways and a shard evicts while its neighbours sit idle. Hash skew means the
+busiest shard holds well above the mean, and a cache that "just fits" by total bytes will
+re-fetch anyway. Measured by replaying a real workload's trace through the production tier
+(3.4 GiB distinct across 204 objects):
+
+| `--mem-cache` | headroom vs working set | re-fetched |
+|---|---|---|
+| 24–32 GB | 6.7× | **nothing** — eviction never fires |
+| 8 GB | 2.2× | 5.0 MiB |
+| 6 GB | 1.7× | 48.9 MiB |
+| 4 GB | 1.1× | **2.2 GiB** |
+| 2 GB | 0.6× | 18.7 GiB — more than double the run's entire S3 traffic |
+
+So the cliff is not at 1.0× but a little above 2×, and it is steep: between 1.7× and 1.1× the
+re-fetch cost rises by 45×. A pooled cache would hold this working set at 1.0×; the ~2.2×
+is what sharding costs. If you are tuning against a bill, measure the distinct bytes your job
+touches and multiply by 2.5.
 
 ## Prefetch depth vs burst credits
 

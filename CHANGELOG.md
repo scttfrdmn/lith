@@ -79,13 +79,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another handle already paid for and cost nothing. The chunk is the right unit 83% of the
   time by hit count and the wrong unit by byte count. So this sweeps the fetch unit
   instead of assuming a binary, charging each `(key, extent)` once mount-wide and counting
-  the bytes no reader ever touches. The answer is a **knee, not a cliff**: half the floor
-  for 1.6× the cold fetches at 512 KiB, 75% for 2.8× at 256 KiB, with the exchange rate
-  collapsing below that — and the well-behaved mount pays 722 extra fetches to save 23
-  MiB, so a global shrink would tax the good reader to pay for the sparse one. **It
-  proposes no default**; it prices the trade, offline, at no cost. Two limitations are
-  explicit: no eviction (inherited, and now the binding limitation on the instrument), and
-  fetches are not GETs, since lith coalesces adjacent fills.
+  the bytes no reader ever touches. The answer is a **knee, not a cliff**, priced in
+  **requests** (one ranged GET per per-chunk fill, not one per extent — the first cut of
+  this sweep conflated the two and overstated the cost 1.72×): half the floor for **1.61×**
+  the cold GETs at 512 KiB, 75% for **2.77×** at 256 KiB, and full byte-exact serving for
+  **5.65×** — measured on the reporting workload's published traces, against a ceiling of
+  one GET per cold read (5.85×), so the ceiling is nearly tight. The exchange rate runs
+  257 → 133 → 63 KiB bought per extra request. The well-behaved mount pays 722 extra
+  requests to save 23 MiB, so a global shrink would tax the good reader to pay for the
+  sparse one. **It proposes no default**; it prices the trade, offline, at no cost.
+
+  The no-eviction caveat this originally carried is now **measured rather than inherited**:
+  at the reporting workload's own 24 GB and 32 GB memory tiers, eviction is **not binding
+  at all** — zero re-fetches, zero unread evictions — so the 83% free-hit rate that is the
+  strongest argument against byte-exact serving stands unchanged for that configuration.
+  It begins to bind at ~8 GB and costs 2.2 GB of re-fetch by 4 GB.
 
 - **`lith-pfreplay -global`: the shared-cache accounting unit**
   ([#256](https://github.com/scttfrdmn/lith/issues/256)), contributed as a patch by
