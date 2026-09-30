@@ -37,7 +37,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64, rtBytes int64) *pfWrapper {
 	pf := prefetch.New(maxReadahead)
 	// A read landing more than one block past the previous is a seek, not
 	// sequential progress, however in-band it looks (#210/M16 1b).
@@ -50,6 +50,12 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapp
 	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
 	// default; ratio <= 0 is a no-op.
 	pf.SetEvidence(evidenceRatio, blockSize)
+	// Floor the evidence cap at one first-byte round trip of reading rather than the
+	// constant 2 blocks (#256). A window under a round trip cannot keep a reader fed,
+	// and cross-region that turned a flat cost into a bimodal 4 s / 20 s race.
+	if rtBytes > 0 && blockSize > 0 {
+		pf.SetEvidenceFloor((rtBytes + blockSize - 1) / blockSize)
+	}
 	return &pfWrapper{pf: pf}
 }
 
