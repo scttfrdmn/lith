@@ -1,0 +1,15 @@
+===== evidence-ratio request-cost gate v2 Wed Sep 30 17:15:43 UTC 2026 =====
+box: 16vcpu aarch64; reps=5 (rep 1 discarded as warm-up)
+RESULT|chr20|nic=50|mra=223|ratio=0|wall_mean=0.44|wall=0.41,0.62,0.35,0.40|req=42|bytes=341680844|issued=326
+RESULT|chr20|nic=50|mra=223|ratio=4|wall_mean=0.37|wall=0.34,0.38,0.34,0.41|req=41|bytes=341680844|issued=326
+RESULT|chr1|nic=50|mra=223|ratio=0|wall_mean=1.20|wall=1.16,1.24,1.27,1.14|req=154|bytes=1217111389|issued=1153
+RESULT|chr1|nic=50|mra=223|ratio=4|wall_mean=1.30|wall=1.22,1.29,1.32,1.39|req=154|bytes=1217111389|issued=1153
+RESULT|chr20|nic=7.5|mra=33|ratio=0|wall_mean=0.35|wall=0.47,0.32,0.30,0.31|req=42|bytes=341680844|issued=326
+RESULT|chr20|nic=7.5|mra=33|ratio=4|wall_mean=0.38|wall=0.33,0.38,0.50,0.31|req=42|bytes=341680844|issued=326
+RESULT|chr1|nic=7.5|mra=33|ratio=0|wall_mean=1.09|wall=1.03,1.23,1.07,1.02|req=154|bytes=1217111389|issued=1153
+RESULT|chr1|nic=7.5|mra=33|ratio=4|wall_mean=1.28|wall=1.30,1.13,1.36,1.34|req=154|bytes=1217111389|issued=1153
+RESULT|chr20|nic=3|mra=13|ratio=0|wall_mean=0.55|wall=0.63,0.54,0.55,0.50|req=42|bytes=341680844|issued=326
+RESULT|chr20|nic=3|mra=13|ratio=4|wall_mean=2.78|wall=0.54,9.32,0.67,0.61|req=42|bytes=341680844|issued=326
+RESULT|chr1|nic=3|mra=13|ratio=0|wall_mean=2.46|wall=2.38,2.23,2.90,2.32|req=154|bytes=1217111389|issued=1153
+RESULT|chr1|nic=3|mra=13|ratio=4|wall_mean=2.37|wall=2.36,2.30,2.53,2.28|req=154|bytes=1217111389|issued=1153
+===== done =====
