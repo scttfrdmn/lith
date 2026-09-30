@@ -144,6 +144,13 @@ func main() {
 	var allKeys []keyScore
 	// The key-level pass reuses the shared-cache accounting wholesale, so asking for one
 	// without the other would silently score objects against a per-handle denominator.
+	// -mem-cache and -keys both say "implies -global" in their help, and the accounting
+	// they extend lives inside the -global branch. Saying so without doing it is the
+	// defect class this tool exists to measure (#264: a flag that reaches nothing), so the
+	// implication is applied here and TestFlagsThatClaimToImplyGlobalDoSo enforces it.
+	if parseBytes(*memCache) > 0 {
+		*global_ = true
+	}
 	if *keys_ {
 		*global_ = true
 	}

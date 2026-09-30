@@ -34,11 +34,31 @@ instead of another GET.
 
 | flag | default | why |
 |---|---|---|
-| `--mem-cache` | 25 % of system RAM | The in-memory tier. 25 % leaves room for the app and the page cache; raise it for re-read-heavy work with spare RAM. **Per-daemon:** the default is 25 % of RAM *for each mount*, so several mounts on one host add up — five mounts default to a 125 % cap. If you run more than one mount on a box, set `--mem-cache` explicitly so they sum to a sane fraction ([#242](https://github.com/scttfrdmn/lith/issues/242)). |
+| `--mem-cache` | 25 % of system RAM | The in-memory tier. 25 % leaves room for the app and the page cache; raise it for re-read-heavy work with spare RAM. **Per-daemon:** the default is 25 % of RAM *for each mount*, so several mounts on one host add up — five mounts default to a 125 % cap. If you run more than one mount on a box, set `--mem-cache` explicitly so they sum to a sane fraction ([#242](https://github.com/scttfrdmn/lith/issues/242)). **Size it at ~2.5× your distinct working set, not 1×** — see below. |
 | `--prefetch-budget` | 50 % of `--mem-cache` | Bytes prefetch may hold un-demanded. Bounding it to half the tier stopped concurrent readers thrashing a small cache ([#55](https://github.com/scttfrdmn/lith/issues/55)). |
 | `--disk-cache` | `0` (off) | An on-disk second tier. Worth it only on **fast local NVMe** for working sets larger than RAM that you re-read; never on EBS/EFS/NFS. |
 | `--disk-path` | `$TMPDIR/lith-cache` | Where the disk tier lives. Point it at your instance-store mount or `/dev/shm`. |
 | `--disk-writers` | `4` | Write-behind workers that persist chunks off the read path, so disk writes never stall a reader. |
+
+**Sizing `--mem-cache`: budget ~2.5× your distinct working set, not 1×.** The memory tier is
+**64 independently-evicting shards**, with a chunk assigned by a hash of its key — so capacity
+is divided 64 ways and a shard evicts while its neighbours sit idle. Hash skew means the
+busiest shard holds well above the mean, and a cache that "just fits" by total bytes will
+re-fetch anyway. Measured by replaying a real workload's trace through the production tier
+(3.4 GiB distinct across 204 objects):
+
+| `--mem-cache` | headroom vs working set | re-fetched |
+|---|---|---|
+| 24–32 GB | 6.7× | **nothing** — eviction never fires |
+| 8 GB | 2.2× | 5.0 MiB |
+| 6 GB | 1.7× | 48.9 MiB |
+| 4 GB | 1.1× | **2.2 GiB** |
+| 2 GB | 0.6× | 18.7 GiB — more than double the run's entire S3 traffic |
+
+So the cliff is not at 1.0× but a little above 2×, and it is steep: between 1.7× and 1.1× the
+re-fetch cost rises by 45×. A pooled cache would hold this working set at 1.0×; the ~2.2×
+is what sharding costs. If you are tuning against a bill, measure the distinct bytes your job
+touches and multiply by 2.5.
 
 ## Prefetch depth vs burst credits
 
@@ -114,7 +134,11 @@ Off by default; enable only if you have measured a win on your own workload.
 | flag | default | why |
 |---|---|---|
 | `--footer-tier2` | `false` | **Experimental, clustered projections only.** Byte-precise projection fetch for footer-family containers (Parquet/ORC/Arrow/zip) — a touched Parquet row group's projected column chunks, or a read zip entry + the next few in directory order ([#108](https://github.com/scttfrdmn/lith/issues/108)). Measured (sessions 29–43): it **wins on bytes for a *clustered* projection** (adjacent columns — ~10× fewer bytes than whole-file streaming) but **loses on wall-clock for a *spread* projection**, where the achievable floor is the reader's own footprint (pyarrow fetches ~the same bytes) and a whole-file stream is faster on a fat pipe (a handful of GETs at line rate vs a round-trip per column region). So it is off by default and stays experimental. Leave off unless you have a clustered projection where bytes-saved is the goal. Tier 1 (footer + head prefetch on open) always runs regardless. |
-| `--readahead-evidence-ratio` | `0` (off) | **Experimental ([#256](https://github.com/scttfrdmn/lith/issues/256)).** Bound a committed readahead window to this multiple of the bytes the handle has actually read. A handle establishes at its first **block crossing** — one block (8 MiB) of contiguous evidence — and that buys the *full* NIC-derived window, ~223 blocks (~1.8 GB) on a 50 Gbps node. With ratio `k` a handle prefetches ~`k`x what it has read, so a **sequential copy still earns the full window** (after consuming `max-readahead x block-size / k`) while a reader that tiles a slab and jumps does not. **Measured on a 48-rank GCHP fullchem run:** amplification 2.425x -> **1.956x** at `k=8`, within 1.5% of what pinning `--max-readahead 1` gives (1.925x) but without pinning a global window. It does **not** improve prefetch precision — the hit rate fell 16.7% -> 14.3%, because accrued evidence is uncorrelated with whether a prefetch is used. Use it where over-fetch costs money (cross-region, requester-pays) and you do not want to cap readahead for every reader; it is not a fix for prefetch accuracy. |
+| `--readahead-evidence-ratio` | `0` (off) | **Experimental ([#256](https://github.com/scttfrdmn/lith/issues/256)).** Bound a committed readahead window to this multiple of the bytes the handle has actually read. A handle establishes at its first **block crossing** — one block (8 MiB) of contiguous evidence — and that buys the *full* NIC-derived window, ~223 blocks (~1.8 GB) on a 50 Gbps node. With ratio `k` a handle prefetches ~`k`x what it has read, so a **sequential copy still earns the full window** (after consuming `max-readahead x block-size / k`) while a reader that tiles a slab and jumps does not. **Measured on a 48-rank GCHP fullchem run:** amplification 2.425x -> **1.956x** at `k=8`, within 1.5% of what pinning `--max-readahead 1` gives (1.925x) but without pinning a global window. **How much it helps depends entirely on how many handles are open, and the 48-rank figure above is the mild case.** The window is `clamp(prefetch-budget / open-handles, 2, --max-readahead)`, so 48 ranks with ~600 open handles sat on the **floor of 2** and had almost nothing to give back. A **single** reader gets the full ~223-block window, which on a 50 Gbps node is ~1.8 GB — larger than most single objects, so an established sequential reader prefetches the *whole file* regardless of how little of it it wants. Measured on one process reading one variable out of a 1.22 GB NetCDF-4 file: over-fetch **54x**, and the over-fetch equals **1/coverage** to within 2% across a 54x range of coverage. At `k=4` that becomes 1217.8 -> **59.8 MB (-95.1%)** with byte follow-through *rising* 0.005 -> 0.135.
+
+So the earlier claim that it "does not improve prefetch precision" was measured at 48 ranks on the chunk-touch ratio (16.7% -> 14.3%) and **does not generalise**: in the single-handle regime byte follow-through improves by 27x. The single-handle case — `python`, `xarray`, `ncks`, `h5py`, one process against a bucket — is both the worse case and the more common one.
+
+**What it does not touch:** the cold-start granularity tax (the ~1.23 GB floor of [#256](https://github.com/scttfrdmn/lith/issues/256)) is **bit-identical** with the flag on, because the whole-chunk commitment is taken before any window decision exists. There are two distinct waste channels and this flag addresses exactly one. The price on the other side is **requests, not bytes**: a whole-file read pays up to **+22% GETs for +0.07% bytes** while the window ramps. Use it where over-fetch costs money (cross-region, requester-pays) or where a single process reads slices of large objects; it is not a fix for the granularity floor. |
 | `--coalesce-gap` | `0` (derived) | Largest gap between two projection/demand fill ranges still merged into one range GET (the byte-precise fill path; only active with `--footer-tier2`). `0` derives it from the device: **NIC baseline × measured first-byte latency ÷ usable concurrency**, clamped to `[256 KiB, 64 MiB]` — a round-trip's worth of bytes amortized across the concurrent requests in flight ([#124](https://github.com/scttfrdmn/lith/issues/124)/[#31](https://github.com/scttfrdmn/lith/issues/31)). Set a fixed size to override the derivation. |
 
 ## Archives and published datasets
