@@ -602,7 +602,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.store.RoundTripBytes()),
+		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio),
 	}
 	f.mu.Lock()
 	fh := f.nextFh

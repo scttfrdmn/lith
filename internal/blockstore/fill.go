@@ -53,27 +53,6 @@ func (bs *BlockStore) gapForC(c int) int64 {
 	return deriveCoalesceGap(bs.nicBPS, bs.currentTTFB(), c)
 }
 
-// RoundTripBytes is how many bytes the link carries in one first-byte round trip:
-// the NIC baseline times the rolling TTFB median. It is the natural floor for any
-// readahead window, because a window smaller than this cannot keep a reader fed --
-// the reader drains it before a refill can land, and then blocks on demand for a
-// whole round trip.
-//
-// Exposed for #256: the evidence gate's floor was the constant initialWindow (2
-// blocks), which is 38 round trips of reading in-region and 1.4 cross-region. That
-// difference is why the gate costs a flat ~0.35 s at 2.2 ms RTT and produces a
-// bimodal 4 s / 20 s split at 58.6 ms -- below ~1 round trip of margin, whether the
-// reader catches the prefetch frontier is a race.
-//
-// Zero when the NIC or TTFB is unknown, so callers keep their own default.
-func (bs *BlockStore) RoundTripBytes() int64 {
-	ttfb := bs.currentTTFB()
-	if bs.nicBPS <= 0 || ttfb <= 0 {
-		return 0
-	}
-	return int64(float64(bs.nicBPS) * ttfb.Seconds())
-}
-
 // CoalesceGap is the representative gap for the FUSE regime switch: the most
 // byte-precise gap the device would use, i.e. at full prefetch concurrency. If
 // even that is ≥ a fill block, a projection cannot be kept precise and the handle

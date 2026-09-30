@@ -25,7 +25,7 @@ func TestByteGapIsConsistentWithSomeSerialization(t *testing.T) {
 		perRead = int64(128 << 10)
 		blockSz = int64(8 << 20)
 	)
-	w := newPFWrapper(223, blockSz, 0, 0)
+	w := newPFWrapper(223, blockSz, 0)
 	var seq atomic.Int64
 	span := int64(readers) * perRead
 
@@ -68,7 +68,7 @@ func TestByteGapIsConsistentWithSomeSerialization(t *testing.T) {
 // that checkable exactly.
 func TestObservedGapIsTheValueTheDetectorSaw(t *testing.T) {
 	const blockSz = int64(8 << 20)
-	w := newPFWrapper(223, blockSz, 0, 0)
+	w := newPFWrapper(223, blockSz, 0)
 	var seq atomic.Int64
 	// First read starts at 0: gap 0 against a fresh endpoint.
 	if obs := w.observe(0, 0, 1<<20, 223, &seq); obs.gap != 0 {
