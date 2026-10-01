@@ -53,3 +53,31 @@ func effectiveReadahead(userBlocks, inflightBytes, blockSize int64) int64 {
 	}
 	return n
 }
+
+// effectiveWindow reports the readahead depth a SINGLE handle will actually be given,
+// and which bound produced it (#297).
+//
+// Two bounds apply and the smaller wins: the configured-or-derived --max-readahead, and
+// the prefetch budget in blocks (internal/fuse perHandleWindow divides that by the live
+// handle count, so one handle gets all of it). The budget is BYTE-denominated, so which
+// bound binds changes with --block-size: on a 33 GB box the budget is ~4.13 GB, which is
+// 492 blocks at 8 MiB and 3936 at 1 MiB. The budget-in-blocks figure comes from
+// BlockStore.PrefetchBudgetBlocks rather than being re-divided here, so the two cannot
+// drift.
+//
+// This exists because the mount used to log the CONFIGURED depth at a point where the
+// effective depth was already different: --block-size 8MiB --max-readahead 1024 logged
+// 1024 and delivered 492, silently, so a readahead measurement at a non-default block
+// size was not the experiment it was configured to be. See #298 for the broader problem
+// that the three bounds disagree by 1.5x in the shipping default.
+func effectiveWindow(maxReadahead, budgetBlocks int64) (int64, string) {
+	eff, bound := maxReadahead, "--max-readahead"
+	if budgetBlocks > 0 && budgetBlocks < eff {
+		eff, bound = budgetBlocks, "--prefetch-budget"
+	}
+	// internal/fuse clamps a handle's share up to 2 blocks however tight the budget.
+	if eff < 2 {
+		eff, bound = 2, "floor"
+	}
+	return eff, bound
+}
