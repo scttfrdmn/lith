@@ -61,3 +61,40 @@ func TestEffectiveWindowBudgetBoundScalesWithBlockSize(t *testing.T) {
 		prev = got
 	}
 }
+
+// #298: three bounds on outstanding prefetch, derived from unrelated quantities, disagreeing
+// by 1.5x in the shipping default with the smallest winning silently. The mount now names the
+// binding one, because a tuner raising --max-readahead from 223 to 492 once measured +3% —
+// both configurations were already against a ceiling neither of them set.
+func TestBindingBoundNamesTheSmallest(t *testing.T) {
+	const (
+		mib = int64(1) << 20
+		// The shipping default on a 50 Gbps, 33 GB box, which is where the three were
+		// measured disagreeing: window 223 x 8 MiB, budget 12.5% of RAM, NIC x 100 ms x 2.
+		window   = 223 * 8 * mib // 1.87 GB
+		budget   = 4_127_195_136 // 4.13 GB
+		inflight = 1_250_000_000 // 1.25 GB
+	)
+	cases := []struct {
+		name                     string
+		window, budget, inflight int64
+		want                     string
+	}{
+		// The shipping default: in-flight is smallest, which is not the knob anyone turns.
+		{"shipping default", window, budget, inflight, "--inflight-bytes"},
+		// A generous in-flight cap hands it to the window.
+		{"window binds", window, budget, 8 * budget, "--max-readahead x --block-size"},
+		// A tight budget binds even against a modest window.
+		{"budget binds", window, 256 * mib, 8 * budget, "--prefetch-budget"},
+		// Unknown bounds must not be reported as binding at zero.
+		{"no budget or inflight", window, 0, 0, "--max-readahead x --block-size"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := bindingBound(c.window, c.budget, c.inflight); got != c.want {
+				t.Errorf("bindingBound(%d, %d, %d) = %q, want %q",
+					c.window, c.budget, c.inflight, got, c.want)
+			}
+		})
+	}
+}

@@ -98,7 +98,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
-	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge)")
+	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge). An UPPER BOUND, not the window: --prefetch-budget/--block-size caps it too, and the mount warns at startup when it does (#297). Aggregate prefetch is bounded separately by admission against --prefetch-budget, so this no longer shrinks when other files are open (#301)")
 	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "EXPERIMENTAL (#256): bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (~223 blocks at 50 Gbps). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that tiles a slab and jumps never earns it. 0 disables (default)")
 	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex. Measured cost at 48 MPI ranks over ~60k traced reads: +0.5-1.6% wall, so the lock is negligible below ~10^5 reads/run; size the trace file for one row per read")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
@@ -389,12 +389,24 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// configured one: the prefetch budget is a byte budget divided by the block size, so
 	// it can bind first and used to do so silently (#297). Logged from the store's own
 	// budget rather than a second derivation of it.
-	if effW, bound := effectiveWindow(f.maxReadahead, bs.PrefetchBudgetBlocks()); effW != f.maxReadahead {
+	// All three bounds on outstanding prefetch, with the binding one named (#298). They are
+	// derived from three different quantities -- an empirical multiple of the
+	// bandwidth-delay product, a fraction of RAM, and NIC x latency -- and in the shipping
+	// default they disagree by 1.5x, with the smallest winning. Logging them separately (as
+	// this did) left a tuner turning a knob that was not in play; raising --max-readahead
+	// from 223 to 492 once measured +3% for exactly that reason.
+	effW, bound := effectiveWindow(f.maxReadahead, bs.PrefetchBudgetBlocks())
+	log.Info("prefetch bounds",
+		"window_blocks", effW,
+		"window_bound", bound,
+		"window_commit_bytes", effW*blockSize,
+		"prefetch_budget_bytes", bs.PrefetchBudgetBytes(),
+		"inflight_bytes", inflight,
+		"binding", bindingBound(effW*blockSize, bs.PrefetchBudgetBytes(), inflight))
+	if effW != f.maxReadahead {
 		log.Warn("readahead window reduced by a tighter bound",
 			"configured_blocks", f.maxReadahead, "effective_blocks", effW, "bound", bound,
 			"prefetch_budget_bytes", bs.PrefetchBudgetBytes(), "block_size", blockSize)
-	} else {
-		log.Info("readahead window", "blocks", f.maxReadahead, "bound", bound)
 	}
 	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 
