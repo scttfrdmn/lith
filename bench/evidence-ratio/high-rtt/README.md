@@ -98,9 +98,51 @@ bench/evidence-ratio/high-rtt/analyse.sh t
 are the raw gate output. The ladder's predictions were pre-registered in the reporting
 workload's repo before it ran.
 
-## What is not settled
+## A cumulative byte budget cannot fix it — scored, not argued
 
-Whether a **cumulative** byte budget — one that permits the establishment burst while still
-capping total over-fetch across the run — keeps the byte saving. The burst is 1.78 GB and the
-low-coverage arm's entire distinct read was 22.5 MB, so it may not. That is a design question
-to score offline against the banked traces before it is worth anyone's endpoint.
+The obvious escape is to bound **cumulative** prefetched bytes over the run rather than the
+instantaneous window, permitting the establishment burst (concurrency) while still capping total
+over-fetch (the byte saving). Scored against the banked second-workload traces, it is
+irreconcilable:
+
+| arm | object | distinct read | coverage | full burst, EOF-clamped |
+|---|---|---|---|---|
+| met/var1 | 1217.8 MB | 24.1 | 0.020 | **1217.8** |
+| met/sub | 1217.8 | 27.3 | 0.022 | **1217.8** |
+| hco/var1 | 851.4 | 87.0 | 0.102 | **851.4** |
+| hco/sub | 851.4 | 29.4 | 0.034 | **851.4** |
+
+223 blocks is 1.78 GB, larger than every object in the set, so the burst clamps to the whole
+object. **Any policy that permits a full establishment burst fetches the entire object**, and
+the saving on every low-coverage arm is exactly **zero** — met/var1's 95.1% becomes 0%.
+
+Making the budget cumulative does not help, because of ordering: at establishment `consumed` is
+one block crossing (~8 MiB), so a `k × consumed` budget at k=4 is 32 MiB and refuses the burst
+exactly as the instantaneous bound does. Permitting it on credit against future consumption
+fetches everything *before* the evidence that would have denied it exists. The burst completes
+first either way.
+
+## The remaining candidate, and the half that is not offline-answerable
+
+The burst's **value** is request count in flight; its **cost** is count × unit. lith's prefetch
+unit is a block (8 MiB), so the same 223 requests at *chunk* granularity (1 MiB) would commit
+223 MB rather than 1.78 GB — same concurrency, one-eighth the bytes:
+
+| arm | gate off | gate k=4 | chunk-granular burst |
+|---|---|---|---|
+| met/var1 | 1217.8 MB | 59.8 | **233.8** (−80.8% vs off, +291% vs k=4) |
+| hco/var1 | 851.4 | 371.8 | **233.8** (−72.5% vs off, **−37% vs k=4**) |
+| met/whole | 1217.8 | 1217.8 | 1218.4 (unchanged) |
+
+A different point on the frontier rather than a free lunch — it gives back most of the win on
+one arm while beating the gate on the other.
+
+**The throughput half cannot be answered offline, and the arithmetic that would do it has already
+failed once.** 443.8 MB/s at 58.6 ms needs only 26 MB in flight, so 223 MB looks ample — but the
+`k=4` arm had 5-block batches (42 MB, implying 717 MB/s by the same reasoning) and measured
+**173 MB/s**. In-flight bytes are not the limiter; request count and scheduling are. Settling it
+needs one measured arm: cross-region on the 3.78 GB object with `--block-size 1MiB` and the gate
+**off**, which isolates request-size from everything else and requires no new code. If
+throughput holds near 443.8 MB/s, unit-shrinking is a real design; if it collapses toward 173,
+concurrency needs depth as well as count, the frontier has no better point, and the flag is
+in-region-only permanently.
