@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The mount now reports the readahead window a handle will actually get**
+  ([#297](https://github.com/scttfrdmn/lith/issues/297)). It logged the *configured* depth
+  at a point where the effective depth was already different: `--block-size 8MiB
+  --max-readahead 1024` printed `blocks=1024` and delivered **492**, with no warning. A
+  readahead measurement at a non-default block size was therefore not the experiment it was
+  configured to be, which is how it was found — the reporting workload only noticed because
+  `--pf-trace` records `peak_window`.
+
+  The cause is that `--prefetch-budget` is a **byte** budget and the window is counted in
+  **blocks**, so `perHandleWindow()` divides one by the block size and the result can bind
+  first. On a 33 GB box the budget is ~4.13 GB: **492 blocks at 8 MiB, 3936 at 1 MiB.** Which
+  bound wins therefore changes with `--block-size`, which is a large behavioural difference
+  arising from a unit conversion rather than a policy. The mount now warns with the
+  configured depth, the effective depth and **which bound produced it**, taking the
+  budget-in-blocks figure from `BlockStore.PrefetchBudgetBlocks` rather than re-deriving it.
+
+  It also explains a null result that was otherwise puzzling: raising `--max-readahead` from
+  223 to 492 at 8 MiB measured **+3%**, within noise, because both configurations were
+  already against a ceiling neither of them set. The broader problem — three bounds on
+  outstanding readahead, derived from three different quantities, disagreeing by 1.5× in the
+  shipping default — is [#298](https://github.com/scttfrdmn/lith/issues/298).
+
 ### Changed
 
 - **`--readahead-evidence-ratio` is documented as in-region-only, with the mechanism**

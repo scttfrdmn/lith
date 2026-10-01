@@ -351,7 +351,6 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// Default the readahead window to the bandwidth-delay product so a single
 	// reader can fill the NIC on a cold read (#56).
 	f.maxReadahead = effectiveReadahead(f.maxReadahead, inflight, blockSize)
-	log.Info("readahead window", "blocks", f.maxReadahead)
 	bs, err := blockstore.New(client, blockstore.Config{
 		Bucket:              bucket,
 		BlockSize:           blockSize,
@@ -385,6 +384,17 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		// count). If it is ≥ a fill block, footer projections stream instead.
 		log.Info("coalesce gap", "bytes", bs.CoalesceGap(), "source", "device-derived",
 			"nic_bytes_per_s", nicBytesPerSec, "ttfb_seed", ttfbSeed, "concurrency", effConc)
+	}
+	// The readahead window a single handle will ACTUALLY get, which is not always the
+	// configured one: the prefetch budget is a byte budget divided by the block size, so
+	// it can bind first and used to do so silently (#297). Logged from the store's own
+	// budget rather than a second derivation of it.
+	if effW, bound := effectiveWindow(f.maxReadahead, bs.PrefetchBudgetBlocks()); effW != f.maxReadahead {
+		log.Warn("readahead window reduced by a tighter bound",
+			"configured_blocks", f.maxReadahead, "effective_blocks", effW, "bound", bound,
+			"prefetch_budget_bytes", bs.PrefetchBudgetBytes(), "block_size", blockSize)
+	} else {
+		log.Info("readahead window", "blocks", f.maxReadahead, "bound", bound)
 	}
 	met.RegisterQueueDepth(func() float64 { return float64(bs.QueueDepth()) })
 
