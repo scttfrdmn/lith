@@ -1,0 +1,8 @@
+===== #301 phase 1b Thu Oct  1 18:31:48 UTC 2026 : tier=512MiB rationed=256MiB unrationed=8GiB =====
+RESULT|rationed|readers=4|wall=9.92|peakCommit=293601280|budget=268435456|win=32|handles=4|evicted=7|issued=4502|s3=4769095221|ws=4752453145
+RESULT|unrationed|readers=4|wall=136.61|peakCommit=1109393408|budget=8589934592|win=33|handles=4|evicted=3656|issued=4502|s3=19978821173|ws=4752453145
+RESULT|rationed|readers=8|wall=9.19|peakCommit=310378496|budget=268435456|win=32|handles=8|evicted=2|issued=8056|s3=8519256391|ws=8510417865
+RESULT|unrationed|readers=8|wall=205.56|peakCommit=2207252480|budget=8589934592|win=33|handles=8|evicted=7417|issued=8056|s3=41569357323|ws=8510417865
+RESULT|rationed|readers=16|wall=13.08|peakCommit=341835776|budget=268435456|win=32|handles=16|evicted=1|issued=12713|s3=13519184827|ws=13481417427
+RESULT|unrationed|readers=16|wall=265.11|peakCommit=3537895424|budget=8589934592|win=33|handles=16|evicted=12702|issued=13918|s3=69750847031|ws=13481417427
+===== done =====
