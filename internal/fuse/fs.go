@@ -1258,15 +1258,21 @@ func (f *rawFS) byteExactThreshold() int64 {
 	return rt
 }
 
-// perHandleWindow is the readahead window (blocks) each open handle may use so
-// their windows share the prefetch budget: budgetBlocks / openHandles, floored
-// at 2 and capped by the configured --max-readahead. With one handle it returns
-// the full configured window; with many, a fair share that keeps aggregate
-// readahead within the memory tier (#55).
-// OpenHandles is the divisor perHandleWindow uses: open file descriptors on this mount,
-// counted per descriptor across every process. Exported for the gauge in #298, because
-// nothing at runtime showed it and a reader holding 256 files open silently reads at the
-// window floor.
+// perHandleWindow is the readahead window, in blocks, a handle may use. It is the
+// configured --max-readahead, capped by what the whole prefetch budget could hold and
+// floored at 2.
+//
+// It no longer divides by the open-handle count (#301). Aggregate readahead is kept inside
+// the memory tier by BlockStore.admitCommitted, which refuses a prefetch whose bytes would
+// not fit the budget -- byte-exact, where the quantity is measured. Rationing is still
+// essential (bench/prefetch-divisor: removing it costs 13.8-22.4x wall and 4.2-5.2x the
+// bytes) but it no longer needs a per-handle proxy, and the proxy was wrong by exactly the
+// descriptor count.
+// OpenHandles is the count of open file descriptors on this mount, per descriptor across
+// every process. It USED to be perHandleWindow's divisor, which is why it is exported: the
+// gauge in #298 exists because nothing at runtime showed that a reader holding 256 files
+// open was silently reading at the window floor. It no longer sizes anything (#301); it is
+// kept as an observable because operators still need to see descriptor pressure.
 func (f *rawFS) OpenHandles() int64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -1283,20 +1289,33 @@ func (f *rawFS) perHandleWindow() int64 {
 	if budgetBlocks <= 0 {
 		return maxW
 	}
-	f.mu.RLock()
-	n := int64(len(f.handles))
-	f.mu.RUnlock()
-	if n < 1 {
-		n = 1
+	// #301: no longer divided by the open-handle count. The budget is now enforced
+	// byte-exactly where it is measured -- BlockStore.admitCommitted refuses a prefetch
+	// whose bytes would not fit -- so rationing no longer needs a per-handle proxy.
+	//
+	// The divisor was load-bearing and this does not remove its protection: removing the
+	// rationing outright costs 13.8-22.4x wall and 4.2-5.2x the bytes with 81-92% of
+	// prefetch evicted unread (bench/prefetch-divisor). What it removes is the proxy's
+	// error, which was linear in the OPEN DESCRIPTOR COUNT -- committed bytes track one
+	// window however many handles are charged, so a mount at 256 descriptors was charged
+	// 4295 MB while holding 17.8 MB and throttled 6-10x for it.
+	//
+	return windowForBudget(maxW, budgetBlocks)
+}
+
+// windowForBudget clamps a configured readahead window to what the prefetch budget could
+// hold, floored at the 2-block minimum a handle always gets. Pure, so the clamp is testable
+// without constructing a store; the budget is consulted as a CEILING only -- a handle should
+// not be handed a window larger than the whole budget could ever hold, even while the budget
+// is momentarily empty.
+func windowForBudget(maxReadahead, budgetBlocks int64) int64 {
+	if budgetBlocks > 0 && budgetBlocks < maxReadahead {
+		maxReadahead = budgetBlocks
 	}
-	share := budgetBlocks / n
-	if share < 2 {
-		share = 2
+	if maxReadahead < 2 {
+		return 2
 	}
-	if share > maxW {
-		share = maxW
-	}
-	return share
+	return maxReadahead
 }
 
 // budgetBlocks is the mount-wide prefetch budget expressed in readahead blocks.

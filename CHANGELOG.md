@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Prefetch is admitted against measured bytes, not the open-descriptor count**
+  ([#301](https://github.com/scttfrdmn/lith/issues/301)). `perHandleWindow()` rationed every
+  handle's readahead as `prefetchBudget/blockSize / openHandles`, and `openHandles` counted
+  every open file **descriptor** on the mount — across processes, per descriptor rather than
+  per object, **including descriptors never read**. A job holding files open drove its own and
+  every other reader's readahead to the floor of 2 blocks whatever the flag said.
+
+  The budget is now enforced where it is measured: `BlockStore.admitCommitted` reserves a
+  chunk's bytes with a CAS before marking it prefetched and refuses what will not fit, and the
+  window is no longer divided. Measured on a reader over a working set that fits, with
+  descriptors held open by a separate process and never read:
+
+  | descriptors | window before → after | wall before → after | bytes | GETs |
+  |---|---|---|---|---|
+  | 64 | 8 → **33** | 3.08 s → **1.09 s** (2.8×) | identical | identical |
+  | 256 | 2 → **33** | 5.89 s → **1.32 s** (4.5×) | identical | identical |
+
+  Complete separation at both, and **identical bytes and GET counts in all 12 cells** — the
+  reason no byte or request counter could ever have caught this. The reporting workload
+  measured 6–10× on a box with a 111× window ratio against this one's 16.5×.
+
+  **The rationing is kept, and that was measured first.** Removing it outright costs
+  13.8–22.4× wall and 4.2–5.2× the bytes with 81–92% of prefetch evicted unread
+  (`bench/prefetch-divisor/`), so "delete the divisor" was ruled out before anything was
+  built. Admitting on the measured total is a strict generalization: on 16 concurrent readers
+  over a tier 7.3× oversubscribed the cap is 4.128 GB against the divisor's realized 4.027 GB
+  — within 2.4% — and it does not fire at all where the divisor was wrong, because idle
+  descriptors commit nothing.
+
+  New counter `lith_prefetch_refused_total`, deliberately distinct from
+  `lith_prefetch_evicted_unread_total`: a refusal is the budget working and costs nothing, an
+  unread eviction is the budget having failed and costs a GET and the bytes.
+
 ### Added
 
 - **`lith_prefetch_committed_bytes` and `lith_prefetch_budget_bytes`: what the prefetch
