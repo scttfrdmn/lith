@@ -320,6 +320,32 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles func() float64) {
 	}, openHandles))
 }
 
+// RegisterPrefetchBudget registers gauges for what --prefetch-budget actually bounds:
+// bytes prefetched and still resident unread, against the budget's own limit (#301).
+//
+// Until these existed the budget was enforced only by a PROXY -- the per-handle window
+// times the open-handle count -- and the proxy was the only observable. That matters
+// because the proxy is what makes the divisor charge for idle file descriptors, at a
+// measured 6.38x wall-clock cost, and nobody could see whether the real quantity was
+// anywhere near its limit.
+//
+// Do not check these against the proxy. An estimator built from dispatch counts returns
+// the standing window by construction, so "resident ~= window x handles" is an identity
+// that will pass whether or not either number is right.
+func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
+	if m == nil {
+		return
+	}
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_prefetch_resident_bytes",
+		Help: "Bytes prefetched and still resident unread: the quantity --prefetch-budget bounds. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for this (#301).",
+	}, resident))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_prefetch_budget_bytes",
+		Help: "The --prefetch-budget limit in bytes (default 50%% of --mem-cache). lith_prefetch_resident_bytes is what is actually held against it.",
+	}, limit))
+}
+
 // Handler returns the Prometheus HTTP handler for this registry.
 func (m *Metrics) Handler() http.Handler {
 	if m == nil {

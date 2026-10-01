@@ -183,10 +183,25 @@ type BlockStore struct {
 	mu       sync.Mutex
 	inflight map[string]*chunkState
 	stale    map[string]struct{}
-	// prefetched holds chunk keys fetched by prefetch and not yet demanded; a
-	// sync.Map so the mem-tier eviction callback can release the budget without
-	// taking bs.mu under the shard lock (avoids a lock-order inversion).
+	// prefetched maps a chunk key fetched by prefetch and not yet demanded to its
+	// BYTE length; a sync.Map so the mem-tier eviction callback can release the budget
+	// without taking bs.mu under the shard lock (avoids a lock-order inversion).
+	//
+	// The value used to be struct{}{}. It carries the length so pfResidentBytes can be
+	// maintained exactly at the three removal sites, which see only the key (#301).
 	prefetched sync.Map
+	// pfResidentBytes is the live sum of those lengths: bytes prefetched and still
+	// resident unread. This is the quantity --prefetch-budget is ABOUT, and until now it
+	// was nowhere -- the budget was enforced by a proxy (per-handle window x open
+	// handles) and the proxy was all anyone could observe.
+	//
+	// It must not be validated against that proxy. An offline estimator built from
+	// dispatch counts returns the standing window by construction (one establishment
+	// burst of exactly the window, then +1 per block boundary including boundaries past
+	// EOF), so "resident ~= window x handles" is an identity, not a check. Verified on
+	// 50/50 cells by the reporting workload, who nearly published the wrong conclusion
+	// from it. Test this against constructed state instead.
+	pfResidentBytes atomic.Int64
 
 	// Write-behind disk tier: prefetch fills apply backpressure on this queue
 	// (bounded), demand fills never block; shutdown drains via stop.
@@ -467,7 +482,7 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, fil
 		}
 	} else if blocking {
 		// Prefetch fill failed: drop its prefetched marker.
-		bs.prefetched.LoadAndDelete(ck)
+		bs.dropPrefetched(ck)
 	}
 	cs.data, cs.filled, cs.err = data, filled, err
 	close(cs.done)
@@ -789,7 +804,9 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 			continue
 		}
 		ck := bs.cacheKey(k, ci)
-		if _, dup := bs.prefetched.LoadOrStore(ck, struct{}{}); !dup {
+		n := chunkLenOf(ci, objSize)
+		if _, dup := bs.prefetched.LoadOrStore(ck, n); !dup {
+			bs.pfResidentBytes.Add(n)
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
 			if bs.timeline != nil {
 				bs.timeline.PrefetchDispatch(k.Key, ci, time.Now())
@@ -823,16 +840,37 @@ func (bs *BlockStore) PrefetchBudgetBlocks() int64 {
 // Called under a shard lock, so it must stay lock-free w.r.t. bs.mu (hence the
 // sync.Map).
 func (bs *BlockStore) onEvictUnread(ck string) {
-	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
+	if bs.dropPrefetched(ck) {
 		bs.recordPrefetchEvicted()
 	}
 }
+
+// dropPrefetched removes a chunk from the prefetched-unread set and decrements the
+// resident byte total, returning whether it was there. The three call sites are the
+// three ways a chunk leaves the set: consumed by a demand read, evicted unread, or its
+// fill failed.
+func (bs *BlockStore) dropPrefetched(ck string) bool {
+	v, ok := bs.prefetched.LoadAndDelete(ck)
+	if !ok {
+		return false
+	}
+	if n, isInt := v.(int64); isInt {
+		bs.pfResidentBytes.Add(-n)
+	}
+	return true
+}
+
+// PrefetchResidentBytes is the live total of bytes prefetched and still resident
+// unread -- the quantity --prefetch-budget bounds (#301). Compare it to
+// PrefetchBudgetBytes to see whether the budget is actually near its limit, which the
+// per-handle-window proxy cannot tell you.
+func (bs *BlockStore) PrefetchResidentBytes() int64 { return bs.pfResidentBytes.Load() }
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a
 // chunk that prefetch had fetched, clears its unread flag, and releases its
 // prefetch-budget reservation.
 func (bs *BlockStore) notePrefetchHit(ck string) {
-	if _, ok := bs.prefetched.LoadAndDelete(ck); ok {
+	if bs.dropPrefetched(ck) {
 		bs.mem.ClearUnread(ck)
 		bs.record(func(r Recorder) { r.PrefetchHit() })
 	}
