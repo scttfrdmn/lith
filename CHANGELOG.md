@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The mount reports all three bounds on outstanding prefetch, with the binding one named**
+  ([#298](https://github.com/scttfrdmn/lith/issues/298)). One handle's window commitment
+  (`--max-readahead × --block-size`), the mount-wide `--prefetch-budget`, and
+  `--inflight-bytes` are derived from three unrelated quantities — an empirical multiple of the
+  bandwidth-delay product, a fraction of RAM, and NIC × latency — and in the shipping default
+  they **disagree by 1.5×**, with the smallest winning silently. They were logged separately,
+  which left a tuner turning a knob that was not in play: raising `--max-readahead` from 223 to
+  492 once measured **+3%**, because both configurations were already against a ceiling neither
+  of them set. Not forced into agreement — each is legitimate on its own terms — just named.
+
+- **Two corrections to `prefetch.Limits`' own documentation**
+  ([#301](https://github.com/scttfrdmn/lith/issues/301)). It described the budget as "for
+  prefetch not yet demanded", but its four callers Reserve before a fetch and Release when it
+  *completes*, so `reserved` measures bytes being fetched rather than bytes held unread. And it
+  said per-handle readahead "sizes its window from `Budget()`", which is no longer true — that
+  sizing was the open-descriptor divisor. There are now two disciplines on purpose:
+  fetch-scoped reservations for the bounded up-front fetches, and consumption-scoped admission
+  for the unbounded windowed path.
+
 - **Prefetch is admitted against measured bytes, not the open-descriptor count**
   ([#301](https://github.com/scttfrdmn/lith/issues/301)). `perHandleWindow()` rationed every
   handle's readahead as `prefetchBudget/blockSize / openHandles`, and `openHandles` counted

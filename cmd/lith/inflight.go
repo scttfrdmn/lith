@@ -81,3 +81,27 @@ func effectiveWindow(maxReadahead, budgetBlocks int64) (int64, string) {
 	}
 	return eff, bound
 }
+
+// bindingBound names which of the three bounds on outstanding prefetch is smallest, and so
+// which one a tuner is actually up against (#298).
+//
+// The three measure different things and are derived from unrelated quantities: one handle's
+// window commitment (--max-readahead x --block-size, an empirical 1.5x multiple of the
+// bandwidth-delay product), the mount-wide prefetch budget (a fraction of RAM, now the hard
+// admission cap), and the in-flight cap (NIC baseline x latency, a blocking semaphore in the
+// blockstore). In the shipping default they disagree by 1.5x and the smallest wins silently,
+// which is why raising --max-readahead from 223 to 492 once measured +3%: both configurations
+// were already against a ceiling neither of them set.
+//
+// Each is legitimate on its own terms -- what the link can hold, what RAM can hold un-demanded,
+// what the NIC wants fed -- so this names the binding one rather than forcing them to agree.
+func bindingBound(windowCommit, prefetchBudget, inflightBytes int64) string {
+	smallest, name := windowCommit, "--max-readahead x --block-size"
+	if prefetchBudget > 0 && prefetchBudget < smallest {
+		smallest, name = prefetchBudget, "--prefetch-budget"
+	}
+	if inflightBytes > 0 && inflightBytes < smallest {
+		name = "--inflight-bytes"
+	}
+	return name
+}

@@ -17,12 +17,28 @@ import (
 //
 // The three concerns:
 //
-//   - Budget/Reserve/Release: a mount-wide byte budget for prefetch not yet
-//     demanded. Per-handle sequential readahead sizes its window from Budget();
-//     sibling readahead (#63) and small-file parallel parts (#69) Reserve
-//     against the same budget so no single mechanism can starve the others.
+//   - Budget/Reserve/Release: a mount-wide byte budget, consulted by the readahead paths
+//     that fetch a bounded amount up front — sibling readahead (#63), small-file parallel
+//     parts (#69), and the bgzf and footer planes — so no single mechanism can starve the
+//     others.
+//
+//     Two corrections to what this used to say, both from #301. It is NOT "a byte budget
+//     for prefetch not yet demanded": these callers Reserve before a fetch and Release
+//     when it COMPLETES (see rawFS.prefetchWhole, "releasing the reservation when they
+//     complete"), so `reserved` measures bytes being fetched, not bytes held unread. And
+//     per-handle sequential readahead no longer "sizes its window from Budget()" — it is
+//     admitted against measured committed bytes in BlockStore.admitCommitted, which is
+//     byte-exact, where sizing from Budget() meant dividing by the open-descriptor count
+//     and over-charging by exactly that count.
+//
+//     So there are two disciplines here deliberately: fetch-scoped reservations for the
+//     bounded up-front fetches, and consumption-scoped admission for the unbounded
+//     windowed path. They bound different things and converging them would need the four
+//     Reserve callers to hold until consumption, which nothing currently needs.
+//
 //   - Neighborhood: the next keys in Index order under a file's directory, so a
 //     directory being walked in key order can be read ahead across siblings.
+//
 //   - Device: the physical limits (NIC bandwidth-delay product, memory-tier
 //     size, disk write rate) the sizing decisions derive from.
 type Limits interface {
