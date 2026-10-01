@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith_readahead_window_blocks` and `lith_open_handles`: the realized readahead depth
+  and its divisor** ([#298](https://github.com/scttfrdmn/lith/issues/298)). The depth a
+  handle actually gets is `clamp(--prefetch-budget / open-handles, 2, --max-readahead)`,
+  and `open-handles` counts every open file **descriptor** on the mount — across processes,
+  per descriptor rather than per object, and **including descriptors that have never been
+  read**. So a job holding 256 files open drives its own and every other reader's readahead
+  to the floor of **2 blocks** whatever the flag says.
+
+  Measured by the reporting workload at **6.38× the wall clock** (186 MB/s where 1293 was
+  available) on bytes and requests that differ by **0.4% and 3%** — the third and largest
+  instance on #256 of "byte-identical is a true and insufficient regression gate", and
+  invisible to every counter lith had. Both of that workload's production mounts were
+  running at the floor, through no flag anyone set, which is also why `--max-readahead`
+  looked inert through a dozen gates: it was never reachable from the workload.
+
+  Both gauges are needed, because a window of 2 could be a tight budget or a crowded mount
+  and only the divisor distinguishes them. The startup warning added in
+  [#297](https://github.com/scttfrdmn/lith/issues/297) cannot cover this case — it is
+  single-handle, and the divisor is dynamic.
+
+  **Reporting only.** Whether the divisor should charge for idle descriptors is a policy
+  question with a much larger blast radius, tracked separately.
+
 ### Fixed
 
 - **The mount now reports the readahead window a handle will actually get**

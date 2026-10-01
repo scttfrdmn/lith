@@ -301,6 +301,14 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			_, _ = fmt.Fprintln(tf, "seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window")
 		}
 	}
+	// The realized readahead depth and the divisor that produces it (#298). Registered
+	// here rather than in cmd/lith because both are properties of this FS, and neither
+	// was observable at runtime: --max-readahead is logged as configured, and a reader
+	// holding 256 descriptors open reads at the window floor of 2 with nothing to show it.
+	f.met.RegisterReadaheadWindow(
+		func() float64 { return float64(f.EffectiveWindow()) },
+		func() float64 { return float64(f.OpenHandles()) },
+	)
 	return f
 }
 
@@ -1249,6 +1257,20 @@ func (f *rawFS) byteExactThreshold() int64 {
 // at 2 and capped by the configured --max-readahead. With one handle it returns
 // the full configured window; with many, a fair share that keeps aggregate
 // readahead within the memory tier (#55).
+// OpenHandles is the divisor perHandleWindow uses: open file descriptors on this mount,
+// counted per descriptor across every process. Exported for the gauge in #298, because
+// nothing at runtime showed it and a reader holding 256 files open silently reads at the
+// window floor.
+func (f *rawFS) OpenHandles() int64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return int64(len(f.handles))
+}
+
+// EffectiveWindow is the readahead depth a handle is currently given, which is NOT
+// --max-readahead whenever the budget or the handle count binds first (#297, #298).
+func (f *rawFS) EffectiveWindow() int64 { return f.perHandleWindow() }
+
 func (f *rawFS) perHandleWindow() int64 {
 	maxW := f.maxReadahead()
 	budgetBlocks := f.budgetBlocks()
