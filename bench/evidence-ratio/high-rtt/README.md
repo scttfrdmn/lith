@@ -137,12 +137,47 @@ unit is a block (8 MiB), so the same 223 requests at *chunk* granularity (1 MiB)
 A different point on the frontier rather than a free lunch — it gives back most of the win on
 one arm while beating the gate on the other.
 
-**The throughput half cannot be answered offline, and the arithmetic that would do it has already
-failed once.** 443.8 MB/s at 58.6 ms needs only 26 MB in flight, so 223 MB looks ample — but the
-`k=4` arm had 5-block batches (42 MB, implying 717 MB/s by the same reasoning) and measured
-**173 MB/s**. In-flight bytes are not the limiter; request count and scheduling are. Settling it
-needs one measured arm: cross-region on the 3.78 GB object with `--block-size 1MiB` and the gate
-**off**, which isolates request-size from everything else and requires no new code. If
-throughput holds near 443.8 MB/s, unit-shrinking is a real design; if it collapses toward 173,
-concurrency needs depth as well as count, the frontier has no better point, and the flag is
-in-region-only permanently.
+**Resolved by intervention, and it kills the unit story.** `--s3-concurrency` is a flag, so the
+suspected fourth ceiling could be perturbed directly rather than fitted. In-region, same object,
+gate off, realized `peak_window` verified at 223 in every A cell and 1024 in every B cell, so
+concurrency does not move the depth ceiling and the only variable is slots:
+
+| `--s3-concurrency` | A = 8MiB/223 | B = 1MiB/1024 | B/A |
+|---|---|---|---|
+| 32 | 1437 MB/s | 922 MB/s | **0.642** — B is 1.56× *slower*, 9/9 separation |
+| 128 | 1377 | **1630** | 1.183 — B faster, 9/9 separation |
+| 512 | 1268 | 1253 | 0.988 — null |
+
+**The sign inverts at 32 slots.** 32 × 1 MiB is 34 MB in flight against 32 × 8 MiB at 268 MB, and
+the big unit wins when slots are scarce. So **the 1 MiB advantage is not a property of the unit —
+it is a property of bytes-per-slot, and in-region it exists only in a band around the shipping
+default of 128.**
+
+A prediction of ours failed in the same run: we expected B/A to keep rising with concurrency,
+since depth 1024 can backlog 512 slots and depth 223 cannot. It does not (0.642 → 1.183 →
+0.988), and 128 → 512 makes *both* configurations slower. 128 is an optimum to sit near, not a
+ceiling to raise.
+
+Neither axis orders the six cells on its own — the fastest (1630 MB/s) is at 134 MB in flight,
+while 268 MB gives 1437 and 537 MB gives 1253. There is an interior optimum in two variables and
+six points cannot locate it; we are not fitting one, for the reason the rest of this file
+documents.
+
+### Consequence: shrinking the default `--block-size` is parked
+
+The 1.58× cross-region result is real and reproduces, but its benefit is **contingent on
+`--s3-concurrency` staying at its default**, and at 32 slots the same change is a **1.56×
+regression**. Lower concurrency is exactly what a small instance, a shared endpoint, or
+politeness to S3 would choose. A default whose benefit depends on another default holding still,
+and which harms anyone who moved it, is not a default change — so this is parked rather than
+pursued, upstream of the coalescing / `--parts-max` / bgzf / footer questions it would also have
+had to answer.
+
+Noted but **not acted on**: at 8 MiB in-region the shipping default is flat-to-declining in
+concurrency (1437 / 1377 / 1268 MB/s, best at the lowest setting tested), which would put
+`--s3-concurrency 128` ~4% behind 32 on this one object. That contradicts
+[#40](https://github.com/scttfrdmn/lith/issues/40), where 128 won a tuning grid across cold
+sequential and stride. One object at n=3 with soft magnitudes does not overturn a grid; it is a
+reason to re-run the grid, not to change the number.
+
+**The original question — whether unit-shrinking is a design worth building — is answered no.**
