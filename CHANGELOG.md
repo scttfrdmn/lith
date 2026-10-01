@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith_prefetch_resident_bytes` and `lith_prefetch_budget_bytes`: what the prefetch
+  budget actually bounds** ([#301](https://github.com/scttfrdmn/lith/issues/301)).
+  `--prefetch-budget` is about bytes prefetched and still resident unread, and that quantity
+  was nowhere observable — the budget was enforced by a **proxy**, the per-handle readahead
+  window times the open-handle count, and the proxy was all anyone could measure. It is also
+  the proxy that charges for idle file descriptors at a measured 6.38× wall-clock cost.
+
+  The `prefetched` set now carries each chunk's byte length so the three removal paths
+  (consumed, evicted unread, failed fill) can maintain an exact running total.
+
+  **Deliberately not validated against the proxy.** The reporting workload tried the
+  offline derivation first and found it circular: an estimator built from dispatch counts
+  returns the standing window by construction — one establishment burst of exactly the
+  window, then +1 per block boundary *including boundaries past EOF* — so
+  `resident ≈ window × handles` held in 50/50 of their cells as an identity. They withdrew
+  a draft conclusion that rested on it. The tests here assert against constructed state
+  instead: 8 chunks prefetched, one consumed, re-prefetch not double-counted, drain to zero,
+  and a short trailing chunk counted at its real length.
+
 - **`lith_readahead_window_blocks` and `lith_open_handles`: the realized readahead depth
   and its divisor** ([#298](https://github.com/scttfrdmn/lith/issues/298)). The depth a
   handle actually gets is `clamp(--prefetch-budget / open-handles, 2, --max-readahead)`,
