@@ -35,6 +35,27 @@ unread evictions**, with **81–92% of all prefetch evicted before anything read
 
 **The divisor is load-bearing. "Delete it" is off the table.**
 
+### The N=8 and N=16 rationed nulls are NIC-suppressed; N=4 carries the finding
+
+A NIC ceiling throttles *dispatch*, which suppresses thrash — so a clean `evicted_unread` can be
+about the network rather than about eviction. Against this box's 7.5 Gbps baseline (938 MB/s):
+
+| arm | N | achieved | % of baseline | |
+|---|---|---|---|---|
+| rationed | 4 | 481 MB/s | **51%** | clear of the ceiling |
+| rationed | 8 | 927 MB/s | 99% | at the ceiling — null suspect |
+| rationed | 16 | 1034 MB/s | 110% | at the ceiling — null suspect |
+| unrationed | 4–16 | 146–263 MB/s | 16–28% | thrash-limited, not bandwidth-limited |
+
+So the rationed arm's near-zero evictions at N=8 and N=16 cannot be distinguished from a
+dispatch rate the NIC was already capping. **The N=4 pair is the interpretable one** — 51% of
+baseline, 7 evictions against 3656, and 1.004× against 4.204× — and it carries the conclusion on
+its own. The unrationed arms sitting at 16–28% of baseline is independent evidence they were
+limited by re-fetch rather than by bandwidth.
+
+Caveat raised by the reporting workload from having hit it in their own arm A, and it is the
+reason to report fetch rate against NIC capacity beside any `evicted_unread` null.
+
 ## What the contrast actually isolates, which is not handle count
 
 The unrationed arm's committed bytes peak at 1.1–3.5 GB — only **13–41% of its 8 GiB budget**,
