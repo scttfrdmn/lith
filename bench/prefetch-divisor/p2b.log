@@ -1,0 +1,14 @@
+===== #301 phase 2b: reach the floor, 256 descriptors on one object Thu Oct  1 21:12:50 UTC 2026 =====
+RESULT|old-divisor|holders=64|openHandles=64|window=8|wall=3.64|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=64|openHandles=64|window=33|wall=1.54|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|old-divisor|holders=64|openHandles=64|window=8|wall=3.08|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=64|openHandles=64|window=33|wall=1.09|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|old-divisor|holders=64|openHandles=64|window=8|wall=2.94|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=64|openHandles=64|window=33|wall=1.04|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|old-divisor|holders=256|openHandles=256|window=2|wall=5.89|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=256|openHandles=256|window=33|wall=1.08|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|old-divisor|holders=256|openHandles=256|window=2|wall=8.53|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=256|openHandles=256|window=33|wall=1.39|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|old-divisor|holders=256|openHandles=256|window=2|wall=5.72|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+RESULT|new-admission|holders=256|openHandles=256|window=33|wall=1.32|bytes=1217111389|gets=154|committed=0|refused=0|evicted=0
+===== done =====

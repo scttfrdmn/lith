@@ -111,3 +111,45 @@ scp p1b.sh <box>: && ./p1b.sh                                            # Phase
 `win=` is a **max** over 100 ms samples, so it catches the transient while only the first
 handle is open (`clamp(32/1, 2, 33) = 32`) rather than the steady-state per-handle window
 (`32/16 = 2` at N=16). The eviction, byte and wall figures are totals and unaffected.
+
+
+## Phase 2: admitting on measured bytes fixes it, byte- and request-neutral
+
+The fix (#301): `BlockStore.admitCommitted` reserves a chunk's bytes against
+`--prefetch-budget` with a CAS before marking it prefetched and refuses what will not fit;
+`perHandleWindow` stops dividing by the descriptor count. A **strict generalization** of the
+divisor — it coincides where the divisor is right and does not fire where the divisor was
+wrong, because idle descriptors commit nothing.
+
+A/B of the same binary pair on one box, one streaming reader over a 1.16 GiB object with an
+8 GiB tier (so the working set **fits** — the no-pressure regime the fake server cannot
+reach), with N descriptors held open on that object by a separate process and never read.
+n=3. **~$0.17**, box terminated and verified.
+
+| descriptors | build | window | wall (median) | bytes | GETs |
+|---|---|---|---|---|---|
+| 64 | old (divisor) | **8** | 3.08 s | 1,217,111,389 | 154 |
+| 64 | new (admission) | **33** | **1.09 s** | 1,217,111,389 | 154 |
+| 256 | old (divisor) | **2** | 5.89 s | 1,217,111,389 | 154 |
+| 256 | new (admission) | **33** | **1.32 s** | 1,217,111,389 | 154 |
+
+**2.8× at 64 descriptors and 4.5× at 256**, with complete separation at both (slowest new cell
+faster than fastest old: 1.54 < 2.94, and 1.39 < 5.72) and **identical bytes and identical GET
+counts in all 12 cells**. `lith_prefetch_refused_total` is 0 throughout — idle descriptors
+commit nothing, so there is nothing for admission to refuse, which is exactly why the old
+divisor's charge was wrong.
+
+The realized windows match the arithmetic exactly: `budgetBlocks` is 512 here
+(4 GiB budget / 8 MiB), so the divisor gives `512/64 = 8` and `512/256 = 2`, and the new
+build gives `max-readahead = 33` in both.
+
+### What this does *not* reproduce
+
+The reporting workload measured 6–10× on a 50 Gbps box where `max-readahead` is 223, so their
+window ratio was 223/2 = 111× against this box's 33/2 = 16.5×. 4.5× here is the same effect at
+a smaller lever, not a weaker version of their result.
+
+An earlier attempt with 22 distinct objects reached only 21 descriptors — `512/21 = 24`, a
+1.4× window reduction — and showed 1.45×. The floor needs 256 descriptors, which is reachable
+on **one** object because the divisor counted per descriptor rather than per object. That
+property, which the reporting workload established, is what made this testable at all.
