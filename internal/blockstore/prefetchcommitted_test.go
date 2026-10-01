@@ -5,6 +5,7 @@ package blockstore
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,4 +139,65 @@ type blockingSource struct {
 func (b *blockingSource) GetRangeReader(ctx context.Context, key string, off, length int64) (io.ReadCloser, string, error) {
 	<-b.release
 	return b.Source.GetRangeReader(ctx, key, off, length)
+}
+
+// #301: admission is atomic with the accounting, which is the property a read-then-decide
+// check would not have. N handles establishing simultaneously must not each read a stale zero
+// and all grant themselves a full window -- that is the over-commitment that thrashes, and
+// the reporting workload measured establishment as a single-shot full-window burst, so
+// simultaneity is the normal case rather than a corner.
+func TestAdmitCommittedIsAtomicUnderConcurrency(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 64)
+	k := keyFor(t, srv, "obj")
+	objSize := int64(64) * mib
+	// A budget of 8 chunks against 64 chunks of demand: most dispatches must be refused.
+	const budget = int64(8) * mib
+	rec := &budgetRec{}
+	bs := newStore(t, srv, Config{
+		BlockSize: 1 << 20, MemCache: 64 * mib, PrefetchBudget: budget, Recorder: rec,
+	})
+
+	var wg sync.WaitGroup
+	for b := int64(0); b < 64; b++ {
+		wg.Add(1)
+		go func(b int64) { defer wg.Done(); bs.Prefetch(context.Background(), k, b, objSize) }(b)
+	}
+	wg.Wait()
+
+	if got := bs.PrefetchCommittedBytes(); got > budget {
+		t.Errorf("committed = %d after 64 concurrent dispatches against a %d budget: admission "+
+			"must be atomic with the accounting, or every dispatch reads a stale zero", got, budget)
+	}
+	if rec.issued.Load() > budget/mib {
+		t.Errorf("issued = %d, more chunks than the budget could hold (%d) — refusals are not "+
+			"being counted as refusals", rec.issued.Load(), budget/mib)
+	}
+}
+
+// A refusal is not a wasted fetch and must not be counted as one. Conflating them would make
+// lith_prefetch_issued_total include prefetches that never happened, breaking the
+// issued-vs-used relation every #256 gate reads off.
+func TestRefusedPrefetchIsNotCountedAsIssued(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 32)
+	k := keyFor(t, srv, "obj")
+	objSize := int64(32) * mib
+	const budget = int64(4) * mib
+	rec := &budgetRec{}
+	bs := newStore(t, srv, Config{
+		BlockSize: 1 << 20, MemCache: 64 * mib, PrefetchBudget: budget, Recorder: rec,
+	})
+	for b := int64(0); b < 32; b++ {
+		bs.Prefetch(context.Background(), k, b, objSize)
+	}
+	issued := rec.issued.Load()
+	if issued == 0 {
+		t.Fatal("nothing issued at all: the fixture is not exercising admission")
+	}
+	if issued > budget/mib {
+		t.Errorf("issued = %d against a budget of %d chunks: a refused prefetch was counted as "+
+			"issued, which inflates lith_prefetch_issued_total with fetches that never happened",
+			issued, budget/mib)
+	}
 }

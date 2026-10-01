@@ -801,26 +801,86 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	if c1 > lastChunk {
 		c1 = lastChunk
 	}
-	// Mark not-yet-cached chunks as prefetched (unread) so a demand read can
-	// credit the hit and eviction can prefer already-read chunks over them. The
-	// aggregate readahead is bounded by the per-handle window the FUSE layer
-	// derives from the prefetch budget and the live handle count (#55), so this
-	// path does not gate.
+	// Mark not-yet-cached chunks as prefetched (unread) so a demand read can credit the
+	// hit and eviction can prefer already-read chunks over them (#55) -- and ADMIT each
+	// against the measured committed total as we go (#301).
+	//
+	// This path used to not gate at all: the comment here said "the aggregate readahead is
+	// bounded by the per-handle window the FUSE layer derives from the prefetch budget and
+	// the live handle count", i.e. the divisor rationed and the store trusted it. The
+	// divisor's rationing is real and necessary -- removing it costs 13.8-22.4x wall and
+	// 4.2-5.2x the bytes, with 81-92% of prefetch evicted unread (bench/prefetch-divisor) --
+	// but it rations by DESCRIPTOR COUNT, which over-charges by exactly that count:
+	// committed tracks one window however many handles are charged, so a mount at 256
+	// descriptors is charged 4295 MB while holding 17.8 MB and is throttled 6-10x for it.
+	//
+	// Admitting on the measured total is a strict generalization. It coincides with the
+	// divisor where the divisor is right -- on 16 concurrent readers over a tier 7.3x
+	// oversubscribed, the cap is 4.128 GB against the divisor's realized 4.027 GB, within
+	// 2.4% -- and it does not fire at all where the divisor is wrong, because idle
+	// descriptors commit nothing.
+	//
+	// Admission is a prefix: chunks are taken in order and the first refusal stops the
+	// block, so what gets fetched is always the nearest contiguous run. A chunk already
+	// cached costs no commitment and never blocks the prefix.
+	hi := c0 - 1
 	for ci := c0; ci <= c1; ci++ {
 		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, maskForLen(chunkLenOf(ci, objSize))) {
+			hi = ci
 			continue
 		}
 		ck := bs.cacheKey(k, ci)
 		n := chunkLenOf(ci, objSize)
-		if _, dup := bs.prefetched.LoadOrStore(ck, n); !dup {
-			bs.pfCommittedBytes.Add(n)
+		if _, dup := bs.prefetched.Load(ck); dup {
+			// Already committed by another dispatch; its bytes are already counted.
+			hi = ci
+			continue
+		}
+		if !bs.admitCommitted(n) {
+			// NOT PrefetchIssued: nothing was issued. Counting a refusal as issued would
+			// inflate lith_prefetch_issued_total with prefetches that never happened and
+			// break the issued-vs-used relation every #256 gate reads.
+			bs.recordPrefetchRefused()
+			break
+		}
+		if _, dup := bs.prefetched.LoadOrStore(ck, n); dup {
+			// Lost a race between Load and LoadOrStore: give the bytes back.
+			bs.pfCommittedBytes.Add(-n)
+		} else {
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
 			if bs.timeline != nil {
 				bs.timeline.PrefetchDispatch(k.Key, ci, time.Now())
 			}
 		}
+		hi = ci
 	}
-	_ = bs.ensureChunks(ctx, k, c0, c1, objSize, true, nil, bs.fullWant(objSize), fillWhole)
+	if hi < c0 {
+		return
+	}
+	_ = bs.ensureChunks(ctx, k, c0, hi, objSize, true, nil, bs.fullWant(objSize), fillWhole)
+}
+
+// admitCommitted reserves n bytes against the prefetch budget, returning false when they
+// would not fit (#301). The CAS makes admission atomic with the accounting, so N handles
+// establishing simultaneously cannot each read a stale zero and all grant themselves a full
+// window -- which a read-then-decide check would permit, and which is exactly the
+// over-commitment that thrashes.
+//
+// A non-positive budget does not gate: that is how the store behaves with no budget
+// configured, and gating there would silently disable prefetch.
+func (bs *BlockStore) admitCommitted(n int64) bool {
+	if bs.pfBudgetBytes <= 0 || n <= 0 {
+		return true
+	}
+	for {
+		cur := bs.pfCommittedBytes.Load()
+		if cur+n > bs.pfBudgetBytes {
+			return false
+		}
+		if bs.pfCommittedBytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
 }
 
 // PrefetchBudgetBytes is the mount-wide byte budget for prefetch not yet
@@ -965,6 +1025,20 @@ func (bs *BlockStore) recordPrefetchWait(d time.Duration) {
 // told when a prefetched-but-unread chunk was evicted (the #55 thrash signal).
 type prefetchEvictRecorder interface {
 	PrefetchEvictedUnread()
+}
+
+// prefetchRefuseRecorder is an optional Recorder extension: implementers are told when a
+// prefetch was refused because the committed total was already at the budget (#301). That is
+// the signal an operator needs to know the budget is binding, and it is distinct from a
+// prefetch that was issued and wasted.
+type prefetchRefuseRecorder interface {
+	PrefetchRefused()
+}
+
+func (bs *BlockStore) recordPrefetchRefused() {
+	if r, ok := bs.rec.(prefetchRefuseRecorder); ok {
+		r.PrefetchRefused()
+	}
 }
 
 func (bs *BlockStore) recordPrefetchEvicted() {

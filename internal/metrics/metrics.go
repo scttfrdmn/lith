@@ -38,6 +38,7 @@ type Metrics struct {
 	pfDeEstab     *prometheus.CounterVec // establishments lost, by object size class (#256)
 	pfResetRand   prometheus.Counter
 	pfEvictUnread prometheus.Counter
+	pfRefused     prometheus.Counter
 	sibPrefetch   prometheus.Counter
 	sibUnread     prometheus.Counter
 	formatDetect  *prometheus.CounterVec
@@ -133,6 +134,9 @@ func New() *Metrics {
 		pfEvictUnread: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_evicted_unread_total", Help: "Prefetched chunks evicted before a demand read consumed them (thrash; #55).",
 		}),
+		pfRefused: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_refused_total", Help: "Prefetches refused because committed bytes were already at --prefetch-budget (#301) -- the budget binding. Distinct from lith_prefetch_evicted_unread_total: a refusal costs nothing, a wasted fetch costs a GET and the bytes.",
+		}),
 		sibPrefetch: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_sibling_prefetch_total", Help: "Sibling objects prefetched by directory-walk readahead (#63).",
 		}),
@@ -210,7 +214,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.pfRefused, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -418,6 +422,16 @@ func (m *Metrics) PrefetchDeEstablished(sizeClass string, n int64) {
 func (m *Metrics) PrefetchEvictedUnread() {
 	if m != nil {
 		m.pfEvictUnread.Inc()
+	}
+}
+
+// PrefetchRefused records a prefetch refused because the committed total was already at
+// --prefetch-budget (optional blockstore.Recorder extension; #301). Separate from
+// PrefetchEvictedUnread on purpose: a refusal is the budget working, an unread eviction is
+// the budget having failed.
+func (m *Metrics) PrefetchRefused() {
+	if m != nil {
+		m.pfRefused.Inc()
 	}
 }
 

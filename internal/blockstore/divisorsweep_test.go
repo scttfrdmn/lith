@@ -13,46 +13,27 @@ import (
 	"github.com/scttfrdmn/lith/internal/s3client/fake"
 )
 
-// PHASE 1 of #301: does the prefetch-budget divisor earn its cost in the regime it exists
-// for?
+// #301: committed prefetch bytes must never exceed --prefetch-budget, however aggressively
+// the caller dispatches.
 //
-// perHandleWindow() rations windowed readahead as clamp(budgetBlocks/openHandles, 2,
-// maxReadahead). Measured on a real mount, that over-charges by exactly the handle count:
-// committed bytes track ONE window however many handles are charged, so tightness = 1/N
-// and a mount at 256 descriptors is charged 4295 MB while holding 17.8 MB — throttled
-// 6–10x for it (#298, #301).
+// This test began as "does the divisor earn its cost?" and that question is answered, in
+// bench/prefetch-divisor: rationing is essential (removing it costs 13.8-22.4x wall and
+// 4.2-5.2x the bytes with 81-92% of prefetch evicted unread) but the divisor rationed by
+// DESCRIPTOR COUNT, which over-charges by exactly that count. admitCommitted now enforces the
+// budget byte-exactly where it is measured, so the proxy is gone.
 //
-// But every one of those cells was a SINGLE streaming reader, so #55's thrash shape — many
-// concurrent readers over a working set larger than the memory tier — was not represented,
-// and the data cannot say whether the divisor's protection is needed. That is what this
-// measures, in the fixture #55 itself was fixed against.
+// What the two arms are for now: they dispatch very differently -- `divisor` advances a
+// frontier budgetBlocks/N ahead as the old per-handle window did, `neutral` dispatches the
+// whole budget ahead at once -- and the invariant must hold in both. That is the point of
+// moving enforcement to the measured quantity: safety stops depending on the caller getting
+// its own rationing right.
 //
-// THE ASSERTION IS THE EXPERIMENT, and it is a paired CONTRAST rather than a threshold: the
-// `neutral` arm removes the divisor by letting every reader prefetch the whole budget ahead,
-// and the divisor arm must do no worse on either of #55's signals. A first version borrowed
-// TestPrefetchBudgetNoThrash's absolute 1% bound and failed in both arms, which is what
-// surfaced the limitation below.
-//
-// WHAT THIS CANNOT SETTLE, and the reason it does not decide #301 on its own. The fake
-// server returns instantly, so every dispatched block lands before consumption drains any
-// of it. Peak committed therefore sits ABOVE the budget here where production sits well
-// below it:
-//
-//	                committed as % of budget    % of tier
-//	production N=1          45.3                  22.7
-//	production N=16          6.1                   3.1
-//	production N=256         0.4                   0.2
-//	fixture    N=4         109.2                  54.6
-//	fixture    N=16        142.1                  71.0
-//
-// (production figures measured on a real mount by the reporting workload, #301.)
-//
-// So this fixture runs 2.4-3.5x tighter on committed/tier than the default configuration
-// does, in a direction the network cannot produce. It establishes that the divisor CAN
-// protect #55's bounds under memory pressure; it does not establish that it does so at the
-// shipping ratio, because the pressure is not the shipping pressure. That distinction is
-// Phase 1b's job and it needs a real endpoint.
-func TestPrefetchDivisorEarnsItsCost(t *testing.T) {
+// The #55 signals (unread evictions, re-fetch) are REPORTED rather than asserted here,
+// because this fixture runs at 2.4-3.5x production memory pressure: the fake server returns
+// instantly, so dispatch outruns consumption in a way the network cannot, and peak committed
+// sat at 109-142% of budget before admission existed where a real mount sits at 0.4-45%.
+// TestPrefetchBudgetNoThrash is the #55 gate; this is the admission gate.
+func TestPrefetchAdmissionCapsCommittedWhateverTheCaller(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocates ~0.5 GB of fixture objects")
 	}
@@ -135,35 +116,29 @@ func TestPrefetchDivisorEarnsItsCost(t *testing.T) {
 			r.evicted, r.issued, float64(r.s3Bytes)/float64(r.workingSet))
 	}
 
-	// THE ASSERTION IS THE EXPERIMENT, and it is a CONTRAST rather than a threshold: an
-	// absolute bound borrowed from TestPrefetchBudgetNoThrash's sizing does not transfer to
-	// this fixture, as a first run showed by failing in both arms. What transfers is the
-	// paired comparison, one variable apart.
-	//
-	// If the divisor arm is not materially better than neutral, the divisor is not what
-	// protects #55 and Phase 2B is indicated. If it is, Phase 2A is.
-	byCell := map[string]result{}
+	// THE INVARIANT. Peak committed must not exceed the budget in any cell. Before
+	// admitCommitted this reached 109-142% of budget in the divisor arm and up to 1067% in
+	// the neutral arm, because the per-handle window was a proxy and a proxy can be wrong in
+	// either direction. A byte-exact cap cannot be.
 	for _, r := range table {
-		byCell[r.ratio+"/"+r.arm+"/"+strconv.Itoa(r.readers)] = r
-	}
-	for _, ratio := range ratios {
-		for _, readers := range []int{4, 8, 16} {
-			d := byCell[ratio.name+"/divisor/"+strconv.Itoa(readers)]
-			n := byCell[ratio.name+"/neutral/"+strconv.Itoa(readers)]
-			if d.issued == 0 || n.issued == 0 {
-				t.Fatalf("%s readers=%d: missing a cell", ratio.name, readers)
-			}
-			if d.evicted > n.evicted {
-				t.Errorf("%s readers=%d: the divisor arm evicted MORE unread prefetch than the "+
-					"neutral arm (%d vs %d) — the divisor is not protecting anything here",
-					ratio.name, readers, d.evicted, n.evicted)
-			}
-			if d.s3Bytes > n.s3Bytes {
-				t.Errorf("%s readers=%d: the divisor arm re-fetched more than neutral (%.3fx vs %.3fx)",
-					ratio.name, readers, float64(d.s3Bytes)/float64(d.workingSet),
-					float64(n.s3Bytes)/float64(n.workingSet))
-			}
+		if r.peakCommit > r.budgetBytes {
+			t.Errorf("%s readers=%d arm=%s: peak committed %d exceeded the budget %d (%.1f%%) — "+
+				"admitCommitted must cap it whatever the caller dispatches",
+				r.ratio, r.readers, r.arm, r.peakCommit, r.budgetBytes,
+				100*float64(r.peakCommit)/float64(r.budgetBytes))
 		}
+	}
+	// And it must actually be reached, or the fixture has stopped exercising the cap and the
+	// assertion above has gone vacuous.
+	var anyAtCap bool
+	for _, r := range table {
+		if r.peakCommit*100 >= r.budgetBytes*90 {
+			anyAtCap = true
+		}
+	}
+	if !anyAtCap {
+		t.Error("no cell drove committed within 10% of the budget: the fixture no longer " +
+			"exercises admission, so the cap assertion proves nothing")
 	}
 }
 
