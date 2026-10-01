@@ -134,20 +134,74 @@ Off by default; enable only if you have measured a win on your own workload.
 | flag | default | why |
 |---|---|---|
 | `--footer-tier2` | `false` | **Experimental, clustered projections only.** Byte-precise projection fetch for footer-family containers (Parquet/ORC/Arrow/zip) — a touched Parquet row group's projected column chunks, or a read zip entry + the next few in directory order ([#108](https://github.com/scttfrdmn/lith/issues/108)). Measured (sessions 29–43): it **wins on bytes for a *clustered* projection** (adjacent columns — ~10× fewer bytes than whole-file streaming) but **loses on wall-clock for a *spread* projection**, where the achievable floor is the reader's own footprint (pyarrow fetches ~the same bytes) and a whole-file stream is faster on a fat pipe (a handful of GETs at line rate vs a round-trip per column region). So it is off by default and stays experimental. Leave off unless you have a clustered projection where bytes-saved is the goal. Tier 1 (footer + head prefetch on open) always runs regardless. |
-| `--readahead-evidence-ratio` | `0` (off) | **Experimental ([#256](https://github.com/scttfrdmn/lith/issues/256)).** Bound a committed readahead window to this multiple of the bytes the handle has actually read. A handle establishes at its first **block crossing** — one block (8 MiB) of contiguous evidence — and that buys the *full* NIC-derived window, ~223 blocks (~1.8 GB) on a 50 Gbps node. With ratio `k` a handle prefetches ~`k`x what it has read, so a **sequential copy still earns the full window** (after consuming `max-readahead x block-size / k`) while a reader that tiles a slab and jumps does not. **Measured on a 48-rank GCHP fullchem run:** amplification 2.425x -> **1.956x** at `k=8`, within 1.5% of what pinning `--max-readahead 1` gives (1.925x) but without pinning a global window. **How much it helps depends entirely on how many handles are open, and the 48-rank figure above is the mild case.** The window is `clamp(prefetch-budget / open-handles, 2, --max-readahead)`, so 48 ranks with ~600 open handles sat on the **floor of 2** and had almost nothing to give back. A **single** reader gets the full ~223-block window, which on a 50 Gbps node is ~1.8 GB — larger than most single objects, so an established sequential reader prefetches the *whole file* regardless of how little of it it wants. Measured on one process reading one variable out of a 1.22 GB NetCDF-4 file: over-fetch **54x**, and the over-fetch equals **1/coverage** to within 2% across a 54x range of coverage. At `k=4` that becomes 1217.8 -> **59.8 MB (-95.1%)** with byte follow-through *rising* 0.005 -> 0.135.
-
-So the earlier claim that it "does not improve prefetch precision" was measured at 48 ranks on the chunk-touch ratio (16.7% -> 14.3%) and **does not generalise**: in the single-handle regime byte follow-through improves by 27x. The single-handle case — `python`, `xarray`, `ncks`, `h5py`, one process against a bucket — is both the worse case and the more common one.
-
-**What it does not touch:** the cold-start granularity tax (the ~1.23 GB floor of [#256](https://github.com/scttfrdmn/lith/issues/256)) is **bit-identical** with the flag on, because the whole-chunk commitment is taken before any window decision exists. There are two distinct waste channels and this flag addresses exactly one. The price on the other side is **requests, not bytes**, and it depends on *how* the whole-file reader asks. A **pure sequential stream** (`cat`, `cp`) pays **nothing**: measured byte-identical with **no increase in requests** at `max-readahead` 13, 33 and 223, on 326 MiB and 1161 MiB objects ([`bench/evidence-ratio/`](https://github.com/scttfrdmn/lith/blob/main/bench/evidence-ratio/README.md)). A **structured** whole-file reader that walks an object variable by variable (`h5py`/`netCDF4` reading everything) pays **+22% GETs for +0.07% bytes**, because its reads are discontiguous so accrued evidence repeatedly lags the window and the ramp is paid more than once. **Do not turn this on for a high-latency or non-AWS endpoint yet.** Measured cross-region (object in us-west-2, reader in us-east-1, connect RTT 2.2 ms → 58.6 ms), bytes and request counts stay **identical in all 32 cells** — but wall clock becomes **bimodal**: a mode sitting on the unclamped time (~4.3 s) and a second mode at 11–24 s, with `wall > 9 s` in **0 of 16** unclamped cells against **8 of 16** at ratio 4 (Fisher exact p ≈ 7 × 10⁻⁴, n=8 per cell, fresh cold mount each). Not warm-up — rep order does not predict which mode a run lands in. The high mode runs at 35–75 MB/s against a ~200 MB/s baseline **for identical bytes and identical requests**, which looks like the ramp intermittently failing to escape a feedback loop: window at its floor plus a long RTT keeps in-flight bytes under the bandwidth–delay product, so throughput is RTT-bound, so evidence accrues slowly, so the window grows slowly. In-region the same flag costs a fixed ~+0.35 s and no stall mode appears. Tracked in [#256](https://github.com/scttfrdmn/lith/issues/256).
-
-**Two mechanisms for it have been proposed and both are refuted; the channel is not yet known.** It is not that low throughput makes the gate's evidence accrue more slowly — `windowCap()` is a pure function of bytes read, so the window schedule is bit-identical at any RTT. And it is not that the gate's window floor is too small to cover a round trip: raising that floor so **no** window fell below a round trip left the stall rate **unchanged** (4 of 8 cells before, 4 of 8 after), and the `--pf-trace` window series is **bit-identical between a 20.3 s cell and a 3.4 s cell of the same arm** — same 6432 windows, same min and max, same dispatch count. A 6x wall-clock difference with an identical window trajectory means the window is not the channel. Running with the gate off — a full 223-block window from the first 8 MB — still produced one 39 s cell, so a wide window does not immunise the read either.
-
-What survives is that the gate is implicated and the window is not how: pooled over both sessions, `wall > 9 s` occurs in **1 of 32** cells with the gate off against **16 of 32** with it on. The remaining candidates are dispatch scheduling, the connection pool, or the endpoint. Until that is settled, leave the flag off for high-latency or non-AWS endpoints.
-
-A corollary worth stating for anyone testing this flag: **a bytes-and-requests regression check is not sufficient for it.** Those are identical on both sides of the stall, so the check passes while wall clock varies 5×.
-
-Use it where over-fetch costs money (requester-pays, or cross-region **only in-region-latency conditions**) or where a single process reads slices of large objects; it is not a fix for the granularity floor. |
+| `--readahead-evidence-ratio` | `0` (off) | **Experimental ([#256](https://github.com/scttfrdmn/lith/issues/256)); in-region only in practice.** Bound a committed readahead window to this multiple of the bytes the handle has actually read, so a single reader that wants a slice of a large object stops prefetching the whole thing. Cuts over-fetch by **56-95%** on a low-coverage read with byte follow-through *rising*, and costs **1.6-2.8x wall clock** on a high-latency endpoint. See below before enabling. |
 | `--coalesce-gap` | `0` (derived) | Largest gap between two projection/demand fill ranges still merged into one range GET (the byte-precise fill path; only active with `--footer-tier2`). `0` derives it from the device: **NIC baseline × measured first-byte latency ÷ usable concurrency**, clamped to `[256 KiB, 64 MiB]` — a round-trip's worth of bytes amortized across the concurrent requests in flight ([#124](https://github.com/scttfrdmn/lith/issues/124)/[#31](https://github.com/scttfrdmn/lith/issues/31)). Set a fixed size to override the derivation. |
+
+### `--readahead-evidence-ratio`, in detail
+
+A handle establishes at its first **block crossing** — one block (8 MiB) of contiguous
+evidence — and that buys the *full* NIC-derived window, ~223 blocks (~1.8 GB) on a 50 Gbps
+node. With ratio `k` a handle prefetches ~`k`× what it has read, so a sequential copy still
+earns the full window (after consuming `max-readahead × block-size / k`) while a reader that
+tiles a slab and jumps does not.
+
+**How much it helps depends on how many handles are open.** The window is
+`clamp(prefetch-budget / open-handles, 2, --max-readahead)`, so a 48-rank job with ~600 open
+handles sits on the **floor of 2** and the gate has almost nothing to give back — measured
+there, amplification 2.425× → 1.956× at `k=8`. A **single** reader gets the full ~223-block
+window, which is larger than most single objects, so an established sequential reader
+prefetches the *whole file* however little of it it wants. On one process reading one variable
+of a 1.22 GB NetCDF-4 file, over-fetch is **54×**, and over-fetch equals **1/coverage** to
+within 2% across a 54× range of coverage. At `k=4` that becomes 1217.8 → **59.8 MB (−95.1%)**
+with byte follow-through *rising* 0.005 → 0.135. The single-handle case — `python`, `xarray`,
+`ncks`, `h5py`, one process against a bucket — is both the worse case and the more common one,
+so an earlier claim here that the flag "does not improve prefetch precision" was a 48-rank
+measurement stated as a general one.
+
+**What it does not touch.** The cold-start granularity tax (the ~1.23 GB floor of
+[#256](https://github.com/scttfrdmn/lith/issues/256)) is **bit-identical** with the flag on,
+because the whole-chunk commitment is taken before any window decision exists. There are two
+distinct waste channels and this addresses exactly one.
+
+**The high-latency cost is `#229`'s establishment burst being capped, and it cannot be tuned
+away.** On an object *larger* than the window (3.78 GB = 450 blocks) at 58.6 ms RTT the effect
+is a clean, fully separated factor — median **8.51 s → 21.74 s (2.56×)** at `k=4`, zero
+overlap across n=8 per arm (exact rank-sum p = 1.6×10⁻⁴) — while moving **identical bytes in
+identical request counts** (3,776,834,855 B, 465 GETs) in every cell. In-region the same
+effect is **+7.5%** (n=8, p ≈ 0.03).
+
+The mechanism is a single dispatch event. `advance(cursor+1+window)` emits `[frontier, target)`
+in one call, so the window value at establishment **is** the batch size — and
+[#229](https://github.com/scttfrdmn/lith/issues/229) exists to make that batch the full window,
+precisely to avoid "many small GETs, an underfed NIC on the cold read". With the gate off, one
+read dispatches **223 blocks at once** and every later dispatch is 1 block (p99 = 1); that
+single burst is the whole of the throughput advantage. With the gate on the burst is capped to
+what consumption has earned, and nothing later recovers it:
+
+| `k` | burst at establishment | throughput | concurrent streams' worth | median wall |
+|---|---|---|---|---|
+| off | **223 blocks** | 443.8 MB/s | **3.10** | 8.51 s |
+| 40 | 41 | 283.8 MB/s | 1.98 | 13.31 s |
+| 4 | 5 | 173.7 MB/s | 1.21 | 21.74 s |
+| 1 | 2 | 160.4 MB/s | **1.12** | 23.55 s |
+
+One stream is 8 MiB / 58.6 ms = 143 MB/s and a fully serial read is 465 × 58.6 ms = 27.2 s, so
+`k=1` at 1.12 streams is **essentially serial**. That is also why raising `k` does not rescue
+it: concurrency cannot fall below one stream, so a **40×** range in how long the cap binds buys
+only a **3.1×** range in the penalty. The gate bounds committed readahead bytes, and on a long
+pipe committed bytes *are* what buy concurrency — so the byte saving and the burst are the same
+quantity, and no ratio keeps both.
+
+Earlier reports of a *bimodal* 4 s / 20 s split came from a test object **smaller** than the
+window, where readahead extent was never the binding constraint at all.
+
+**A bytes-and-requests regression check is not sufficient for this flag.** Those are identical
+on both sides of the effect, so such a check passes while wall clock varies by a factor of 2.8.
+
+**So: use it in-region, or where you are paying for bytes and can afford the wall clock.** It
+is not a fix for the granularity floor, and on a high-latency or non-AWS endpoint it costs
+1.6–2.8× on reads of objects larger than the prefetch window — at every ratio tested, including
+one permissive enough to clear the cap after 1.1% of the object.
 
 ## Archives and published datasets
 
