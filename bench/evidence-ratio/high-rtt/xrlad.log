@@ -1,0 +1,35 @@
+=== gate 5f-G  2026-09-30T23:00:13Z  reps=3 ===
+  lith: lith dev
+  netCDF4 1.7.2 libnetcdf 4.9.4-development hdf5 1.14.2
+  host: ip-172-31-39-157 16 cores
+hco-dd-r40-1 lith_distinct_bytes_read 3.77683968e+09 wall=13.313608470
+hco-dd-r40-1 lith_prefetch_issued_total 3586 wall=13.313608470
+hco-dd-r40-1 lith_prefetch_used_total 3586 wall=13.313608470
+hco-dd-r40-1 lith_s3_bytes_total 3.776834855e+09 wall=13.313608470
+hco-dd-r40-1 lith_s3_requests_total{op="get",status="ok"} 465 wall=13.313608470
+hco-dd-r1-1 lith_distinct_bytes_read 3.77683968e+09 wall=19.766941300
+hco-dd-r1-1 lith_prefetch_issued_total 3586 wall=19.766941300
+hco-dd-r1-1 lith_prefetch_used_total 3586 wall=19.766941300
+hco-dd-r1-1 lith_s3_bytes_total 3.776834855e+09 wall=19.766941300
+hco-dd-r1-1 lith_s3_requests_total{op="get",status="ok"} 465 wall=19.766941300
+hco-dd-r40-2 lith_distinct_bytes_read 3.77683968e+09 wall=15.108628889
+hco-dd-r40-2 lith_prefetch_issued_total 3586 wall=15.108628889
+hco-dd-r40-2 lith_prefetch_used_total 3586 wall=15.108628889
+hco-dd-r40-2 lith_s3_bytes_total 3.776834855e+09 wall=15.108628889
+hco-dd-r40-2 lith_s3_requests_total{op="get",status="ok"} 465 wall=15.108628889
+hco-dd-r1-2 lith_distinct_bytes_read 3.77683968e+09 wall=23.546461223
+hco-dd-r1-2 lith_prefetch_issued_total 3586 wall=23.546461223
+hco-dd-r1-2 lith_prefetch_used_total 3586 wall=23.546461223
+hco-dd-r1-2 lith_s3_bytes_total 3.776834855e+09 wall=23.546461223
+hco-dd-r1-2 lith_s3_requests_total{op="get",status="ok"} 465 wall=23.546461223
+hco-dd-r40-3 lith_distinct_bytes_read 3.77683968e+09 wall=13.291504117
+hco-dd-r40-3 lith_prefetch_issued_total 3586 wall=13.291504117
+hco-dd-r40-3 lith_prefetch_used_total 3586 wall=13.291504117
+hco-dd-r40-3 lith_s3_bytes_total 3.776834855e+09 wall=13.291504117
+hco-dd-r40-3 lith_s3_requests_total{op="get",status="ok"} 465 wall=13.291504117
+hco-dd-r1-3 lith_distinct_bytes_read 3.77683968e+09 wall=29.276764535
+hco-dd-r1-3 lith_prefetch_issued_total 3586 wall=29.276764535
+hco-dd-r1-3 lith_prefetch_used_total 3586 wall=29.276764535
+hco-dd-r1-3 lith_s3_bytes_total 3.776834855e+09 wall=29.276764535
+hco-dd-r1-3 lith_s3_requests_total{op="get",status="ok"} 465 wall=29.276764535
+=== done 2026-09-30T23:02:15Z ===

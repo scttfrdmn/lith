@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--readahead-evidence-ratio` is documented as in-region-only, with the mechanism**
+  ([#256](https://github.com/scttfrdmn/lith/issues/256)). At 58.6 ms RTT, on an object larger
+  than the prefetch window, the flag costs a cleanly separated **2.56×** wall clock — median
+  8.51 s to 21.74 s, zero overlap across n=8 per arm — while moving **identical bytes in
+  identical request counts** (3,776,834,855 B and 465 GETs in every cell). In-region the same
+  effect is **+7.5%**.
+
+  The cause is one dispatch event. `advance(cursor+1+window)` emits its blocks in a single
+  call, so the window value at establishment **is** the batch size, and
+  [#229](https://github.com/scttfrdmn/lith/issues/229) exists to make that batch the full
+  window — its comment naming the alternative as *"many small GETs, an underfed NIC on the cold
+  read"*. The gate caps that batch, which is that regression reintroduced: with the gate off one
+  read dispatches **223 blocks** and every later dispatch is **one** block, and that single
+  burst is the entire throughput advantage. Capped to 41, 5 and 2 blocks at k = 40, 4 and 1, the
+  read falls from 3.10 to 1.12 concurrent streams' worth — essentially serial.
+
+  **It cannot be tuned away.** Concurrency cannot fall below one stream, so a 40× range in how
+  long the cap binds buys only a 3.1× range in the penalty; the gate bounds committed readahead
+  bytes and on a long pipe committed bytes *are* what buy concurrency, so the byte saving and
+  the burst are the same quantity. `docs/knobs.md` now says so, and the analysis is in
+  `bench/evidence-ratio/high-rtt/` with a script that reproduces it from published traces.
+
+  Two corrections fall out. Earlier reports of a **bimodal** 4 s / 20 s split were an artefact
+  of a test object *smaller* than the window, where readahead extent was never binding. And
+  four mechanisms were proposed and refuted before this one — two of them ours — of which the
+  last two were killed offline, from traces already published, at no cost.
+
 ### Fixed
 
 - **Reverted: the evidence gate's window floor is a constant again**
