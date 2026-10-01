@@ -187,13 +187,20 @@ type BlockStore struct {
 	// BYTE length; a sync.Map so the mem-tier eviction callback can release the budget
 	// without taking bs.mu under the shard lock (avoids a lock-order inversion).
 	//
-	// The value used to be struct{}{}. It carries the length so pfResidentBytes can be
+	// The value used to be struct{}{}. It carries the length so pfCommittedBytes can be
 	// maintained exactly at the three removal sites, which see only the key (#301).
 	prefetched sync.Map
-	// pfResidentBytes is the live sum of those lengths: bytes prefetched and still
-	// resident unread. This is the quantity --prefetch-budget is ABOUT, and until now it
-	// was nowhere -- the budget was enforced by a proxy (per-handle window x open
-	// handles) and the proxy was all anyone could observe.
+	// pfCommittedBytes is the live sum of those lengths: bytes prefetch has COMMITTED
+	// and nothing has consumed yet. This is the quantity --prefetch-budget is ABOUT, and
+	// until now it was nowhere -- the budget was enforced by a proxy (per-handle window x
+	// open handles) and the proxy was all anyone could observe.
+	//
+	// COMMITTED, not resident. The marking loop above runs BEFORE ensureChunks, so a
+	// chunk counts from the moment it is dispatched and keeps counting while its GET is
+	// in flight and nothing is in RAM yet. That is arguably the right quantity for
+	// admission control -- you want to refuse work you have already promised -- but it is
+	// NOT a memory figure, and an earlier name of "resident" invited exactly the
+	// misreading that someone would enforce a RAM limit with it.
 	//
 	// It must not be validated against that proxy. An offline estimator built from
 	// dispatch counts returns the standing window by construction (one establishment
@@ -201,7 +208,7 @@ type BlockStore struct {
 	// EOF), so "resident ~= window x handles" is an identity, not a check. Verified on
 	// 50/50 cells by the reporting workload, who nearly published the wrong conclusion
 	// from it. Test this against constructed state instead.
-	pfResidentBytes atomic.Int64
+	pfCommittedBytes atomic.Int64
 
 	// Write-behind disk tier: prefetch fills apply backpressure on this queue
 	// (bounded), demand fills never block; shutdown drains via stop.
@@ -806,7 +813,7 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 		ck := bs.cacheKey(k, ci)
 		n := chunkLenOf(ci, objSize)
 		if _, dup := bs.prefetched.LoadOrStore(ck, n); !dup {
-			bs.pfResidentBytes.Add(n)
+			bs.pfCommittedBytes.Add(n)
 			bs.record(func(r Recorder) { r.PrefetchIssued() })
 			if bs.timeline != nil {
 				bs.timeline.PrefetchDispatch(k.Key, ci, time.Now())
@@ -855,16 +862,20 @@ func (bs *BlockStore) dropPrefetched(ck string) bool {
 		return false
 	}
 	if n, isInt := v.(int64); isInt {
-		bs.pfResidentBytes.Add(-n)
+		bs.pfCommittedBytes.Add(-n)
 	}
 	return true
 }
 
-// PrefetchResidentBytes is the live total of bytes prefetched and still resident
-// unread -- the quantity --prefetch-budget bounds (#301). Compare it to
-// PrefetchBudgetBytes to see whether the budget is actually near its limit, which the
-// per-handle-window proxy cannot tell you.
-func (bs *BlockStore) PrefetchResidentBytes() int64 { return bs.pfResidentBytes.Load() }
+// PrefetchCommittedBytes is the live total of bytes prefetch has committed and nothing
+// has consumed -- the quantity --prefetch-budget bounds (#301). Compare it to
+// PrefetchBudgetBytes to see whether the budget is near its limit, which the
+// per-handle-window proxy cannot tell you: measured, the proxy over-charges by exactly
+// the open-handle count (tightness = 1/N, matched to within 6.2% at N = 1..256).
+//
+// Counted from DISPATCH, so it includes bytes whose GET is still in flight. Not a
+// resident-memory figure.
+func (bs *BlockStore) PrefetchCommittedBytes() int64 { return bs.pfCommittedBytes.Load() }
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a
 // chunk that prefetch had fetched, clears its unread flag, and releases its

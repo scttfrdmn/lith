@@ -321,7 +321,8 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles func() float64) {
 }
 
 // RegisterPrefetchBudget registers gauges for what --prefetch-budget actually bounds:
-// bytes prefetched and still resident unread, against the budget's own limit (#301).
+// bytes prefetch has committed and nothing has consumed, against the budget's own limit
+// (#301).
 //
 // Until these existed the budget was enforced only by a PROXY -- the per-handle window
 // times the open-handle count -- and the proxy was the only observable. That matters
@@ -337,12 +338,12 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
 		return
 	}
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "lith_prefetch_resident_bytes",
-		Help: "Bytes prefetched and still resident unread: the quantity --prefetch-budget bounds. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for this (#301).",
+		Name: "lith_prefetch_committed_bytes",
+		Help: "Bytes prefetch has committed and nothing has consumed: the quantity --prefetch-budget bounds. Counted from DISPATCH, so it includes bytes still in flight -- this is NOT a resident-memory figure. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for it, and over-charges by the open-handle count (#301).",
 	}, resident))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_prefetch_budget_bytes",
-		Help: "The --prefetch-budget limit in bytes (default 50%% of --mem-cache). lith_prefetch_resident_bytes is what is actually held against it.",
+		Help: "The --prefetch-budget limit in bytes (default 50%% of --mem-cache). lith_prefetch_committed_bytes is what is actually held against it.",
 	}, limit))
 }
 

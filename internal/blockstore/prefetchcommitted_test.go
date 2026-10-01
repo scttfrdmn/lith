@@ -4,6 +4,7 @@ package blockstore
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 // counts returns the standing window by construction, so "resident ~= window x handles"
 // is an identity that passes whether or not either number is right; they nearly published
 // a conclusion from it. Every number below is a chunk count this test caused.
-func TestPrefetchResidentBytesTracksTheRealSet(t *testing.T) {
+func TestPrefetchCommittedBytesTracksTheRealSet(t *testing.T) {
 	srv := fake.New()
 	const nChunks = 16
 	makeObj(srv, "obj", nChunks)
@@ -28,13 +29,13 @@ func TestPrefetchResidentBytesTracksTheRealSet(t *testing.T) {
 	ctx := context.Background()
 	objSize := int64(nChunks) * mib
 
-	if got := bs.PrefetchResidentBytes(); got != 0 {
+	if got := bs.PrefetchCommittedBytes(); got != 0 {
 		t.Fatalf("fresh store: resident = %d, want 0", got)
 	}
 
 	// Prefetch block 0 — 8 chunks of 1 MiB — and nothing has consumed them.
 	bs.Prefetch(ctx, k, 0, objSize)
-	if got, want := bs.PrefetchResidentBytes(), int64(8)*mib; got != want {
+	if got, want := bs.PrefetchCommittedBytes(), int64(8)*mib; got != want {
 		t.Errorf("after prefetching one 8-chunk block: resident = %d, want %d", got, want)
 	}
 
@@ -42,14 +43,14 @@ func TestPrefetchResidentBytesTracksTheRealSet(t *testing.T) {
 	if _, err := bs.Chunk(ctx, k, 0, objSize, 0, mib, true); err != nil {
 		t.Fatalf("Chunk: %v", err)
 	}
-	if got, want := bs.PrefetchResidentBytes(), int64(7)*mib; got != want {
+	if got, want := bs.PrefetchCommittedBytes(), int64(7)*mib; got != want {
 		t.Errorf("after consuming one chunk: resident = %d, want %d", got, want)
 	}
 
 	// Re-prefetching the same block must not double-count: every chunk is either
 	// already resident-unread or already consumed.
 	bs.Prefetch(ctx, k, 0, objSize)
-	if got, want := bs.PrefetchResidentBytes(), int64(7)*mib; got != want {
+	if got, want := bs.PrefetchCommittedBytes(), int64(7)*mib; got != want {
 		t.Errorf("after re-prefetching the same block: resident = %d, want %d (no double count)", got, want)
 	}
 
@@ -61,7 +62,7 @@ func TestPrefetchResidentBytesTracksTheRealSet(t *testing.T) {
 			t.Fatalf("Chunk %d: %v", ci, err)
 		}
 	}
-	if got := bs.PrefetchResidentBytes(); got != 0 {
+	if got := bs.PrefetchCommittedBytes(); got != 0 {
 		t.Errorf("after consuming every prefetched chunk: resident = %d, want 0", got)
 	}
 }
@@ -69,7 +70,7 @@ func TestPrefetchResidentBytesTracksTheRealSet(t *testing.T) {
 // The short trailing chunk must be counted at its real length, not a full chunk. The old
 // map value was struct{}{}, so the length had to be introduced to make the removal sites
 // exact — and a trailing chunk is where an off-by-one would hide.
-func TestPrefetchResidentBytesCountsAShortTrailingChunk(t *testing.T) {
+func TestPrefetchCommittedBytesCountsAShortTrailingChunk(t *testing.T) {
 	srv := fake.New()
 	// 2 chunks and a bit: the last chunk is short.
 	const objSize = int64(2)*mib + 123456
@@ -78,8 +79,63 @@ func TestPrefetchResidentBytesCountsAShortTrailingChunk(t *testing.T) {
 	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MemCache: 256 * mib})
 
 	bs.Prefetch(context.Background(), k, 0, objSize)
-	if got := bs.PrefetchResidentBytes(); got != objSize {
+	if got := bs.PrefetchCommittedBytes(); got != objSize {
 		t.Errorf("resident = %d, want the object's %d — a short trailing chunk must count "+
 			"its real length, not a full chunk", got, objSize)
 	}
+}
+
+// The semantics the name has to carry, flagged by the reporting workload after an earlier
+// version called this "resident": the marking loop runs BEFORE ensureChunks, so a chunk
+// counts from DISPATCH and keeps counting while its GET is in flight with nothing in RAM.
+// That is defensible for admission control and indefensible as a memory figure, and the
+// risk they named is that someone enforces a RAM limit with it.
+//
+// Asserted by holding the fetch open: the counter must already include the chunk while
+// the source has not yet returned a byte.
+func TestPrefetchCommittedBytesCountsBytesStillInFlight(t *testing.T) {
+	srv := fake.New()
+	makeObj(srv, "obj", 8)
+	k := keyFor(t, srv, "obj")
+	objSize := int64(8) * mib
+
+	release := make(chan struct{})
+	blocked := &blockingSource{Source: srv, release: release}
+	bs, err := New(blocked, Config{Bucket: "bkt", BlockSize: 8 << 20, MemCache: 256 * mib})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(bs.Close)
+
+	done := make(chan struct{})
+	go func() { defer close(done); bs.Prefetch(context.Background(), k, 0, objSize) }()
+
+	// The fetch is blocked in the source, so nothing can be in RAM. The counter must
+	// nonetheless already carry the full block: it counts commitments, not residency.
+	deadline := time.Now().Add(2 * time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		if got = bs.PrefetchCommittedBytes(); got == int64(8)*mib {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if want := int64(8) * mib; got != want {
+		t.Errorf("with every GET blocked in the source: committed = %d, want %d — the counter "+
+			"must include bytes in flight, which is why it is not named 'resident'", got, want)
+	}
+	close(release)
+	<-done
+}
+
+// blockingSource holds every range read until release is closed, so a test can observe
+// the committed-bytes counter while nothing has arrived in RAM.
+type blockingSource struct {
+	Source
+	release chan struct{}
+}
+
+func (b *blockingSource) GetRangeReader(ctx context.Context, key string, off, length int64) (io.ReadCloser, string, error) {
+	<-b.release
+	return b.Source.GetRangeReader(ctx, key, off, length)
 }

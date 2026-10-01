@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`lith_prefetch_resident_bytes` and `lith_prefetch_budget_bytes`: what the prefetch
+- **`lith_prefetch_committed_bytes` and `lith_prefetch_budget_bytes`: what the prefetch
   budget actually bounds** ([#301](https://github.com/scttfrdmn/lith/issues/301)).
-  `--prefetch-budget` is about bytes prefetched and still resident unread, and that quantity
-  was nowhere observable — the budget was enforced by a **proxy**, the per-handle readahead
+  `--prefetch-budget` is about bytes prefetch has committed and nothing has consumed, and
+  that quantity was nowhere observable — the budget was enforced by a **proxy**, the per-handle readahead
   window times the open-handle count, and the proxy was all anyone could measure. It is also
   the proxy that charges for idle file descriptors at a measured 6.38× wall-clock cost.
 
@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a draft conclusion that rested on it. The tests here assert against constructed state
   instead: 8 chunks prefetched, one consumed, re-prefetch not double-counted, drain to zero,
   and a short trailing chunk counted at its real length.
+
+  **Measured on a real mount, the proxy over-charges by exactly the open-handle count.**
+  Tightness is `1/N` to within 6.2% from N=1 to N=256: at 256 descriptors the mount is
+  charged 4295 MB, holds **17.8 MB**, and is throttled ~9.5× for it, while even the tightest
+  case (N=1, tightness 1.000) leaves the budget 55% empty. The error is linear in descriptor
+  count, not a constant a fudge factor could absorb. The gauge also validated in that run —
+  the budget reads 4.127829504e9 exactly, committed drains to **0 at unmount in 18/18 cells**
+  under a real FUSE read loop, and at N=1 it steps 0 → 1870.659584 MB in one 100 ms sample,
+  which is 223 × 8 MiB to the byte.
+
+  Named **committed**, not resident: the counter increments at dispatch, so it includes bytes
+  whose GET is still in flight. Right for admission control, wrong for a memory limit — the
+  earlier name invited enforcing a RAM bound with it.
 
 - **`lith_readahead_window_blocks` and `lith_open_handles`: the realized readahead depth
   and its divisor** ([#298](https://github.com/scttfrdmn/lith/issues/298)). The depth a
