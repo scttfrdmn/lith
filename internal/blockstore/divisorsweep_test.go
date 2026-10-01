@@ -4,6 +4,7 @@ package blockstore
 
 import (
 	"context"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,14 +35,24 @@ import (
 // sat at 109-142% of budget before admission existed where a real mount sits at 0.4-45%.
 // TestPrefetchBudgetNoThrash is the #55 gate; this is the admission gate.
 func TestPrefetchAdmissionCapsCommittedWhateverTheCaller(t *testing.T) {
-	if testing.Short() {
-		t.Skip("allocates ~0.5 GB of fixture objects")
+	// Two sizes. CI runs the small one: enough readers and oversubscription to exercise
+	// admission and prove the invariant, small enough to survive `go test -race`, which
+	// OOM-killed a GitHub runner at the measurement size (exit 143) because the race
+	// detector's shadow memory multiplies a 512 MB fixture.
+	//
+	// LITH_SWEEP_FULL=1 runs the measurement size, which is what the numbers in
+	// bench/prefetch-divisor were taken at. The invariant is the same either way; only the
+	// reported magnitudes need the larger fixture.
+	// 8 chunks x 4 readers = 32 MiB of distinct demand against a 32 MiB budget, so the
+	// largest cell drives committed to the cap -- which the vacuity check below requires,
+	// and which a smaller fixture failed to do. The budget cannot go much lower: it sets
+	// the tiers (2x and 8x), and a --mem-cache under 64 MiB is DEAD, because 64 shards of
+	// under 1 MiB each refuse every chunk.
+	chunksPerObj, readerCounts, budget := 8, []int{2, 4}, int64(32)<<20
+	if os.Getenv("LITH_SWEEP_FULL") != "" {
+		chunksPerObj, readerCounts, budget = 32, []int{4, 8, 16}, int64(48)<<20
 	}
-	const (
-		chunksPerObj = 32             // 32 MiB objects
-		blockSize    = int64(1) << 20 // 1 MiB blocks, so budgetBlocks has room to divide
-		budget       = int64(48) << 20
-	)
+	const blockSize = int64(1) << 20 // 1 MiB blocks, so budgetBlocks has room to divide
 	// Two budget-to-tier ratios, because they are not the same question. "shipping" is the
 	// default (--prefetch-budget is 50% of --mem-cache). "conservative" is the 1:8 that
 	// TestPrefetchBudgetNoThrash deliberately chose, which is the only ratio #55's bounds
@@ -69,7 +80,7 @@ func TestPrefetchAdmissionCapsCommittedWhateverTheCaller(t *testing.T) {
 	var table []result
 
 	for _, ratio := range ratios {
-		for _, readers := range []int{4, 8, 16} {
+		for _, readers := range readerCounts {
 			for _, arm := range []string{"divisor", "neutral"} {
 				srv := fake.New()
 				keys := make([]Key, readers)

@@ -26,7 +26,7 @@ func TestPrefetchCommittedBytesTracksTheRealSet(t *testing.T) {
 	const nChunks = 16
 	makeObj(srv, "obj", nChunks)
 	k := keyFor(t, srv, "obj")
-	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MemCache: 256 * mib})
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MemCache: 128 * mib})
 	ctx := context.Background()
 	objSize := int64(nChunks) * mib
 
@@ -77,7 +77,7 @@ func TestPrefetchCommittedBytesCountsAShortTrailingChunk(t *testing.T) {
 	const objSize = int64(2)*mib + 123456
 	srv.Put("short", make([]byte, objSize), time.Unix(1, 0))
 	k := keyFor(t, srv, "short")
-	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MemCache: 256 * mib})
+	bs := newStore(t, srv, Config{BlockSize: 8 << 20, MemCache: 128 * mib})
 
 	bs.Prefetch(context.Background(), k, 0, objSize)
 	if got := bs.PrefetchCommittedBytes(); got != objSize {
@@ -102,7 +102,7 @@ func TestPrefetchCommittedBytesCountsBytesStillInFlight(t *testing.T) {
 
 	release := make(chan struct{})
 	blocked := &blockingSource{Source: srv, release: release}
-	bs, err := New(blocked, Config{Bucket: "bkt", BlockSize: 8 << 20, MemCache: 256 * mib})
+	bs, err := New(blocked, Config{Bucket: "bkt", BlockSize: 8 << 20, MemCache: 128 * mib})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -148,25 +148,27 @@ func (b *blockingSource) GetRangeReader(ctx context.Context, key string, off, le
 // simultaneity is the normal case rather than a corner.
 func TestAdmitCommittedIsAtomicUnderConcurrency(t *testing.T) {
 	srv := fake.New()
-	makeObj(srv, "obj", 64)
+	makeObj(srv, "obj", 16)
 	k := keyFor(t, srv, "obj")
-	objSize := int64(64) * mib
-	// A budget of 8 chunks against 64 chunks of demand: most dispatches must be refused.
-	const budget = int64(8) * mib
+	objSize := int64(16) * mib
+	// A budget of 4 chunks against 16 chunks of demand: most dispatches must be refused.
+	// Kept small on purpose -- `go test -race` on this package OOM-killed a CI runner, and
+	// 16 concurrent dispatches exercise the CAS exactly as 64 did.
+	const budget = int64(4) * mib
 	rec := &budgetRec{}
 	bs := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: 64 * mib, PrefetchBudget: budget, Recorder: rec,
+		BlockSize: 1 << 20, MemCache: 128 * mib, PrefetchBudget: budget, Recorder: rec,
 	})
 
 	var wg sync.WaitGroup
-	for b := int64(0); b < 64; b++ {
+	for b := int64(0); b < 16; b++ {
 		wg.Add(1)
 		go func(b int64) { defer wg.Done(); bs.Prefetch(context.Background(), k, b, objSize) }(b)
 	}
 	wg.Wait()
 
 	if got := bs.PrefetchCommittedBytes(); got > budget {
-		t.Errorf("committed = %d after 64 concurrent dispatches against a %d budget: admission "+
+		t.Errorf("committed = %d after 16 concurrent dispatches against a %d budget: admission "+
 			"must be atomic with the accounting, or every dispatch reads a stale zero", got, budget)
 	}
 	if rec.issued.Load() > budget/mib {
@@ -180,15 +182,15 @@ func TestAdmitCommittedIsAtomicUnderConcurrency(t *testing.T) {
 // issued-vs-used relation every #256 gate reads off.
 func TestRefusedPrefetchIsNotCountedAsIssued(t *testing.T) {
 	srv := fake.New()
-	makeObj(srv, "obj", 32)
+	makeObj(srv, "obj", 12)
 	k := keyFor(t, srv, "obj")
-	objSize := int64(32) * mib
-	const budget = int64(4) * mib
+	objSize := int64(12) * mib
+	const budget = int64(2) * mib
 	rec := &budgetRec{}
 	bs := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: 64 * mib, PrefetchBudget: budget, Recorder: rec,
+		BlockSize: 1 << 20, MemCache: 128 * mib, PrefetchBudget: budget, Recorder: rec,
 	})
-	for b := int64(0); b < 32; b++ {
+	for b := int64(0); b < 12; b++ {
 		bs.Prefetch(context.Background(), k, b, objSize)
 	}
 	issued := rec.issued.Load()
