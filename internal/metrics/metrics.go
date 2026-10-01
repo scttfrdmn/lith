@@ -292,6 +292,34 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 	}, f))
 }
 
+// RegisterReadaheadWindow registers gauges for the readahead depth a handle will
+// actually be given and the divisor that produces it (#298).
+//
+// perHandleWindow is clamp(prefetchBudgetBlocks / openHandles, 2, max-readahead), and
+// openHandles counts every open file DESCRIPTOR on the mount — mount-wide, across
+// processes, including descriptors that have never been read. So a reader holding files
+// open collapses its own and everyone else's prefetch depth, and until these gauges
+// existed there was nothing at runtime that showed it: `--max-readahead` is logged as
+// configured, and the realized window appeared nowhere.
+//
+// Measured consequence: 256 open descriptors drive the window to its floor of 2 and cost
+// 6.38x the wall clock on +0.4% bytes and +3% requests — invisible to every byte and
+// request counter, which is why it took an external workload and a dozen gates to find.
+// Both GCHP production mounts ran there.
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles func() float64) {
+	if m == nil {
+		return
+	}
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_readahead_window_blocks",
+		Help: "Readahead depth in blocks a handle is currently given: clamp(prefetch-budget/open-handles, 2, --max-readahead). This is the EFFECTIVE window; --max-readahead is only an upper bound on it (#298).",
+	}, window))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_open_handles",
+		Help: "Open file descriptors on the mount. This is the divisor for the readahead window, counted per DESCRIPTOR across all processes including descriptors never read, so holding files open shrinks prefetch depth (#298).",
+	}, openHandles))
+}
+
 // Handler returns the Prometheus HTTP handler for this registry.
 func (m *Metrics) Handler() http.Handler {
 	if m == nil {
