@@ -312,7 +312,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.
 	f.met.RegisterPrefetchBudget(
-		func() float64 { return float64(f.store.PrefetchResidentBytes()) },
+		func() float64 { return float64(f.store.PrefetchCommittedBytes()) },
 		func() float64 { return float64(f.store.PrefetchBudgetBytes()) },
 	)
 	return f
