@@ -87,8 +87,8 @@ func effectiveWindow(maxReadahead, budgetBlocks int64) (int64, string) {
 //
 // The three measure different things and are derived from unrelated quantities: one handle's
 // window commitment (--max-readahead x --block-size, an empirical 1.5x multiple of the
-// bandwidth-delay product), the mount-wide prefetch budget (a fraction of RAM, now the hard
-// admission cap), and the in-flight cap (NIC baseline x latency, a blocking semaphore in the
+// bandwidth-delay product), the mount-wide prefetch budget (a fraction of RAM, divided across
+// handles), and the in-flight cap (NIC baseline x latency, a blocking semaphore in the
 // blockstore). In the shipping default they disagree by 1.5x and the smallest wins silently,
 // which is why raising --max-readahead from 223 to 492 once measured +3%: both configurations
 // were already against a ceiling neither of them set.
@@ -104,4 +104,40 @@ func bindingBound(windowCommit, prefetchBudget, inflightBytes int64) string {
 		name = "--inflight-bytes"
 	}
 	return name
+}
+
+// windowCoverage reports how many concurrent open descriptors the prefetch budget can
+// serve, at two depths: `full` get the whole effective window, and at `floorAt` every
+// reader is down to the 2-block floor (#301).
+//
+// Both follow from the divisor in internal/fuse perHandleWindow -- each handle gets
+// clamp(budgetBlocks/N, 2, maxReadahead) -- so full = budgetBlocks/effW and the floor
+// binds once budgetBlocks/N < 2.
+//
+// This is reported at mount because the condition is otherwise invisible. The workload
+// that found #301 ran BOTH production mounts at the floor of 2 blocks -- 48 ranks x ~6
+// files is ~288 descriptors against the ~246 needed to get there -- reading at 186 MB/s
+// where 1293 was available, with no flag set wrong and nothing in the log saying so. The
+// mount logged the configured depth; the descriptors doing the throttling belonged to
+// other processes. Two numbers at startup would have shown it.
+//
+// floorAt is 1 when the mount is at the floor from its very first descriptor.
+//
+// The floor is where the share is 2, which integer division reaches one step EARLIER than
+// where the clamp starts applying: at budgetBlocks=492 the share at N=246 is already
+// exactly 2 without any clamping, so the condition is budgetBlocks/N < 3, not < 2. A
+// cross-check against the divisor's own arithmetic caught that off-by-one; the test
+// reproduces the clamp rather than restating this formula, so the two cannot agree by
+// construction.
+func windowCoverage(effW, budgetBlocks int64) (full, floorAt int64) {
+	if budgetBlocks <= 0 || effW <= 0 {
+		return 0, 0
+	}
+	full = budgetBlocks / effW
+	if budgetBlocks < 3 || effW <= 2 {
+		// One descriptor is already at the floor -- either the budget cannot fund more
+		// than the floor, or the effective window IS the floor.
+		return full, 1
+	}
+	return full, budgetBlocks/3 + 1
 }

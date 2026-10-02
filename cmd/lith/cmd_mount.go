@@ -396,13 +396,27 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// this did) left a tuner turning a knob that was not in play; raising --max-readahead
 	// from 223 to 492 once measured +3% for exactly that reason.
 	effW, bound := effectiveWindow(f.maxReadahead, bs.PrefetchBudgetBlocks())
+	fullAt, floorAt := windowCoverage(effW, bs.PrefetchBudgetBlocks())
 	log.Info("prefetch bounds",
 		"window_blocks", effW,
 		"window_bound", bound,
 		"window_commit_bytes", effW*blockSize,
 		"prefetch_budget_bytes", bs.PrefetchBudgetBytes(),
 		"inflight_bytes", inflight,
-		"binding", bindingBound(effW*blockSize, bs.PrefetchBudgetBytes(), inflight))
+		"binding", bindingBound(effW*blockSize, bs.PrefetchBudgetBytes(), inflight),
+		// How many concurrent open descriptors keep the window above, and at, the floor.
+		// The budget is divided by the OPEN DESCRIPTOR count -- across processes, including
+		// descriptors never read -- so these are reached by files other readers hold open
+		// and not only by this mount's own concurrency (#301).
+		"full_window_descriptors", fullAt,
+		"floor_at_descriptors", floorAt)
+	if fullAt < 2 {
+		log.Warn("the prefetch budget cannot give two concurrent readers a full window",
+			"full_window_descriptors", fullAt,
+			"window_blocks", effW,
+			"prefetch_budget_bytes", bs.PrefetchBudgetBytes(),
+			"hint", "--prefetch-budget is the numerator of each reader's share; raise it, or lower --max-readahead")
+	}
 	if effW != f.maxReadahead {
 		log.Warn("readahead window reduced by a tighter bound",
 			"configured_blocks", f.maxReadahead, "effective_blocks", effW, "bound", bound,
