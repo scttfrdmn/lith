@@ -20,7 +20,7 @@ import (
 // and close.
 func TestStreamDeltaIsReportedOncePerTransition(t *testing.T) {
 	const blockSize = int64(1) << 20
-	w := newPFWrapper(223, blockSize, 0)
+	w := newPFWrapper(223, blockSize, 0, coverageMin)
 	var seq atomic.Int64
 	var count int64
 
@@ -64,7 +64,7 @@ func TestStreamDeltaIsReportedOncePerTransition(t *testing.T) {
 // A handle the detector never establishes must never be counted. This is the case the old
 // divisor got wrong by construction: a descriptor opened and never read was a full divisor.
 func TestNeverEstablishedHandleIsNeverCounted(t *testing.T) {
-	w := newPFWrapper(223, 1<<20, 0)
+	w := newPFWrapper(223, 1<<20, 0, coverageMin)
 	// Opened, never read.
 	if d := w.releaseStreaming(); d != 0 {
 		t.Errorf("closing a never-read handle returned %d, want 0", d)
@@ -78,7 +78,7 @@ func TestNeverEstablishedHandleIsNeverCounted(t *testing.T) {
 // that stops being sequential stops charging for depth it is not using.
 func TestCollapseToRandomReleasesTheShare(t *testing.T) {
 	const blockSize = int64(1) << 20
-	w := newPFWrapper(223, blockSize, 0)
+	w := newPFWrapper(223, blockSize, 0, coverageMin)
 	var seq atomic.Int64
 	var count int64
 	for i := int64(0); i < 32; i++ {
@@ -110,7 +110,7 @@ func TestCollapseToRandomReleasesTheShare(t *testing.T) {
 // transition double-reported under that concurrency would permanently skew the divisor.
 func TestStreamDeltaUnderConcurrentReadsOnOneHandle(t *testing.T) {
 	const blockSize = int64(1) << 20
-	w := newPFWrapper(223, blockSize, 0)
+	w := newPFWrapper(223, blockSize, 0, coverageMin)
 	var seq atomic.Int64
 	var count atomic.Int64
 

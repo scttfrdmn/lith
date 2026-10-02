@@ -43,6 +43,7 @@ type mountFlags struct {
 	prefetchBudget    string
 	maxReadahead      int64
 	readaheadEvidence float64
+	coverageMin       float64
 	pfTrace           string
 	nicGbps           float64
 	siblingWindow     int
@@ -99,6 +100,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge). An UPPER BOUND, not the window: the mount divides --prefetch-budget/--block-size across the handles being read sequentially and caps the result by this, and it warns at startup when this is not what binds (#297). Idle open descriptors do not shrink it (#301); other concurrent READERS do")
+	fl.Float64Var(&f.coverageMin, "prefetch-coverage-min", 0, "EXPERIMENTAL (#316): override the #221 coverage threshold. A handle establishes readahead only when its trailing 16 reads cover at least this fraction of their own byte span; below it the handle is held provisional and prefetches NOTHING. The default 0.5 comes from one characterization (streams >= 0.89, scattered walks <= 0.07) and does not account for concurrent readers of ONE object: the shared kernel page cache serves each handle's siblings' reads, so a handle advancing in order sees coverage near 1/N and never establishes -- 243x slower at 16 readers, with byte amplification of 1.001. Lowering this admits those handles at the cost of also admitting genuinely scattered walks, which over-fetch (4.76x measured on a FITS cutout). 0 uses the default")
 	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "EXPERIMENTAL (#256): bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (~223 blocks at 50 Gbps). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that tiles a slab and jumps never earns it. 0 disables (default)")
 	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex. Measured cost at 48 MPI ranks over ~60k traced reads: +0.5-1.6% wall, so the lock is negligible below ~10^5 reads/run; size the trace file for one row per read")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
@@ -458,6 +460,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		DisableFooterTier2:     !f.footerTier2,
 		MaxReadahead:           f.maxReadahead,
 		ReadaheadEvidenceRatio: f.readaheadEvidence,
+		CoverageMin:            f.coverageMin,
 		PFTracePath:            f.pfTrace,
 		SiblingWindow:          f.siblingWindow,
 		SiblingReadahead:       f.siblingRead,

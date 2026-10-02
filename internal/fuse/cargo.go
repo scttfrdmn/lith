@@ -46,6 +46,7 @@ func (f *rawFS) cargoReadahead(h *fileHandle, p cargoPart, chunkOff int64) {
 	if obs.streamDelta != 0 {
 		f.streamingHandles.Add(obs.streamDelta)
 	}
+	f.met.PrefetchCoverage(obs.covDelta, obs.covHeldDelta)
 	for _, pb := range obs.dispatch {
 		pb := pb
 		go f.store.Prefetch(f.ctx, p.key, pb, p.uncompTotal)

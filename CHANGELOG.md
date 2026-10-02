@@ -109,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--prefetch-coverage-min`: the #221 coverage threshold, as a knob**
+  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Experimental, default unchanged.
+
+  The shipping `0.5` comes from one characterization (streams ≥ 0.89, scattered walks ≤ 0.07)
+  and does not account for concurrent readers of **one** object: `FOPEN_KEEP_CACHE` shares the
+  inode page cache, so each handle's siblings' reads never reach lith and its own coverage is
+  ~`1/N`. Establishment therefore dies between 2 and 4 concurrent readers — 243× slower at 16,
+  with byte amplification of 1.001.
+
+  Lowering it admits those handles and also admits genuinely scattered walks, which over-fetch
+  (4.76× on a FITS cutout, #222). No setting is right for both, which is why it is a flag and
+  not a new default. Added so the threshold can be measured at zero cost rather than requiring
+  a patched build.
+
 - **`lith_prefetch_low_coverage_total`: the counter that makes a non-establishing handle
   explicable** ([#316](https://github.com/scttfrdmn/lith/issues/316)). Reads the #221 coverage
   gate forced Random. `Prefetcher.LowCoverage()` has existed since #221 and was never wired to
@@ -224,6 +238,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question with a much larger blast radius, tracked separately.
 
 ### Fixed
+
+- **The coverage-gate counters are live, and the one that matters now exists**
+  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Two defects in the counter added one
+  day earlier, both found by an external 48-rank run reading the code:
+
+  1. **It was folded in once per handle at `Release`, so it was useless on a running job.** It
+     read 0 in every 2 Hz sample through the whole run and only appeared (527, 522) in the
+     final scrape, after the job was killed and its handles closed. A workload that holds its
+     handles open for the duration — the normal shape there — could never see the defect it
+     exists to show. Now incremented per read.
+  2. **The rejection that *is* #316 was counted nowhere.** `lowCoverage` increments only on the
+     seek path; a handle making contiguous progress and refused a window takes a different
+     branch, and `deEstablish()` counts only an establishment that existed — these handles are
+     refused while still provisional. So the purest #316 cell incremented **zero** counters.
+
+  New `lith_prefetch_coverage_held_total` covers it, and the pairing is the diagnostic: held
+  rising while `low_coverage_total` stays flat is contiguous progress denied a window (#316),
+  whereas both rising is a scattered walk and the gate working as designed. It ticks at **block
+  boundaries**, not per read.
 
 - **`--mem-cache` is documented as not bounding RSS**
   ([#314](https://github.com/scttfrdmn/lith/issues/314)). In-flight prefetch is not charged

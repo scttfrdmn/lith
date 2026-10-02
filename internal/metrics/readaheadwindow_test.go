@@ -118,14 +118,17 @@ func TestPrefetchBudgetGaugesSeparateResidentFromInFlight(t *testing.T) {
 	}
 }
 
-// #316: the coverage gate's rejections must be scrapeable.
+// #316: the coverage gate's two rejection counters, and that they are LIVE.
 //
-// Concurrent readers of ONE object have each other's reads absorbed by the shared kernel
-// page cache, so each handle sees a punctate offset stream, the #221 coverage gate forces it
-// Random, and nothing prefetches. Measured at 243x slower with byte amplification of 1.001 —
-// so bytes, requests, and `prefetch_issued_total` all look correct or better. This counter
-// and `lith_prefetch_evicted_unread_total` are the only things that move.
-func TestLowCoverageCounterIsScrapeable(t *testing.T) {
+// Concurrent readers of ONE object have each other's reads absorbed by the shared kernel page
+// cache, so each handle advances in order yet looks punctate, the #221 coverage gate refuses
+// it a window, and nothing prefetches. Measured at 243x slower with byte amplification of
+// 1.001 — so bytes, requests and prefetch_issued_total all look correct or better.
+//
+// The two counters must be separable: a SEEK landing forced Random is the gate working as
+// designed, while contiguous progress denied a window is the #316 shape. One number cannot
+// tell those apart, and the first version of this shipped with only the first.
+func TestCoverageCountersAreSeparableAndLive(t *testing.T) {
 	m := New()
 	scrape := func() string {
 		t.Helper()
@@ -134,18 +137,39 @@ func TestLowCoverageCounterIsScrapeable(t *testing.T) {
 		return rec.Body.String()
 	}
 
-	// Registered at zero, so an absent series cannot be read as a missing feature.
-	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 0") {
-		t.Error("the counter is not emitted at zero")
+	// Both registered at zero, so an absent series cannot be read as a missing feature.
+	got := scrape()
+	for _, want := range []string{
+		"lith_prefetch_low_coverage_total 0",
+		"lith_prefetch_coverage_held_total 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("not emitted at zero: %q", want)
+		}
 	}
 
-	m.PrefetchLowCoverage(430)
-	m.PrefetchLowCoverage(0) // a handle that never tripped the gate must not change it
-	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 430") {
-		t.Error("scrape missing lith_prefetch_low_coverage_total 430")
+	// THE #316 SHAPE: contiguous reads held, no seek rejections at all. The two must move
+	// independently — an external deployment needs exactly this pairing to tell "my readers
+	// share a file" from "my readers are scattered walks".
+	for i := 0; i < 430; i++ {
+		m.PrefetchCoverage(0, 1)
+	}
+	got = scrape()
+	if !strings.Contains(got, "lith_prefetch_coverage_held_total 430") {
+		t.Error("the held counter did not accumulate per read")
+	}
+	if !strings.Contains(got, "lith_prefetch_low_coverage_total 0") {
+		t.Error("a contiguous rejection wrongly incremented the SEEK counter — the two are " +
+			"not separable, and separating them is the whole point")
+	}
+
+	// A scattered walk moves the other one.
+	m.PrefetchCoverage(7, 0)
+	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 7") {
+		t.Error("the seek counter did not accumulate")
 	}
 
 	// Nil-safe, like every other recorder here: a mount without --metrics must not panic.
 	var nilM *Metrics
-	nilM.PrefetchLowCoverage(1)
+	nilM.PrefetchCoverage(1, 1)
 }
