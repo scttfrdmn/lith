@@ -47,33 +47,63 @@ func newWindowFS(t *testing.T) *rawFS {
 // numbers are the division, written out.
 func TestPerHandleWindowAcrossStreamCounts(t *testing.T) {
 	f := newWindowFS(t)
+
+	// An ESTABLISHED caller is already in the count and divides by it exactly.
 	for _, tc := range []struct {
 		streams int64
 		want    int64
 		why     string
 	}{
-		{0, 223, "no stream has established yet; the first reader gets everything"},
 		{1, 223, "492/1 = 492, capped by --max-readahead"},
 		{2, 223, "492/2 = 246, still above the cap"},
 		{3, 164, "492/3 = 164, the first count the budget binds"},
 		{8, 61, "492/8 = 61"},
-		{16, 30, "492/16 = 30 — the external report's 16-reader cell"},
+		{16, 30, "492/16 = 30 — the external report's 16-reader cell, measured exactly"},
 		{164, 3, "492/164 = 3, the last count above the floor"},
 		{165, 2, "492/165 = 2 — THE FLOOR, one stream later"},
 		{256, 2, "floored"},
 		{10000, 2, "floored, far past it"},
 	} {
 		f.streamingHandles.Store(tc.streams)
-		if got := f.perHandleWindow(); got != tc.want {
-			t.Errorf("%d streams: window = %d, want %d (%s)", tc.streams, got, tc.want, tc.why)
+		if got := f.perHandleWindow(true); got != tc.want {
+			t.Errorf("%d streams, established caller: window = %d, want %d (%s)",
+				tc.streams, got, tc.want, tc.why)
 		}
+	}
+
+	// An ESTABLISHING caller is not yet in the count, so it divides by the population it is
+	// about to join. perHandleWindow runs before the Observe that establishes it, and without
+	// this a sole establishing reader divides by 1 and takes the whole budget.
+	for _, tc := range []struct {
+		streams int64
+		want    int64
+		why     string
+	}{
+		{0, 223, "492/1 — alone, and it is about to be the one"},
+		{2, 164, "492/3 = 164, not 492/2: it is joining two, making three"},
+		{15, 30, "492/16 = 30 — the sixteenth reader sees what sixteen readers get"},
+		{164, 2, "492/165 = 2 — the floor arrives one stream earlier than for a member"},
+	} {
+		f.streamingHandles.Store(tc.streams)
+		if got := f.perHandleWindow(false); got != tc.want {
+			t.Errorf("%d streams, establishing caller: window = %d, want %d (%s)",
+				tc.streams, got, tc.want, tc.why)
+		}
+	}
+
+	// The +1 must not tighten the steady state: a mount of N established readers divides by
+	// N, not N+1. This is the thing that makes the +1 safe to add.
+	f.streamingHandles.Store(16)
+	if member, joiner := f.perHandleWindow(true), f.perHandleWindow(false); member != 30 || joiner != 28 {
+		t.Errorf("at 16 streams: member = %d (want 30 = 492/16), joiner = %d (want 28 = 492/17)",
+			member, joiner)
 	}
 
 	// The 111x collapse, reproduced: nothing the operator configured changes between these.
 	f.streamingHandles.Store(1)
-	alone := f.perHandleWindow()
+	alone := f.perHandleWindow(true)
 	f.streamingHandles.Store(256)
-	crowded := f.perHandleWindow()
+	crowded := f.perHandleWindow(true)
 	if alone/crowded < 100 {
 		t.Errorf("window at 1 stream = %d, at 256 = %d (%.0fx): the collapse this guards "+
 			"against is not reproduced, so the fixture no longer exercises it",
@@ -94,7 +124,7 @@ func TestOpenDescriptorsDoNotShrinkTheWindow(t *testing.T) {
 	for i := 1; i <= 288; i++ {
 		f.handles[uint64(i)] = &fileHandle{}
 	}
-	if got := f.perHandleWindow(); got != 223 {
+	if got := f.perHandleWindow(true); got != 223 {
 		t.Errorf("1 stream behind 288 open descriptors: window = %d, want 223 — the "+
 			"descriptor count is back in the divisor", got)
 	}
@@ -134,7 +164,7 @@ func TestPerHandleWindowWithoutABudget(t *testing.T) {
 		t.Fatalf("fixture: budgetBlocks = %d, want 0 — the no-budget path is not being exercised", got)
 	}
 	f.streamingHandles.Store(256)
-	if got := f.perHandleWindow(); got != 223 {
+	if got := f.perHandleWindow(true); got != 223 {
 		t.Errorf("256 streams, no budget: window = %d, want 223 (no division applies)", got)
 	}
 }

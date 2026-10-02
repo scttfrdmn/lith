@@ -655,7 +655,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 			// objects win. Readahead operates on the chunk's uncompressed stream.
 			p := h.cargo[0]
 			base := p.archiveOff / f.blockSize
-			for _, blk := range h.pf.open(f.perHandleWindow()) {
+			for _, blk := range h.pf.open(f.perHandleWindow(false)) {
 				b := base + blk
 				go f.store.Prefetch(f.ctx, p.key, b, p.uncompTotal)
 			}
@@ -712,7 +712,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// otherwise sweep every column. A streaming footer handle keeps the window
 	// (it wants the whole file), like every non-footer handle.
 	if fi.Size > f.partsThreshold() && (h.footerKind == footer.FormatNone || h.footerStream) {
-		for _, pb := range h.pf.open(f.perHandleWindow()) {
+		for _, pb := range h.pf.open(f.perHandleWindow(false)) {
 			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
 		}
 	}
@@ -849,7 +849,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// Observe. An offline replay that does not know it runs a different program —
 		// measured at 2.70x more dispatch than the mount, on a capture where the mount
 		// never exceeded 17 blocks and the replay assumed 223 (#267). So it is recorded.
-		maxWin := f.perHandleWindow()
+		maxWin := f.perHandleWindow(h.pf.isStreaming())
 		obs := h.pf.observe(blk, off, end, maxWin, &f.pfSeq)
 		if obs.streamDelta != 0 {
 			f.streamingHandles.Add(obs.streamDelta)
@@ -880,7 +880,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		f.tracePF(pfTraceRow{
 			seq: f.pfSeq.Add(1), fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
 			off: off, length: end - off, blk: blk, gap: h.pf.gapFrom(off), path: path, before: st, after: st,
-			maxWindow: f.perHandleWindow(), window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
+			maxWindow: f.perHandleWindow(h.pf.isStreaming()), window: h.pf.window(), dispatched: 0, peak: h.pf.peakWindow(),
 		})
 	}
 	return res, fuse.OK
@@ -1293,7 +1293,10 @@ func (f *rawFS) OpenHandles() int64 {
 
 // EffectiveWindow is the readahead depth a handle is currently given, which is NOT
 // --max-readahead whenever the budget or the handle count binds first (#297, #298).
-func (f *rawFS) EffectiveWindow() int64 { return f.perHandleWindow() }
+//
+// Reported as an ESTABLISHED handle's share (selfCounted), because that is the depth a
+// steady-state reader runs at; an establishing handle briefly sees one less.
+func (f *rawFS) EffectiveWindow() int64 { return f.perHandleWindow(true) }
 
 // StreamingHandles is the number of handles the detector is currently prefetching for --
 // established sequential streams. It is perHandleWindow's divisor (#301). The gap between
@@ -1305,7 +1308,7 @@ func (f *rawFS) StreamingHandles() int64 { return f.streamingHandles.Load() }
 // --max-readahead, capped by the share of the prefetch budget this handle is entitled to,
 // floored at 2. See the body for why there is a share and why its divisor counts streams
 // rather than descriptors (#301).
-func (f *rawFS) perHandleWindow() int64 {
+func (f *rawFS) perHandleWindow(selfCounted bool) int64 {
 	maxW := f.maxReadahead()
 	budgetBlocks := f.budgetBlocks()
 	if budgetBlocks <= 0 {
@@ -1340,12 +1343,32 @@ func (f *rawFS) perHandleWindow() int64 {
 	//
 	// Two consequences worth knowing, both bounded:
 	//
-	//  1. A handle computes its window from a count that does not yet include itself, since
-	//     perHandleWindow runs before the Observe that establishes it. Self-corrects on the
-	//     next read, and cannot under-charge persistently.
-	//  2. N readers starting together each see a near-zero count and so a full window. The
-	//     geometric ramp is what bounds the resulting burst: a handle's first dispatch is 2
-	//     blocks, not maxReadahead, so the count has settled long before any window is deep.
+	// THE DIVISOR LAGS, and that cost something measurable. It is +1 for exactly that reason:
+	// perHandleWindow runs BEFORE the Observe that establishes the caller, so a handle sizing
+	// itself must count the population it is about to join, not the one it can see. Without
+	// the +1 a sole establishing reader divides by 1 and takes everything; with sixteen
+	// starting together, each divides by a count still near zero.
+	//
+	// The +1 does not make the transient safe, and the claim that once stood here -- that
+	// "the geometric ramp bounds the burst, because a first dispatch is 2 blocks and not
+	// maxReadahead" -- was WRONG, in the specific way an external measurement was asked to
+	// contradict and did. It bounds the first dispatch and not the ramp's integral: sixteen
+	// ramps running together reached 12.944 GB committed within 6 s, against a 4.128 GB budget
+	// (3.14x) and an 8.256 GB memory tier (1.57x). Blocks were then evicted before their
+	// reader arrived, returned as synchronous demand reads, and whoever lost that first race
+	// kept losing it -- a fairness collapse rather than a slowdown, with 13 of 16 readers
+	// finishing on schedule and 3 crawling to 106 s. Raising ONLY the tier, every window and
+	// the realized burst bit-identical, recovered 3.05x.
+	//
+	// So an aggregate bound is missing and the +1 is not it. The regime is predicted by
+	//
+	//	N_crit = mem_cache / (0.2 x nic_bytes_per_sec)  =  1.25 x RAM / nic_bytes_per_sec
+	//
+	// at stock defaults, which FALLS as the NIC grows relative to RAM: a 15 Gbps box with
+	// 33 GB clears it at N=22, while c8gn.48xlarge is at 6.4 and m8gn.48xlarge at 12.8 with
+	// 192 vCPU to fill them. Tracked on #313 with the candidate repairs; deliberately not
+	// guessed at here, because the last allocator change made on argument rather than
+	// measurement regressed this path by 11x.
 	//
 	// KNOWN LIMITATION. A handle that establishes, reads a little, and then idles for the
 	// rest of the run keeps its share until it closes or the detector collapses it to Random.
@@ -1354,6 +1377,14 @@ func (f *rawFS) perHandleWindow() int64 {
 	// that is worth the churn depends on an access shape this project does not have in hand,
 	// so it is a question on #301 rather than a mechanism guessed at here.
 	n := f.streamingHandles.Load()
+	if !selfCounted {
+		// The caller is not yet in the count, so it must divide by the population it is
+		// ABOUT to join -- otherwise a sole establishing reader divides by 1 and takes
+		// everything. An already-established caller must NOT add one: it is in the total
+		// already, and adding anyway would tighten every steady-state share (16 streams
+		// would get 492/17 = 28 blocks where the correct share is 492/16 = 30).
+		n++
+	}
 	if n < 1 {
 		n = 1
 	}

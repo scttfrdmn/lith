@@ -69,7 +69,7 @@ func TestNeverEstablishedHandleIsNeverCounted(t *testing.T) {
 	if d := w.releaseStreaming(); d != 0 {
 		t.Errorf("closing a never-read handle returned %d, want 0", d)
 	}
-	if w.streaming {
+	if w.streaming.Load() {
 		t.Error("a never-read handle reports itself as streaming")
 	}
 }
@@ -131,13 +131,13 @@ func TestStreamDeltaUnderConcurrentReadsOnOneHandle(t *testing.T) {
 	// Whatever state the interleaving produced, the count must AGREE with it: 1 if the
 	// handle is streaming, 0 if not. Any other value is a lost or duplicated delta.
 	want := int64(0)
-	if w.streaming {
+	if w.streaming.Load() {
 		want = 1
 	}
 	if got := count.Load(); got != want {
 		t.Errorf("after 512 concurrent reads on one handle: count = %d, want %d "+
 			"(streaming=%v) — a delta was lost or double-reported",
-			got, want, w.streaming)
+			got, want, w.streaming.Load())
 	}
 	count.Add(w.releaseStreaming())
 	if got := count.Load(); got != 0 {
