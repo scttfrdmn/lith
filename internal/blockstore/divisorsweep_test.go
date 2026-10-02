@@ -14,27 +14,28 @@ import (
 	"github.com/scttfrdmn/lith/internal/s3client/fake"
 )
 
-// #301: committed prefetch bytes must never exceed --prefetch-budget, however aggressively
-// the caller dispatches.
+// #301: does the prefetch-budget divisor earn its cost?
 //
-// This test began as "does the divisor earn its cost?" and that question is answered, in
-// bench/prefetch-divisor: rationing is essential (removing it costs 13.8-22.4x wall and
-// 4.2-5.2x the bytes with 81-92% of prefetch evicted unread) but the divisor rationed by
-// DESCRIPTOR COUNT, which over-charges by exactly that count. admitCommitted now enforces the
-// budget byte-exactly where it is measured, so the proxy is gone.
+// perHandleWindow rations readahead as clamp(budgetBlocks/openHandles, 2, maxReadahead), and
+// that over-charges by exactly the open-handle count -- committed bytes track one window
+// however many handles are charged. Replacing the division with byte-exact admission was
+// tried and REVERTED (see the divisor comment in internal/fuse/fs.go): it starved concurrent
+// readers by up to 11x, because the division is an ALLOCATION DISCIPLINE and not merely a
+// total. 16 x 30 blocks covers sixteen readers shallowly; 2 x 223 + 14 x 0 commits the same
+// total and covers two.
 //
-// What the two arms are for now: they dispatch very differently -- `divisor` advances a
-// frontier budgetBlocks/N ahead as the old per-handle window did, `neutral` dispatches the
-// whole budget ahead at once -- and the invariant must hold in both. That is the point of
-// moving enforcement to the measured quantity: safety stops depending on the caller getting
-// its own rationing right.
+// So this guards the share. The two arms are one variable apart: `divisor` advances a
+// frontier budgetBlocks/N ahead as perHandleWindow does, `neutral` advances the whole budget
+// ahead as removing the division would permit. The divisor arm must do no worse on either of
+// #55's signals -- which is a CONTRAST, not a threshold: an absolute bound borrowed from
+// TestPrefetchBudgetNoThrash's sizing does not transfer here, as a first version showed by
+// failing in both arms.
 //
-// The #55 signals (unread evictions, re-fetch) are REPORTED rather than asserted here,
-// because this fixture runs at 2.4-3.5x production memory pressure: the fake server returns
-// instantly, so dispatch outruns consumption in a way the network cannot, and peak committed
-// sat at 109-142% of budget before admission existed where a real mount sits at 0.4-45%.
-// TestPrefetchBudgetNoThrash is the #55 gate; this is the admission gate.
-func TestPrefetchAdmissionCapsCommittedWhateverTheCaller(t *testing.T) {
+// WHAT THIS CANNOT SETTLE. The fake server returns instantly, so dispatch outruns consumption
+// in a way the network cannot, and peak committed sits ABOVE the budget here where a real
+// mount sits at 0.4-45% of it. bench/prefetch-divisor carries the real-S3 numbers and is what
+// should be quoted; this is a cheap guard on the direction.
+func TestPrefetchDivisorEarnsItsCost(t *testing.T) {
 	// Two sizes. CI runs the small one: enough readers and oversubscription to exercise
 	// admission and prove the invariant, small enough to survive `go test -race`, which
 	// OOM-killed a GitHub runner at the measurement size (exit 143) because the race
@@ -127,29 +128,60 @@ func TestPrefetchAdmissionCapsCommittedWhateverTheCaller(t *testing.T) {
 			r.evicted, r.issued, float64(r.s3Bytes)/float64(r.workingSet))
 	}
 
-	// THE INVARIANT. Peak committed must not exceed the budget in any cell. Before
-	// admitCommitted this reached 109-142% of budget in the divisor arm and up to 1067% in
-	// the neutral arm, because the per-handle window was a proxy and a proxy can be wrong in
-	// either direction. A byte-exact cap cannot be.
+	// A loose sanity bound on the DIVISOR arm at any fixture size: the shipping
+	// configuration may not evict most of what it prefetched or re-fetch half the working
+	// set. Catches a catastrophe in CI without pretending the small fixture supports a finer
+	// claim.
+	//
+	// Scoped to the divisor arm deliberately. `neutral` is the counterfactual and is
+	// expected to be bad -- at the measurement size it evicts 135 of 256 and fetches 1.527x,
+	// which is the finding rather than a regression. Asserting the bound on both arms flagged
+	// it as a failure, which is the mirror of the vacuous assertion: a true measurement
+	// reported as a defect.
 	for _, r := range table {
-		if r.peakCommit > r.budgetBytes {
-			t.Errorf("%s readers=%d arm=%s: peak committed %d exceeded the budget %d (%.1f%%) — "+
-				"admitCommitted must cap it whatever the caller dispatches",
-				r.ratio, r.readers, r.arm, r.peakCommit, r.budgetBytes,
-				100*float64(r.peakCommit)/float64(r.budgetBytes))
+		if r.arm != "divisor" {
+			continue
+		}
+		if r.issued > 0 && r.evicted*2 > r.issued {
+			t.Errorf("%s readers=%d arm=%s: evicted %d of %d issued — over half the prefetch was "+
+				"thrown away unread", r.ratio, r.readers, r.arm, r.evicted, r.issued)
+		}
+		if r.s3Bytes > r.workingSet*3/2 {
+			t.Errorf("%s readers=%d arm=%s: fetched %.3fx the working set",
+				r.ratio, r.readers, r.arm, float64(r.s3Bytes)/float64(r.workingSet))
 		}
 	}
-	// And it must actually be reached, or the fixture has stopped exercising the cap and the
-	// assertion above has gone vacuous.
-	var anyAtCap bool
-	for _, r := range table {
-		if r.peakCommit*100 >= r.budgetBytes*90 {
-			anyAtCap = true
-		}
+
+	// THE CONTRAST needs the measurement fixture and is skipped without it. At the CI size
+	// the objects are 8 blocks, so `ahead` covers the whole object in BOTH arms and the
+	// difference is noise -- asserting it there failed, which is the vacuous-assertion trap
+	// in its other form: a claim the fixture cannot produce. bench/prefetch-divisor carries
+	// the real-S3 version, and that is what should be quoted.
+	if os.Getenv("LITH_SWEEP_FULL") == "" {
+		return
 	}
-	if !anyAtCap {
-		t.Error("no cell drove committed within 10% of the budget: the fixture no longer " +
-			"exercises admission, so the cap assertion proves nothing")
+	byCell := map[string]result{}
+	for _, r := range table {
+		byCell[r.ratio+"/"+r.arm+"/"+strconv.Itoa(r.readers)] = r
+	}
+	for _, ratio := range ratios {
+		for _, readers := range readerCounts {
+			d := byCell[ratio.name+"/divisor/"+strconv.Itoa(readers)]
+			n := byCell[ratio.name+"/neutral/"+strconv.Itoa(readers)]
+			if d.issued == 0 || n.issued == 0 {
+				t.Fatalf("%s readers=%d: missing a cell", ratio.name, readers)
+			}
+			if d.evicted > n.evicted {
+				t.Errorf("%s readers=%d: the divisor arm evicted MORE unread prefetch than neutral "+
+					"(%d vs %d) — the share has stopped protecting anything",
+					ratio.name, readers, d.evicted, n.evicted)
+			}
+			if d.s3Bytes > n.s3Bytes {
+				t.Errorf("%s readers=%d: the divisor arm re-fetched more than neutral (%.3fx vs %.3fx)",
+					ratio.name, readers, float64(d.s3Bytes)/float64(d.workingSet),
+					float64(n.s3Bytes)/float64(n.workingSet))
+			}
+		}
 	}
 }
 

@@ -25,16 +25,12 @@ import (
 //     Two corrections to what this used to say, both from #301. It is NOT "a byte budget
 //     for prefetch not yet demanded": these callers Reserve before a fetch and Release
 //     when it COMPLETES (see rawFS.prefetchWhole, "releasing the reservation when they
-//     complete"), so `reserved` measures bytes being fetched, not bytes held unread. And
-//     per-handle sequential readahead no longer "sizes its window from Budget()" — it is
-//     admitted against measured committed bytes in BlockStore.admitCommitted, which is
-//     byte-exact, where sizing from Budget() meant dividing by the open-descriptor count
-//     and over-charging by exactly that count.
-//
-//     So there are two disciplines here deliberately: fetch-scoped reservations for the
-//     bounded up-front fetches, and consumption-scoped admission for the unbounded
-//     windowed path. They bound different things and converging them would need the four
-//     Reserve callers to hold until consumption, which nothing currently needs.
+//     complete"), so `reserved` measures bytes being fetched, not bytes held unread. Per-handle
+//     sequential readahead DOES still size its window from Budget(), by dividing it by the
+//     open-handle count — which over-charges by exactly that count (#301). Replacing that
+//     division with byte-exact admission was tried and reverted: the division is an
+//     allocation discipline, not merely a total, and removing it starved concurrent readers
+//     by up to 11x. The open fix is to that divisor's input, not to this interface.
 //
 //   - Neighborhood: the next keys in Index order under a file's directory, so a
 //     directory being walked in key order can be read ahead across siblings.
