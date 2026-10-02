@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The mount says when readahead is at the floor, and how many descriptors it takes to get
+  there** ([#301](https://github.com/scttfrdmn/lith/issues/301)). The `prefetch bounds` line
+  gains `full_window_descriptors` (how many concurrent open descriptors can each hold the
+  whole effective window) and `floor_at_descriptors` (the count at which every reader is down
+  to the 2-block floor). At the shipping default on a 33 GB box those are **2** and **165**.
+
+  More useful than either: a one-per-mount `WARN` emitted at the moment a share actually hits
+  the floor. The prediction needs a descriptor count nobody can know at startup, because
+  other processes contribute to it — the workload that found #301 was at the floor by way of
+  48 ranks × ~6 files it did not account for, read at 186 MB/s where 1293 was available, and
+  had nothing in the log saying so. The runtime warning needs no prediction.
+
+  The floor is a share of **2**, not a share below 2: integer division reaches exactly 2 one
+  descriptor before the clamp starts applying. A cross-check against the divisor's own
+  arithmetic caught that off-by-one, which would have reported every crossing one count late.
+
 - **`lith_prefetch_committed_bytes` and `lith_prefetch_budget_bytes`: what the prefetch
   budget actually bounds** ([#301](https://github.com/scttfrdmn/lith/issues/301)).
   `--prefetch-budget` is about bytes prefetch has committed and nothing has consumed, and

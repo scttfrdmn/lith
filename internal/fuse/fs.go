@@ -228,6 +228,10 @@ type rawFS struct {
 	pfSeq     atomic.Int64 // mount-wide decision sequence for the trace (#267)
 
 	// missMu/missSeen dedup the ENOENT-lookup breadcrumb (#240): the first time a
+	// floorWarned caps the "readahead at the floor" warning at one line per mount. The
+	// condition is per-read and would otherwise flood (#301).
+	floorWarned atomic.Bool
+
 	// lookup resolves to a path not in the index, log it at INFO so a prefix-
 	// scoped mount that is silently short a key says which one. Deduped per
 	// distinct path and capped so a probe-heavy app cannot flood the log.
@@ -1321,29 +1325,52 @@ func (f *rawFS) perHandleWindow() int64 {
 	if n < 1 {
 		n = 1
 	}
-	share := budgetBlocks / n
-	if share < 2 {
-		share = 2
-	}
-	if share > maxW {
-		share = maxW
+	share, atFloor := shareClamp(budgetBlocks/n, maxW)
+	if atFloor {
+		// WARN ONCE, at the moment it actually happens. The reporting workload ran both
+		// production mounts here and could not tell: the mount logged the configured depth
+		// and `floor_at_descriptors` only PREDICTS the crossing, from a descriptor count
+		// nobody can know at startup because other processes contribute to it. This needs
+		// no prediction -- the share is 2 right now.
+		if f.floorWarned.CompareAndSwap(false, true) {
+			slog.Warn("readahead is at the 2-block floor: the prefetch budget is divided "+
+				"across more open descriptors than it can fund",
+				"open_descriptors", n,
+				"budget_blocks", budgetBlocks,
+				"max_readahead", maxW,
+				"hint", "--prefetch-budget is the numerator of each reader's share; raise it. "+
+					"The descriptor count includes files held open by other processes and "+
+					"descriptors never read (#301).")
+		}
 	}
 	return share
 }
 
-// windowForBudget clamps a configured readahead window to what the prefetch budget could
-// hold, floored at the 2-block minimum a handle always gets. Pure, so the clamp is testable
-// without constructing a store; the budget is consulted as a CEILING only -- a handle should
-// not be handed a window larger than the whole budget could ever hold, even while the budget
-// is momentarily empty.
-func windowForBudget(maxReadahead, budgetBlocks int64) int64 {
-	if budgetBlocks > 0 && budgetBlocks < maxReadahead {
-		maxReadahead = budgetBlocks
+// shareClamp bounds one handle's share of the prefetch budget to [2, maxReadahead] and
+// reports whether the 2-block FLOOR is what bound it -- the condition #301 is about, where
+// a mount reads at a fraction of its link because the budget is split across more open
+// descriptors than it can fund.
+//
+// Pure, so both the clamp and the floor detection are testable without constructing a
+// store or a mount. It replaced windowForBudget, which clamped a window against the whole
+// budget rather than a share: that was perHandleWindow's body during the brief period the
+// division was removed (reverted, see above), and afterwards nothing but its own test
+// called it.
+//
+// The floor is share <= 2, not share < 2. Integer division reaches a share of exactly 2
+// one descriptor before the clamp starts applying, so testing only the clamped case would
+// miss the first descriptor count at which the mount is actually at the floor.
+func shareClamp(share, maxReadahead int64) (int64, bool) {
+	if share <= 2 {
+		return 2, true
 	}
-	if maxReadahead < 2 {
-		return 2
+	if share > maxReadahead {
+		if maxReadahead < 2 {
+			return 2, true
+		}
+		return maxReadahead, false
 	}
-	return maxReadahead
+	return share, false
 }
 
 // budgetBlocks is the mount-wide prefetch budget expressed in readahead blocks.
