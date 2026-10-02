@@ -801,28 +801,25 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	if c1 > lastChunk {
 		c1 = lastChunk
 	}
-	// Mark not-yet-cached chunks as prefetched (unread) so a demand read can credit the
-	// hit and eviction can prefer already-read chunks over them (#55) -- and ADMIT each
-	// against the measured committed total as we go (#301).
+	// Mark not-yet-cached chunks as prefetched (unread) so a demand read can credit the hit
+	// and eviction can prefer already-read chunks over them (#55).
 	//
-	// This path used to not gate at all: the comment here said "the aggregate readahead is
-	// bounded by the per-handle window the FUSE layer derives from the prefetch budget and
-	// the live handle count", i.e. the divisor rationed and the store trusted it. The
-	// divisor's rationing is real and necessary -- removing it costs 13.8-22.4x wall and
-	// 4.2-5.2x the bytes, with 81-92% of prefetch evicted unread (bench/prefetch-divisor) --
-	// but it rations by DESCRIPTOR COUNT, which over-charges by exactly that count:
-	// committed tracks one window however many handles are charged, so a mount at 256
-	// descriptors is charged 4295 MB while holding 17.8 MB and is throttled 6-10x for it.
+	// NOTHING IS GATED HERE, deliberately. Admission against the measured committed total was
+	// added and then reverted (#301, ceeb2b7 -> #309); the accounting stays because the gauges
+	// built on it are what made two separate defects visible, but the refusal is gone. See the
+	// note at the Add below for the two mechanisms that killed it.
 	//
-	// Admitting on the measured total is a strict generalization. It coincides with the
-	// divisor where the divisor is right -- on 16 concurrent readers over a tier 7.3x
-	// oversubscribed, the cap is 4.128 GB against the divisor's realized 4.027 GB, within
-	// 2.4% -- and it does not fire at all where the divisor is wrong, because idle
-	// descriptors commit nothing.
+	// Two code paths DO bound the burst, and they are easy to miss when reasoning about it --
+	// an external N_crit model that omitted both over-predicted collapse in 4 of 4 cells:
 	//
-	// Admission is a prefix: chunks are taken in order and the first refusal stops the
-	// block, so what gets fetched is always the nearest contiguous run. A chunk already
-	// cached costs no commitment and never blocks the prefix.
+	//   - EOF: the c1 > lastChunk clamp just above means no reader commits past the end of its
+	//     own object. A handle on a 3.78 GB object cannot commit a 22.5 GB window.
+	//   - DEDUP: the bs.prefetched.Load check below skips a chunk another dispatch already
+	//     committed, so N handles streaming ONE object commit it once between them.
+	//
+	// So the aggregate start burst is the sum over DISTINCT streamed objects of
+	// min(window bytes, budget, objSize) -- not N x window. Measured: 8 readers on a fat NIC
+	// peaked at 29.81 GB against the 8 objects summed size of 29.95 GB, a 0.5% difference.
 	hi := c0 - 1
 	for ci := c0; ci <= c1; ci++ {
 		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, maskForLen(chunkLenOf(ci, objSize))) {
@@ -934,6 +931,34 @@ func (bs *BlockStore) dropPrefetched(ck string) bool {
 // Counted from DISPATCH, so it includes bytes whose GET is still in flight. Not a
 // resident-memory figure.
 func (bs *BlockStore) PrefetchCommittedBytes() int64 { return bs.pfCommittedBytes.Load() }
+
+// PrefetchUnreadResidentBytes is the bytes HELD IN THE MEMORY TIER that nothing has read
+// (#313). Zero when there is no memory tier.
+//
+// This is the quantity eviction-before-read is about, and it is NOT
+// PrefetchCommittedBytes. That one counts from dispatch, so it sums resident-unread AND
+// still-in-flight; only the resident half can be evicted, and only eviction of an unread
+// chunk costs a GET and a synchronous stall. An external measurement found committed/tier
+// separating clean from collapsed cells at 1.20 vs 1.21 across two boxes 12x apart in RAM --
+// a suspiciously tight edge for a ratio whose numerator includes bytes that cannot evict
+// anything. It also could not explain why committed plateaued near 1.55x tier.
+//
+// Both resolve if committed ~= unread-resident + in-flight: unread-resident cannot exceed
+// the tier by construction, so the plateau is the tier plus whatever is in flight, and the
+// real condition for eviction-before-read is unread-resident approaching tier CAPACITY --
+// at which point every arriving chunk must evict an unread one, because there is nothing
+// else left to take. That is a mechanism rather than a fitted threshold, and this gauge is
+// what lets it be tested.
+//
+// Also immune to a known inaccuracy in the committed figure: commitment is never released
+// when a handle closes (rawFS.Release), so committed ratchets on a mount whose working set
+// fits the tier. This is read from the tier itself and cannot ratchet.
+func (bs *BlockStore) PrefetchUnreadResidentBytes() int64 {
+	if bs.mem == nil {
+		return 0
+	}
+	return bs.mem.UnreadBytes()
+}
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a
 // chunk that prefetch had fetched, clears its unread flag, and releases its

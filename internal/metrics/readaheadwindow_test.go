@@ -74,3 +74,78 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		}
 	}
 }
+
+// #313: the three prefetch-budget gauges, and specifically that the resident-unread one is
+// SEPARATELY observable from committed.
+//
+// An external measurement found committed/tier separating clean from collapsed runs at 1.20
+// vs 1.21 across two boxes 12x apart in RAM, and could not explain why committed plateaued
+// near 1.55x tier. Both resolve if committed = resident-unread + in-flight: only the resident
+// half can evict anything, and it cannot exceed the tier by construction. These must therefore
+// be scrapeable as two numbers, not one — a deployment needs to subtract them.
+func TestPrefetchBudgetGaugesSeparateResidentFromInFlight(t *testing.T) {
+	m := New()
+	committed, limit, unread := 13.078e9, 4.128e9, 8.0e9
+	m.RegisterPrefetchBudget(
+		func() float64 { return committed },
+		func() float64 { return limit },
+		func() float64 { return unread },
+	)
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	got := rec.Body.String()
+
+	for _, want := range []string{
+		"lith_prefetch_committed_bytes 1.3078e+10",
+		"lith_prefetch_budget_bytes 4.128e+09",
+		"lith_prefetch_unread_resident_bytes 8e+09",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape missing %q", want)
+		}
+	}
+
+	// The gauges must not be the same series under two names: the whole point is that
+	// committed exceeds resident-unread by the bytes in flight, and that difference is what
+	// a deployment reads to tell "the tier is full of unread prefetch" from "a lot is in
+	// flight and the tier is fine".
+	if committed <= unread {
+		t.Fatal("fixture: committed must exceed resident-unread for this to test anything")
+	}
+	if strings.Contains(got, "lith_prefetch_unread_resident_bytes 1.3078e+10") {
+		t.Error("the resident-unread gauge is reporting the committed total")
+	}
+}
+
+// #316: the coverage gate's rejections must be scrapeable.
+//
+// Concurrent readers of ONE object have each other's reads absorbed by the shared kernel
+// page cache, so each handle sees a punctate offset stream, the #221 coverage gate forces it
+// Random, and nothing prefetches. Measured at 243x slower with byte amplification of 1.001 —
+// so bytes, requests, and `prefetch_issued_total` all look correct or better. This counter
+// and `lith_prefetch_evicted_unread_total` are the only things that move.
+func TestLowCoverageCounterIsScrapeable(t *testing.T) {
+	m := New()
+	scrape := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	// Registered at zero, so an absent series cannot be read as a missing feature.
+	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 0") {
+		t.Error("the counter is not emitted at zero")
+	}
+
+	m.PrefetchLowCoverage(430)
+	m.PrefetchLowCoverage(0) // a handle that never tripped the gate must not change it
+	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 430") {
+		t.Error("scrape missing lith_prefetch_low_coverage_total 430")
+	}
+
+	// Nil-safe, like every other recorder here: a mount without --metrics must not panic.
+	var nilM *Metrics
+	nilM.PrefetchLowCoverage(1)
+}

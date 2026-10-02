@@ -48,6 +48,15 @@ type mem2Q struct {
 	ghost  map[string]*list.Element // key -> element in out
 	pins   map[string]int           // key -> pin count (not evictable while > 0)
 	unread map[string]struct{}      // prefetched, not yet demand-read: evicted last (#55)
+	// unreadBytes is the live sum of len(data) over the keys in `unread` -- the bytes of this
+	// shard that are RESIDENT and that nothing has read (#313).
+	//
+	// Distinct from BlockStore.pfCommittedBytes, which counts from dispatch and so conflates
+	// resident-unread with still-in-flight. Only the resident part can be evicted, so only
+	// the resident part can cause eviction-before-read, which is the measured proximate cause
+	// of the concurrent-start collapse. Maintained incrementally rather than summed on demand
+	// because a scan would be O(resident) under this shard's lock; the invariant is tested.
+	unreadBytes int64
 
 	ghostCap int // entry cap for the ghost list
 
@@ -87,8 +96,11 @@ func (c *mem2Q) MarkUnread(key string) {
 		return
 	}
 	c.mu.Lock()
-	if _, ok := c.table[key]; ok {
-		c.unread[key] = struct{}{}
+	if el, ok := c.table[key]; ok {
+		if _, dup := c.unread[key]; !dup {
+			c.unread[key] = struct{}{}
+			c.unreadBytes += int64(len(el.Value.(*entry).data))
+		}
 	}
 	c.mu.Unlock()
 }
@@ -100,7 +112,12 @@ func (c *mem2Q) ClearUnread(key string) {
 		return
 	}
 	c.mu.Lock()
-	delete(c.unread, key)
+	if _, ok := c.unread[key]; ok {
+		delete(c.unread, key)
+		if el, present := c.table[key]; present {
+			c.unreadBytes -= int64(len(el.Value.(*entry).data))
+		}
+	}
 	c.mu.Unlock()
 }
 
@@ -204,11 +221,23 @@ func (c *mem2Q) merge(key string, data []byte, filled uint16, unread bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Before evict(), so the chunk being filled is never an eligible "already-read" victim.
+	// The byte total follows the same ordering: it must reflect this chunk before evict()
+	// can drop something on account of it.
+	_, wasUnread := c.unread[key]
 	if unread {
 		c.unread[key] = struct{}{}
 	}
 	if el, ok := c.table[key]; ok {
 		e := el.Value.(*entry)
+		if _, isUnread := c.unread[key]; isUnread {
+			// Resident already: adjust by the length delta, or add the whole new length if
+			// this merge is what made it unread.
+			if wasUnread {
+				c.unreadBytes += int64(len(data)) - int64(len(e.data))
+			} else {
+				c.unreadBytes += int64(len(data))
+			}
+		}
 		c.size += int64(len(data)) - int64(len(e.data))
 		e.data = data
 		e.filled |= filled
@@ -229,7 +258,17 @@ func (c *mem2Q) merge(key string, data []byte, filled uint16, unread bool) {
 		c.table[key] = c.in.PushFront(e)
 	}
 	c.size += int64(len(data))
+	if _, isUnread := c.unread[key]; isUnread {
+		c.unreadBytes += int64(len(data))
+	}
 	c.evict()
+}
+
+// UnreadBytes is the resident bytes nothing has read: see the field comment.
+func (c *mem2Q) UnreadBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.unreadBytes
 }
 
 // evict enforces the one bound this cache has: total capacity. See the type comment for why
@@ -287,7 +326,7 @@ func (c *mem2Q) evictMainEl(el *list.Element, unread bool) {
 	c.main.Remove(el)
 	delete(c.table, e.key)
 	c.size -= int64(len(e.data))
-	c.dropUnread(e.key, unread)
+	c.dropUnread(e.key, unread, int64(len(e.data)))
 }
 
 func (c *mem2Q) evictInEl(el *list.Element, unread bool) {
@@ -295,7 +334,7 @@ func (c *mem2Q) evictInEl(el *list.Element, unread bool) {
 	c.in.Remove(el)
 	delete(c.table, e.key)
 	c.size -= int64(len(e.data))
-	c.dropUnread(e.key, unread)
+	c.dropUnread(e.key, unread, int64(len(e.data)))
 	// Record a ghost (key only) so a later reference promotes it to main.
 	c.ghost[e.key] = c.out.PushFront(&entry{key: e.key})
 	for c.out.Len() > c.ghostCap {
@@ -305,12 +344,15 @@ func (c *mem2Q) evictInEl(el *list.Element, unread bool) {
 	}
 }
 
-// dropUnread clears an evicted key's unread flag and signals the thrash metric.
-func (c *mem2Q) dropUnread(key string, unread bool) {
+// dropUnread clears an evicted key's unread flag and signals the thrash metric. The size is
+// passed because the caller has already removed the entry from the table, so it cannot be
+// looked up here.
+func (c *mem2Q) dropUnread(key string, unread bool, n int64) {
 	if !unread {
 		return
 	}
 	delete(c.unread, key)
+	c.unreadBytes -= n
 	if c.onEvictUnread != nil {
 		c.onEvictUnread(key)
 	}

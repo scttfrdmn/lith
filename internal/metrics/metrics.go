@@ -28,6 +28,7 @@ type Metrics struct {
 	prefetchIss   prometheus.Counter
 	prefetchHit   prometheus.Counter
 	uncovered     prometheus.Counter
+	pfLowCoverage prometheus.Counter
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -92,6 +93,10 @@ func New() *Metrics {
 		}),
 		prefetchHit: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_used_total", Help: "Prefetched chunks TOUCHED by a later demand read (same 1 MiB unit as lith_prefetch_issued_total). A CHUNK-TOUCH count, not a byte count: a 64 KiB read marks the whole 1 MiB chunk used, so used/issued OVERSTATES byte follow-through, and overstates it most for the scattered readers where prefetch is least useful. Measured case: 89% by this ratio against at most ~25% of the prefetched bytes actually read. Do not read it as a byte efficiency (#256).",
+		}),
+		pfLowCoverage: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_low_coverage_total",
+			Help: "Reads the #221 coverage gate forced Random: the handle's trailing reads covered too little of their own span to look like a scan. A handle with this climbing and zero prefetch issued is NOT necessarily a scattered walk -- concurrent readers of ONE object see each other's reads absorbed by the shared kernel page cache, so a dense stream presents as punctate and never establishes (#316, measured at 243x with byte amplification of 1.001).",
 		}),
 		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",
@@ -210,7 +215,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -340,7 +345,7 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles 
 // Do not check these against the proxy. An estimator built from dispatch counts returns
 // the standing window by construction, so "resident ~= window x handles" is an identity
 // that will pass whether or not either number is right.
-func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
+func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident func() float64) {
 	if m == nil {
 		return
 	}
@@ -352,6 +357,10 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
 		Name: "lith_prefetch_budget_bytes",
 		Help: "The --prefetch-budget limit in bytes (default 50%% of --mem-cache). lith_prefetch_committed_bytes is what is actually held against it.",
 	}, limit))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_prefetch_unread_resident_bytes",
+		Help: "Bytes HELD IN THE MEMORY TIER that nothing has read. This -- not lith_prefetch_committed_bytes -- is the quantity eviction-before-read is about: committed counts from dispatch and so includes bytes still in flight, which cannot evict anything. Compare against --mem-cache, not --prefetch-budget: the collapse condition is this approaching tier CAPACITY, at which point every arriving chunk must evict an unread one (#313).",
+	}, unreadResident))
 }
 
 // Handler returns the Prometheus HTTP handler for this registry.
@@ -367,6 +376,20 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) PrefetchWait(d time.Duration) {
 	if m != nil {
 		m.prefetchWait.Observe(d.Seconds())
+	}
+}
+
+// PrefetchLowCoverage adds a handle's coverage-gate rejection count (called once per handle
+// at Release). Nil-safe.
+//
+// Called unconditionally, including at zero, so an absent series cannot be mistaken for a
+// missing feature -- the same reason #256's evidence counter is emitted at zero.
+func (m *Metrics) PrefetchLowCoverage(n int64) {
+	if m == nil {
+		return
+	}
+	if n > 0 {
+		m.pfLowCoverage.Add(float64(n))
 	}
 }
 

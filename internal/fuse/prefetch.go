@@ -184,6 +184,17 @@ func (w *pfWrapper) halvings() int64 {
 	return w.pf.Halvings()
 }
 
+// lowCoverage is the count of reads the #221 coverage gate forced Random on this handle.
+//
+// Exposed because it is the signal that distinguishes "this handle is a scattered walk, as
+// designed" from "this handle is a dense stream whose sibling reads were absorbed by the
+// shared page cache" (#316). Both present as zero prefetch and clean byte counters.
+func (w *pfWrapper) lowCoverage() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.LowCoverage()
+}
+
 func (w *pfWrapper) deEstablished() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
