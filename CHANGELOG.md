@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every per-handle prefetch counter is now recorded per read, not at close**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284),
+  [#316](https://github.com/scttfrdmn/lith/issues/316)). #319 fixed this for the two coverage
+  counters; the remaining five — window halvings, random resets, evidence-gate holds, blocks
+  withheld, and de-establishments — were still folded into their metrics once per handle at
+  `Release`. On a job that holds its handles open for its whole run, which is the normal shape,
+  every one of them read **zero** until the process exited. An external 48-rank deployment
+  measured exactly that.
+
+  The labelled children are resolved once at `Open` and kept on the handle, so a per-read
+  record is a few atomic adds rather than a `WithLabelValues` lookup under the registry mutex —
+  and the labelled series now exists from the first **open** rather than the first close, which
+  is the present-and-zero-versus-absent trap of #253 closed one step earlier.
+
+- **`BlockStore.MeasuredTTFB` distinguishes a measurement from the seed**
+  ([#292](https://github.com/scttfrdmn/lith/issues/292)). `currentTTFB()` falls back to a
+  hard-coded 40 ms until a fill has recorded a sample, so anything deriving a value before the
+  first fill received a plausible constant identical on every endpoint. #291 shipped a readahead
+  floor derived that way and measured it at exactly 30 blocks on both a 2.2 ms and a 58.6 ms
+  endpoint, where the real 58.6 ms round trip wants 44. The new accessor returns
+  `(duration, measured bool)`, so a caller has to decide what to do about "not measured yet"
+  instead of being handed a number that looks right.
+
+### Added
+
+- **`lith_readahead_evidence_ratio`, and the latency-derived evidence policy's plumbing**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284)). **No behaviour change**: the policy
+  returns 0 at every latency and a test asserts it.
+
+  `--readahead-evidence-ratio` bounds a committed readahead window to a multiple of the bytes a
+  handle has actually consumed, and it is the one thing measured to fix #284 — where a single
+  process reading one variable of a multi-variable NetCDF-4 file fetched the **whole object**,
+  54.03× over-fetch, equal to `1/coverage` to within 0.4% on two different objects. It is off by
+  default because its cost is sharply RTT-scaled: byte-identical and wall-indistinguishable
+  in-region, and a clean **2.56×** at 58.6 ms.
+
+  The ratio is now consulted **per read** from the endpoint's measured latency rather than
+  latched at open from the flag, so the policy has somewhere to live; the gauge reports which
+  regime a mount landed in. The constants wait on a measured ladder between those two anchor
+  points — this campaign has refuted five mechanisms and shipped one 11× regression whose
+  justifying argument agreed with the thing it replaced to within 2.4%.
+
+
 ## [1.3.0] - 2026-10-02
 
 ### Changed

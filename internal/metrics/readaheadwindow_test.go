@@ -15,11 +15,12 @@ import (
 // counter could have caught it. These gauges are the thing that would have.
 func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	m := New()
-	window, handles, streams := 223.0, 1.0, 1.0
+	window, handles, streams, evRatio := 223.0, 1.0, 1.0, 0.0
 	m.RegisterReadaheadWindow(
 		func() float64 { return window },
 		func() float64 { return handles },
 		func() float64 { return streams },
+		func() float64 { return evRatio },
 	)
 
 	scrape := func() string {
@@ -34,6 +35,8 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		"lith_readahead_window_blocks 223",
 		"lith_open_handles 1",
 		"lith_streaming_handles 1",
+		// Off by default, and emitted so an absent line cannot be read as a missing feature.
+		"lith_readahead_evidence_ratio 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape missing %q", want)
@@ -151,8 +154,9 @@ func TestCoverageCountersAreSeparableAndLive(t *testing.T) {
 	// THE #316 SHAPE: contiguous reads held, no seek rejections at all. The two must move
 	// independently — an external deployment needs exactly this pairing to tell "my readers
 	// share a file" from "my readers are scattered walks".
+	h := m.PrefetchHandleFor(">64MiB")
 	for i := 0; i < 430; i++ {
-		m.PrefetchCoverage(0, 1)
+		h.Record(PrefetchDelta{CoverageHeld: 1})
 	}
 	got = scrape()
 	if !strings.Contains(got, "lith_prefetch_coverage_held_total 430") {
@@ -164,12 +168,15 @@ func TestCoverageCountersAreSeparableAndLive(t *testing.T) {
 	}
 
 	// A scattered walk moves the other one.
-	m.PrefetchCoverage(7, 0)
+	h.Record(PrefetchDelta{Seek: 7})
 	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 7") {
 		t.Error("the seek counter did not accumulate")
 	}
 
-	// Nil-safe, like every other recorder here: a mount without --metrics must not panic.
+	// Nil-safe at both levels, like every other recorder here: a mount without --metrics
+	// must not panic, and the resolved handle it hands out must be safe to Record.
 	var nilM *Metrics
-	nilM.PrefetchCoverage(1, 1)
+	nilM.PrefetchHandleFor(">64MiB").Record(PrefetchDelta{Seek: 1, CoverageHeld: 1})
+	var nilH *PrefetchHandle
+	nilH.Record(PrefetchDelta{Seek: 1})
 }

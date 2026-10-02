@@ -138,10 +138,11 @@ func TestNilMetricsReadHooks(t *testing.T) {
 // gets a test rather than a promise.
 func TestLabelledPrefetchCountersEmitAtZero(t *testing.T) {
 	m := New()
-	// A handle that served a read but never clamped and never de-established —
-	// the common case, and the one that produced no series before the fix.
-	m.PrefetchEvidenceClamped(">64MiB", 0, 0)
-	m.PrefetchDeEstablished(">64MiB", 0)
+	// A handle OPENED but which never clamped and never de-established — the common case,
+	// and the one that produced no series before the fix. Resolving the recorder is what
+	// touches the children now, so the series exists from the first open rather than (as
+	// before) the first close.
+	h := m.PrefetchHandleFor(">64MiB")
 
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
@@ -157,8 +158,7 @@ func TestLabelledPrefetchCountersEmitAtZero(t *testing.T) {
 	}
 
 	// And they still count when they do fire.
-	m.PrefetchEvidenceClamped(">64MiB", 3, 40)
-	m.PrefetchDeEstablished(">64MiB", 7)
+	h.Record(PrefetchDelta{EvidenceHeld: 3, EvidenceWithheld: 40, DeEstablished: 7})
 	rec = httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	body = rec.Body.String()

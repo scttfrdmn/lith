@@ -63,16 +63,31 @@ func (bs *BlockStore) CoalesceGap() int64 {
 }
 
 // currentTTFB is the rolling median of measured fill first-byte latencies, or the
-// seed until a fill has been measured.
+// seed until a fill has been measured. Prefer MeasuredTTFB for anything that must not
+// silently accept the seed.
 func (bs *BlockStore) currentTTFB() time.Duration {
+	d, _ := bs.MeasuredTTFB()
+	return d
+}
+
+// MeasuredTTFB reports the rolling median first-byte latency and whether it is a
+// MEASUREMENT (#292).
+//
+// False means no fill has completed, so the caller is receiving ttfbSeed: a plausible
+// constant that is identical on every endpoint. That is the trap #291 fell into -- it
+// derived a readahead floor at OPEN time, before any fill, and the "device-derived"
+// quantity came out as exactly 30 blocks at both a 2.2 ms and a 58.6 ms endpoint. The
+// 58.6 ms round trip wants 44. Returning the second value forces a caller to decide what
+// to do about "not measured yet" instead of being handed a number that looks right.
+func (bs *BlockStore) MeasuredTTFB() (time.Duration, bool) {
 	bs.ttfbMu.Lock()
 	defer bs.ttfbMu.Unlock()
 	if len(bs.ttfbSamples) == 0 {
-		return bs.ttfbSeed
+		return bs.ttfbSeed, false
 	}
 	s := append([]time.Duration(nil), bs.ttfbSamples...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	return s[len(s)/2]
+	return s[len(s)/2], true
 }
 
 // recordTTFB feeds a fill's first-byte latency into the rolling window.

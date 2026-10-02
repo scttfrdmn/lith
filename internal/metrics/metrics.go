@@ -318,7 +318,7 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 // mounts ran there. #301 changed the divisor's input, so the gap is now diagnostic rather
 // than causal: wide means many idle descriptors (no longer a problem), narrow-and-crowded
 // means genuinely more streams than the budget can fund (raise --prefetch-budget).
-func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles func() float64) {
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio func() float64) {
 	if m == nil {
 		return
 	}
@@ -334,6 +334,10 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles 
 		Name: "lith_streaming_handles",
 		Help: "Handles being prefetched for: established sequential streams. This is the divisor for the readahead window (#301). Its gap from lith_open_handles is what the old divisor over-charged for -- on the workload that found this, ~288 descriptors against ~48 streams.",
 	}, streamingHandles))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_readahead_evidence_ratio",
+		Help: "The #256 evidence-gate ratio in force: a committed readahead window may not exceed this multiple of the bytes a handle has actually consumed. 0 means the gate is off, which is the default and is also what a mount reports before any fill has measured the endpoint's latency. Non-zero without --readahead-evidence-ratio set means the latency-derived policy engaged (#284).",
+	}, evidenceRatio))
 }
 
 // RegisterPrefetchBudget registers gauges for what --prefetch-budget actually bounds:
@@ -384,73 +388,96 @@ func (m *Metrics) PrefetchWait(d time.Duration) {
 	}
 }
 
-// PrefetchCoverage adds one read's coverage-gate rejections: `seek` for a scattered landing
-// forced Random, `held` for contiguous progress denied a window. Nil-safe.
+// PrefetchDelta is one read's contribution to the per-handle prefetch counters.
 //
-// Called PER READ, not per handle at Release. The per-handle version was useless on a running
-// job and that is how it shipped: an external 48-rank deployment saw both read 0 in every 2 Hz
-// sample and only non-zero (527, 522) in the final scrape, after the job was killed and its
-// handles closed. A workload that holds handles open for the whole run -- the normal shape
-// there -- could never observe the defect these exist to show (#316).
-func (m *Metrics) PrefetchCoverage(seek, held int64) {
-	if m == nil {
-		return
-	}
-	if seek > 0 {
-		m.pfLowCoverage.Add(float64(seek))
-	}
-	if held > 0 {
-		m.pfCovHeld.Add(float64(held))
+// Recorded PER READ. The four counters below were all folded in once per handle at
+// rawFS.Release, which made every one of them useless on a running job: an external 48-rank
+// deployment holding its handles open for the whole run saw zeroes in every 2 Hz sample and
+// non-zero values only in the final scrape, after the job was killed. #319 fixed that for the
+// coverage counters; this does the rest.
+type PrefetchDelta struct {
+	Seek             int64 // coverage gate forced Random on a seek landing (#221)
+	CoverageHeld     int64 // contiguous progress denied a window (#316)
+	Halvings         int64 // window halvings (#40)
+	Resets           int64 // collapses to Random
+	EvidenceHeld     int64 // the #256 evidence gate held the window below max
+	EvidenceWithheld int64 // blocks withheld across those holds
+	DeEstablished    int64 // establishment lost, counted only where there was one
+}
+
+// Since returns the field-wise difference d - b, for a caller holding cumulative snapshots
+// taken either side of one decision.
+func (d PrefetchDelta) Since(b PrefetchDelta) PrefetchDelta {
+	return PrefetchDelta{
+		Seek:             d.Seek - b.Seek,
+		CoverageHeld:     d.CoverageHeld - b.CoverageHeld,
+		Halvings:         d.Halvings - b.Halvings,
+		Resets:           d.Resets - b.Resets,
+		EvidenceHeld:     d.EvidenceHeld - b.EvidenceHeld,
+		EvidenceWithheld: d.EvidenceWithheld - b.EvidenceWithheld,
+		DeEstablished:    d.DeEstablished - b.DeEstablished,
 	}
 }
 
-// PrefetchSeeks adds a handle's window-halving and random-reset counts (called
-// once per handle at Release). Nil-safe.
-func (m *Metrics) PrefetchSeeks(halvings, resets int64) {
+// Empty reports whether this delta would change nothing, so a caller can skip the record on
+// the overwhelming majority of reads.
+func (d PrefetchDelta) Empty() bool {
+	return d == PrefetchDelta{}
+}
+
+// PrefetchHandle is the resolved set of labelled counters for one handle's size class. It
+// exists so a per-read record is a handful of atomic adds rather than a WithLabelValues map
+// lookup under a registry mutex on a hot path.
+//
+// Resolving it at Open also makes the labelled series EXIST from the first open rather than
+// the first close. A labelled counter that only appears when it fires is indistinguishable in
+// a scrape from "the binary lacks the feature", "a different label value", or "the mount was
+// never opened" -- the present-and-zero-versus-absent trap of #253, reported from the field
+// for exactly these metrics.
+type PrefetchHandle struct {
+	m         *Metrics
+	evClamped prometheus.Counter
+	deEstab   prometheus.Counter
+}
+
+// PrefetchHandleFor resolves the counters for a size class and touches them at zero. Nil-safe,
+// and the returned value is nil-safe to Record.
+func (m *Metrics) PrefetchHandleFor(sizeClass string) *PrefetchHandle {
 	if m == nil {
-		return
+		return nil
 	}
-	if halvings > 0 {
-		m.pfHalved.Add(float64(halvings))
-	}
-	if resets > 0 {
-		m.pfResetRand.Add(float64(resets))
+	return &PrefetchHandle{
+		m:         m,
+		evClamped: m.pfEvClamped.WithLabelValues(sizeClass),
+		deEstab:   m.pfDeEstab.WithLabelValues(sizeClass),
 	}
 }
 
-// PrefetchEvidenceClamped records a handle's evidence-gate activity at Release
-// (#256): how many times the gate held the window below the configured max, the
-// blocks that withheld, and the size class of the object it happened on. The size
-// class is the label because the question a reporter cannot otherwise answer is
-// whether the gate fires on the large files or the small ones. Nil-safe.
-func (m *Metrics) PrefetchEvidenceClamped(sizeClass string, clamps, withheldBlocks int64) {
-	if m == nil {
+// Record adds one read's deltas. Nil-safe.
+func (h *PrefetchHandle) Record(d PrefetchDelta) {
+	if h == nil || h.m == nil {
 		return
 	}
-	// Touch the child even at zero so the series EXISTS once a mount has served a
-	// read. A labelled counter that only appears when it fires is indistinguishable
-	// in a scrape from "the binary lacks the feature", "a different label value" or
-	// "the mount was never opened" — the same present-and-zero-versus-absent trap as
-	// #253, reported from the field for exactly this metric.
-	c := m.pfEvClamped.WithLabelValues(sizeClass)
-	if clamps > 0 {
-		c.Add(float64(clamps))
+	if d.Seek > 0 {
+		h.m.pfLowCoverage.Add(float64(d.Seek))
 	}
-	if withheldBlocks > 0 {
-		m.pfEvWithheld.Add(float64(withheldBlocks))
+	if d.CoverageHeld > 0 {
+		h.m.pfCovHeld.Add(float64(d.CoverageHeld))
 	}
-}
-
-// PrefetchDeEstablished records how many times a handle lost an establishment it
-// had, by object size class (#256, called once per handle at Release). The series
-// is emitted at zero once a mount has served a read. Nil-safe.
-func (m *Metrics) PrefetchDeEstablished(sizeClass string, n int64) {
-	if m == nil {
-		return
+	if d.Halvings > 0 {
+		h.m.pfHalved.Add(float64(d.Halvings))
 	}
-	c := m.pfDeEstab.WithLabelValues(sizeClass)
-	if n > 0 {
-		c.Add(float64(n))
+	if d.Resets > 0 {
+		h.m.pfResetRand.Add(float64(d.Resets))
+	}
+	if d.EvidenceHeld > 0 {
+		h.evClamped.Add(float64(d.EvidenceHeld))
+	}
+	if d.EvidenceWithheld > 0 {
+		h.m.pfEvWithheld.Add(float64(d.EvidenceWithheld))
+	}
+	if d.DeEstablished > 0 {
+		h.deEstab.Add(float64(d.DeEstablished))
 	}
 }
 
