@@ -29,6 +29,7 @@ type Metrics struct {
 	prefetchHit   prometheus.Counter
 	uncovered     prometheus.Counter
 	pfLowCoverage prometheus.Counter
+	pfCovHeld     prometheus.Counter
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -96,7 +97,11 @@ func New() *Metrics {
 		}),
 		pfLowCoverage: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_low_coverage_total",
-			Help: "Reads the #221 coverage gate forced Random: the handle's trailing reads covered too little of their own span to look like a scan. A handle with this climbing and zero prefetch issued is NOT necessarily a scattered walk -- concurrent readers of ONE object see each other's reads absorbed by the shared kernel page cache, so a dense stream presents as punctate and never establishes (#316, measured at 243x with byte amplification of 1.001).",
+			Help: "Reads the #221 coverage gate forced Random on a SEEK landing: a scattered walk, which is the gate working as designed. Incremented live, per read. Pair with lith_prefetch_coverage_held_total -- that one rising while this stays flat is the #316 shape (#221, #316).",
+		}),
+		pfCovHeld: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_coverage_held_total",
+			Help: "Reads that made CONTIGUOUS progress and were denied a readahead window anyway, because coverage had not confirmed the access tiles. This rising while lith_prefetch_low_coverage_total stays flat is the signature of #316: concurrent readers of ONE object have their siblings' reads absorbed by the shared kernel page cache, so each handle advances in order yet looks punctate and never establishes -- measured at 243x slower with byte amplification of 1.001. Nothing counted this before: deEstablish() only counts an establishment that existed, and these handles are refused while still provisional.",
 		}),
 		uncovered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_uncovered_total", Help: "Demand reads whose chunk was neither cached nor in flight.",
@@ -215,7 +220,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -379,17 +384,23 @@ func (m *Metrics) PrefetchWait(d time.Duration) {
 	}
 }
 
-// PrefetchLowCoverage adds a handle's coverage-gate rejection count (called once per handle
-// at Release). Nil-safe.
+// PrefetchCoverage adds one read's coverage-gate rejections: `seek` for a scattered landing
+// forced Random, `held` for contiguous progress denied a window. Nil-safe.
 //
-// Called unconditionally, including at zero, so an absent series cannot be mistaken for a
-// missing feature -- the same reason #256's evidence counter is emitted at zero.
-func (m *Metrics) PrefetchLowCoverage(n int64) {
+// Called PER READ, not per handle at Release. The per-handle version was useless on a running
+// job and that is how it shipped: an external 48-rank deployment saw both read 0 in every 2 Hz
+// sample and only non-zero (527, 522) in the final scrape, after the job was killed and its
+// handles closed. A workload that holds handles open for the whole run -- the normal shape
+// there -- could never observe the defect these exist to show (#316).
+func (m *Metrics) PrefetchCoverage(seek, held int64) {
 	if m == nil {
 		return
 	}
-	if n > 0 {
-		m.pfLowCoverage.Add(float64(n))
+	if seek > 0 {
+		m.pfLowCoverage.Add(float64(seek))
+	}
+	if held > 0 {
+		m.pfCovHeld.Add(float64(held))
 	}
 }
 

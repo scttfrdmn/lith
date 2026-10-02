@@ -51,7 +51,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) *pfWrapper {
 	pf := prefetch.New(maxReadahead)
 	// A read landing more than one block past the previous is a seek, not
 	// sequential progress, however in-band it looks (#210/M16 1b).
@@ -59,7 +59,7 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio float64) *pfWrapp
 	// A punctate handle (low coverage over a trailing window) is not sequential
 	// however its block deltas look; force it Random so the seek path stops
 	// re-anchoring and prefetching across a scattered walk (#221).
-	pf.SetCoverage(coverageWindow, coverageMin)
+	pf.SetCoverage(coverageWindow, covMin)
 	// Bound a committed window by the bytes the handle has actually read, so
 	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
 	// default; ratio <= 0 is a no-op.
@@ -91,6 +91,16 @@ type observation struct {
 	// returned so the trace records the input to the decision rather than a re-derivation
 	// of it (#278).
 	gap int64
+	// covDelta / covHeldDelta are this read's contribution to the two coverage-gate counters.
+	//
+	// Returned per read, and added to the metrics in the read path, because folding them in at
+	// Release makes them USELESS ON A RUNNING JOB -- which is how they shipped and how an
+	// external deployment found them: both read 0 in every 2 Hz sample through a 48-rank run
+	// and only appeared (527, 522) in the final scrape after the job was killed and its
+	// handles closed. A workload that holds its handles open for the whole run, which is the
+	// normal shape here, could never see the defect these count.
+	covDelta     int64
+	covHeldDelta int64
 	// streamDelta is the change this read made to the mount-wide established-stream count:
 	// +1 when the handle just became a sequential stream, -1 when it stopped being one, 0
 	// otherwise. Computed under the handle's lock with the transition it describes, for the
@@ -108,15 +118,18 @@ func (w *pfWrapper) observe(block, off, end, maxWindow int64, seq *atomic.Int64)
 	gap := off - w.lastReadEnd
 	w.lastReadEnd = end
 	w.pf.SetMax(maxWindow)
+	cov0, held0 := w.pf.LowCoverage(), w.pf.CoverageHeld()
 	d := w.pf.Observe(block, off, end-off, gap)
 	return observation{
-		dispatch:    d,
-		seq:         seq.Add(1),
-		after:       w.pf.State(),
-		window:      w.pf.Window(),
-		peak:        w.pf.PeakWindow(),
-		gap:         gap,
-		streamDelta: w.updateStreaming(),
+		covDelta:     w.pf.LowCoverage() - cov0,
+		covHeldDelta: w.pf.CoverageHeld() - held0,
+		dispatch:     d,
+		seq:          seq.Add(1),
+		after:        w.pf.State(),
+		window:       w.pf.Window(),
+		peak:         w.pf.PeakWindow(),
+		gap:          gap,
+		streamDelta:  w.updateStreaming(),
 	}
 }
 
@@ -130,9 +143,12 @@ func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, seq *ato
 	defer w.mu.Unlock()
 	w.lastReadEnd = end
 	w.pf.SetMax(maxWindow)
+	cov0, held0 := w.pf.LowCoverage(), w.pf.CoverageHeld()
 	d := w.pf.Observe(block, off, end-off, 0)
 	return observation{
-		dispatch: d, seq: seq.Add(1), after: w.pf.State(),
+		covDelta:     w.pf.LowCoverage() - cov0,
+		covHeldDelta: w.pf.CoverageHeld() - held0,
+		dispatch:     d, seq: seq.Add(1), after: w.pf.State(),
 		window: w.pf.Window(), peak: w.pf.PeakWindow(), gap: 0,
 		streamDelta: w.updateStreaming(),
 	}
@@ -182,17 +198,6 @@ func (w *pfWrapper) halvings() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.pf.Halvings()
-}
-
-// lowCoverage is the count of reads the #221 coverage gate forced Random on this handle.
-//
-// Exposed because it is the signal that distinguishes "this handle is a scattered walk, as
-// designed" from "this handle is a dense stream whose sibling reads were absorbed by the
-// shared page cache" (#316). Both present as zero prefetch and clean byte counters.
-func (w *pfWrapper) lowCoverage() int64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.pf.LowCoverage()
 }
 
 func (w *pfWrapper) deEstablished() int64 {

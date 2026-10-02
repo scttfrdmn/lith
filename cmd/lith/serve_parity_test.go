@@ -32,6 +32,7 @@ var serveInapplicable = map[string]string{
 	"sibling-window":           "FUSE sibling detection (#63); gateway read path does not use it",
 	"max-readahead":            "FUSE per-handle readahead window; gateway uses its per-client window",
 	"readahead-evidence-ratio": "FUSE per-handle window evidence gate (#256); internal/nfs has no prefetcher at all",
+	"prefetch-coverage-min":    "FUSE per-handle coverage gate (#221/#316); internal/nfs has no prefetcher at all",
 	"bgzf-whole-file-max":      "FUSE bgzf prefetch (#107); gateway read path does not use it",
 	// Diagnostics / internal.
 	"timeline-csv": "FUSE per-chunk diagnostic (#70)",

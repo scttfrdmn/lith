@@ -138,7 +138,19 @@ type Prefetcher struct {
 	halvings    int64 // window halvings on a seek from an established pattern
 	resetRandom int64 // collapses to Random (a second seek with no progress)
 	peakWindow  int64 // largest window ever reached
-	lowCoverage int64 // reads forced Random by the coverage gate (#221)
+	lowCoverage int64 // reads forced Random by the coverage gate on a SEEK landing (#221)
+	// coverageHeld counts reads that made CONTIGUOUS progress and were still denied a
+	// window because coverage had not confirmed tiling (#229's provisional state).
+	//
+	// Distinct from lowCoverage, and the distinction is diagnostic. lowCoverage fires on the
+	// seek path: a scattered landing, which is the gate working as designed. This fires on
+	// the contiguous path: a handle advancing in order, refused a window anyway. That pairing
+	// -- contiguous progress with low coverage -- is the signature of #316, where concurrent
+	// readers of one object have their siblings' reads absorbed by the shared page cache and
+	// each handle's own stream looks punctate. Nothing counted it: deEstablish() only counts
+	// an establishment that existed, and these handles are rejected while still provisional,
+	// so the purest #316 cell incremented ZERO counters (reported from a 48-rank GCHP run).
+	coverageHeld int64
 }
 
 // covSpan is one read's byte range [off, end).
@@ -187,6 +199,10 @@ func (p *Prefetcher) SetCoverage(window int, minRatio float64) {
 
 // LowCoverage reports how many reads the coverage gate forced Random (#221).
 func (p *Prefetcher) LowCoverage() int64 { return p.lowCoverage }
+
+// CoverageHeld reports how many contiguous reads were denied a window because coverage had
+// not confirmed tiling (#316). See the field comment for why this is not LowCoverage.
+func (p *Prefetcher) CoverageHeld() int64 { return p.coverageHeld }
 
 // SetEvidence enables the #256 evidence gate: a committed readahead window may
 // not exceed `ratio` times the bytes this handle has actually read. ratio <= 0 or
@@ -434,6 +450,9 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		// is dispatched — and a contiguous read whose window is still full of an
 		// earlier scattered walk de-establishes rather than ramping.
 		if !p.coverageOK(cov) {
+			// Contiguous progress, refused a window. See the coverageHeld field comment:
+			// this is the only place the #316 shape is observable, and it used to be silent.
+			p.coverageHeld++
 			p.deEstablish()
 			if p.state == Sequential {
 				p.state = Cold

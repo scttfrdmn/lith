@@ -41,6 +41,12 @@ type Config struct {
 	SmallFile    int64 // whole-file prefetch threshold in bytes
 	PartsMax     int64 // largest file fetched whole as parallel parts once its reads tile (#69/#229); 0 falls back to SmallFile
 	MaxReadahead int64 // max sequential readahead window in blocks
+	// CoverageMin overrides the #221 coverage gate's threshold. <=0 uses the default
+	// (coverageMin). See the flag's help and #316: the default 0.5 is a constant from one
+	// characterization, and a 48-rank measurement found 32-35% of real handles below it --
+	// handles advancing in order whose sibling reads the shared page cache absorbed.
+	CoverageMin float64
+
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
@@ -306,7 +312,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			// carries the config that produced it (#262).
 			_, _ = fmt.Fprintf(tf, "# lith prefetch trace; block_size=%d max_readahead=%d parts_max=%d small_file=%d coverage_window=%d coverage_min=%g evidence_ratio=%g\n",
 				f.blockSize, f.maxReadahead(), f.partsThreshold(), cfg.SmallFile,
-				coverageWindow, coverageMin, cfg.ReadaheadEvidenceRatio)
+				coverageWindow, f.coverageMin(), cfg.ReadaheadEvidenceRatio)
 			_, _ = fmt.Fprintln(tf, "seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window")
 		}
 	}
@@ -631,7 +637,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
 		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio),
+		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin()),
 	}
 	f.mu.Lock()
 	fh := f.nextFh
@@ -855,6 +861,7 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		if obs.streamDelta != 0 {
 			f.streamingHandles.Add(obs.streamDelta)
 		}
+		f.met.PrefetchCoverage(obs.covDelta, obs.covHeldDelta)
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
 				seq: obs.seq, fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
@@ -1103,10 +1110,6 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		halvings, resets := h.pf.halvings(), h.pf.resets()
 		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
 		f.met.PrefetchSeeks(halvings, resets)
-		// #316: the coverage gate's rejections, which are indistinguishable from a correct
-		// classification by every other counter -- byte amplification was 1.001 on the run
-		// that measured 243x.
-		f.met.PrefetchLowCoverage(h.pf.lowCoverage())
 		// #256: make the evidence gate's action observable. Without this the only
 		// visible effect is that `issued` fell, which cannot distinguish a window
 		// the gate refused from one the detector never wanted — and cannot say
@@ -1242,6 +1245,15 @@ func (f *rawFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.S
 
 func (f *rawFS) objectKey(relPath string) string {
 	return f.index().Prefix() + relPath
+}
+
+// coverageMin is the #221 coverage threshold in force: the configured override, or the
+// characterized default.
+func (f *rawFS) coverageMin() float64 {
+	if f.cfg.CoverageMin > 0 {
+		return f.cfg.CoverageMin
+	}
+	return coverageMin
 }
 
 func (f *rawFS) maxReadahead() int64 {
