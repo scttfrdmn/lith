@@ -5,7 +5,6 @@ package blockstore
 import (
 	"context"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
@@ -139,67 +138,4 @@ type blockingSource struct {
 func (b *blockingSource) GetRangeReader(ctx context.Context, key string, off, length int64) (io.ReadCloser, string, error) {
 	<-b.release
 	return b.Source.GetRangeReader(ctx, key, off, length)
-}
-
-// #301: admission is atomic with the accounting, which is the property a read-then-decide
-// check would not have. N handles establishing simultaneously must not each read a stale zero
-// and all grant themselves a full window -- that is the over-commitment that thrashes, and
-// the reporting workload measured establishment as a single-shot full-window burst, so
-// simultaneity is the normal case rather than a corner.
-func TestAdmitCommittedIsAtomicUnderConcurrency(t *testing.T) {
-	srv := fake.New()
-	makeObj(srv, "obj", 16)
-	k := keyFor(t, srv, "obj")
-	objSize := int64(16) * mib
-	// A budget of 4 chunks against 16 chunks of demand: most dispatches must be refused.
-	// Kept small on purpose -- `go test -race` on this package OOM-killed a CI runner, and
-	// 16 concurrent dispatches exercise the CAS exactly as 64 did.
-	const budget = int64(4) * mib
-	rec := &budgetRec{}
-	bs := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: 128 * mib, PrefetchBudget: budget, Recorder: rec,
-	})
-
-	var wg sync.WaitGroup
-	for b := int64(0); b < 16; b++ {
-		wg.Add(1)
-		go func(b int64) { defer wg.Done(); bs.Prefetch(context.Background(), k, b, objSize) }(b)
-	}
-	wg.Wait()
-
-	if got := bs.PrefetchCommittedBytes(); got > budget {
-		t.Errorf("committed = %d after 16 concurrent dispatches against a %d budget: admission "+
-			"must be atomic with the accounting, or every dispatch reads a stale zero", got, budget)
-	}
-	if rec.issued.Load() > budget/mib {
-		t.Errorf("issued = %d, more chunks than the budget could hold (%d) — refusals are not "+
-			"being counted as refusals", rec.issued.Load(), budget/mib)
-	}
-}
-
-// A refusal is not a wasted fetch and must not be counted as one. Conflating them would make
-// lith_prefetch_issued_total include prefetches that never happened, breaking the
-// issued-vs-used relation every #256 gate reads off.
-func TestRefusedPrefetchIsNotCountedAsIssued(t *testing.T) {
-	srv := fake.New()
-	makeObj(srv, "obj", 12)
-	k := keyFor(t, srv, "obj")
-	objSize := int64(12) * mib
-	const budget = int64(2) * mib
-	rec := &budgetRec{}
-	bs := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: 128 * mib, PrefetchBudget: budget, Recorder: rec,
-	})
-	for b := int64(0); b < 12; b++ {
-		bs.Prefetch(context.Background(), k, b, objSize)
-	}
-	issued := rec.issued.Load()
-	if issued == 0 {
-		t.Fatal("nothing issued at all: the fixture is not exercising admission")
-	}
-	if issued > budget/mib {
-		t.Errorf("issued = %d against a budget of %d chunks: a refused prefetch was counted as "+
-			"issued, which inflates lith_prefetch_issued_total with fetches that never happened",
-			issued, budget/mib)
-	}
 }

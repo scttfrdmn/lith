@@ -1262,12 +1262,11 @@ func (f *rawFS) byteExactThreshold() int64 {
 // configured --max-readahead, capped by what the whole prefetch budget could hold and
 // floored at 2.
 //
-// It no longer divides by the open-handle count (#301). Aggregate readahead is kept inside
-// the memory tier by BlockStore.admitCommitted, which refuses a prefetch whose bytes would
-// not fit the budget -- byte-exact, where the quantity is measured. Rationing is still
-// essential (bench/prefetch-divisor: removing it costs 13.8-22.4x wall and 4.2-5.2x the
-// bytes) but it no longer needs a per-handle proxy, and the proxy was wrong by exactly the
-// descriptor count.
+// It divides by the open-handle count, which over-charges by exactly that count (#301) --
+// committed bytes track one window however many handles are charged. Replacing the division
+// with byte-exact admission was tried and REVERTED: it regressed concurrent readers by up to
+// 11x, because the division is an allocation discipline and not merely a total. The fix is to
+// change this divisor's INPUT, not to remove it.
 // OpenHandles is the count of open file descriptors on this mount, per descriptor across
 // every process. It USED to be perHandleWindow's divisor, which is why it is exported: the
 // gauge in #298 exists because nothing at runtime showed that a reader holding 256 files
@@ -1289,18 +1288,47 @@ func (f *rawFS) perHandleWindow() int64 {
 	if budgetBlocks <= 0 {
 		return maxW
 	}
-	// #301: no longer divided by the open-handle count. The budget is now enforced
-	// byte-exactly where it is measured -- BlockStore.admitCommitted refuses a prefetch
-	// whose bytes would not fit -- so rationing no longer needs a per-handle proxy.
+	// THE SHARE. Each handle gets budgetBlocks/N, floored at 2 and capped at maxReadahead.
 	//
-	// The divisor was load-bearing and this does not remove its protection: removing the
-	// rationing outright costs 13.8-22.4x wall and 4.2-5.2x the bytes with 81-92% of
-	// prefetch evicted unread (bench/prefetch-divisor). What it removes is the proxy's
-	// error, which was linear in the OPEN DESCRIPTOR COUNT -- committed bytes track one
-	// window however many handles are charged, so a mount at 256 descriptors was charged
-	// 4295 MB while holding 17.8 MB and throttled 6-10x for it.
+	// The divisor is known to be WRONG and is kept anyway, which needs explaining.
 	//
-	return windowForBudget(maxW, budgetBlocks)
+	// It is wrong because N counts open file DESCRIPTORS -- across processes, per descriptor
+	// rather than per object, including descriptors never read. The error is linear in that
+	// count, because committed bytes track one window however many handles are charged for
+	// it: a mount at 256 descriptors is charged 4295 MB while holding 17.8 MB, and is
+	// throttled 6-10x for the difference. A job merely holding files open drives its own and
+	// every other reader's readahead to the floor of 2 whatever --max-readahead says.
+	//
+	// It is kept because removing the division was tried (#301, ceeb2b7, reverted) and
+	// regressed concurrent readers 5.66x on the arm that was asked for and up to 11x
+	// elsewhere -- with both pre-registered falsifiers clean, so nothing here predicted it.
+	// The replacement admitted prefetch against measured committed bytes, which bounds the
+	// same TOTAL byte-exactly and was within 2.4% of the divisor's realized commitment on a
+	// 16-reader oversubscribed tier. That argument compared totals, and the total was never
+	// the thing the divisor provided: it is an ALLOCATION DISCIPLINE. 16 x 30 blocks covers
+	// sixteen readers shallowly; 2 x 223 + 14 x 0 commits the same total and covers two.
+	// Equal totals, opposite outcomes. First-come-first-served admission produces the second.
+	//
+	// Removing the rationing outright is worse still: 13.8-22.4x wall and 4.2-5.2x the bytes
+	// with 81-92% of prefetch evicted unread (bench/prefetch-divisor/).
+	//
+	// So the fix is not to the division but to its INPUT -- counting established sequential
+	// streams rather than open descriptors keeps the discipline and drops the over-charge.
+	// That is tracked on #301 and is not this function yet.
+	f.mu.RLock()
+	n := int64(len(f.handles))
+	f.mu.RUnlock()
+	if n < 1 {
+		n = 1
+	}
+	share := budgetBlocks / n
+	if share < 2 {
+		share = 2
+	}
+	if share > maxW {
+		share = maxW
+	}
+	return share
 }
 
 // windowForBudget clamps a configured readahead window to what the prefetch budget could
