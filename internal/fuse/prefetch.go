@@ -30,12 +30,16 @@ type pfWrapper struct {
 	// detector is in prefetch.Sequential, so it is actually being prefetched for. This is
 	// the divisor's input (#301), replacing the open-descriptor count.
 	//
-	// Kept here, as a bool under the handle's own mutex, rather than recomputed by walking
-	// every handle: perHandleWindow runs on every read, and the reporting workload has 6229
-	// handles, so an O(handles) scan taking each handle's lock per read would cost more
-	// than the misallocation it fixes. Transitions are reported as a delta to a mount-wide
-	// atomic instead.
-	streaming bool
+	// Kept here, per handle, rather than recomputed by walking every handle: perHandleWindow
+	// runs on every read, and the reporting workload has 6229 handles, so an O(handles) scan
+	// taking each handle's lock per read would cost more than the misallocation it fixes.
+	// Transitions are reported as a delta to a mount-wide atomic instead.
+	//
+	// An atomic rather than a plain bool under w.mu, even though every WRITE is made under
+	// w.mu so transitions stay serialized with the Observe that causes them. The read is what
+	// needs to be lock-free: perHandleWindow consults it to decide whether to count the caller
+	// in its own divisor, and it runs before observe() takes this mutex.
+	streaming atomic.Bool
 }
 
 // coverageWindow / coverageMin are the #221 coverage gate parameters, chosen
@@ -214,15 +218,20 @@ func (w *pfWrapper) peakWindow() int64 {
 // nothing to the divisor -- which is the whole correction.
 func (w *pfWrapper) updateStreaming() int64 {
 	now := w.pf.State() == prefetch.Sequential
-	if now == w.streaming {
+	if now == w.streaming.Load() {
 		return 0
 	}
-	w.streaming = now
+	w.streaming.Store(now)
 	if now {
 		return 1
 	}
 	return -1
 }
+
+// isStreaming reports whether this handle is currently counted in the mount-wide
+// established-stream total. Lock-free: perHandleWindow needs it before observe() takes the
+// handle's mutex, to decide whether the caller is already in its own divisor.
+func (w *pfWrapper) isStreaming() bool { return w.streaming.Load() }
 
 // releaseStreaming gives up this handle's share, for the close path. Returns the delta to
 // apply to the mount-wide count, and is idempotent so a double Release cannot drive the
@@ -237,9 +246,9 @@ func (w *pfWrapper) updateStreaming() int64 {
 func (w *pfWrapper) releaseStreaming() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.streaming {
+	if !w.streaming.Load() {
 		return 0
 	}
-	w.streaming = false
+	w.streaming.Store(false)
 	return -1
 }

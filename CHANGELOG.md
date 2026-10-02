@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An establishing handle sizes its window from the count it is about to join**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). `perHandleWindow` runs *before* the
+  `Observe` that establishes its caller, so a handle that is not yet counted divides by
+  `streams + 1`. Without it a sole establishing reader divides by 1 and takes the whole
+  budget. An already-established caller still divides by `streams` exactly — adding one there
+  would tighten every steady-state share (16 readers would get `492/17 = 28` blocks where the
+  correct share is `492/16 = 30`, which an external deployment measured exactly).
+
+  **This does not make the concurrent start safe, and a claim in this code that said otherwise
+  was wrong.** It read: *"the geometric ramp bounds the burst, because a handle's first
+  dispatch is 2 blocks and not maxReadahead"*. It bounds the first dispatch, not the ramp's
+  integral — sixteen ramps running together were measured at 12.944 GB committed within 6 s,
+  against a 4.128 GB budget and an 8.256 GB tier, producing a fairness collapse in which 3 of
+  16 readers crawled to 106 s while 13 finished on schedule. Tracked as #313 with four
+  candidate repairs and none shipped on argument.
+
+- **The prefetch divisor counts sequential streams, not open file descriptors**
+  ([#301](https://github.com/scttfrdmn/lith/issues/301)). This is the fix for #301; the
+  division itself stays.
+
+  `perHandleWindow` rations readahead as `clamp(prefetchBudget/blockSize / N, 2,
+  --max-readahead)`. `N` was `len(f.handles)` — every open **descriptor** on the mount, across
+  processes, per descriptor rather than per object, **including descriptors never read**. The
+  charge was therefore linear in a number the reader does not control: at 256 descriptors a
+  mount was charged 4295 MB, held 17.8 MB, and was throttled 6–10× for the difference. The
+  workload that found this ran both production mounts at the 2-block floor — 48 ranks × ~6
+  files is ~288 descriptors against the ~165 that gets you there — reading 186 MB/s where 1293
+  was available, with no flag set wrong. It is also why `--max-readahead` looked inert through
+  a dozen gates: the knob was never reachable from the workload.
+
+  `N` is now the number of handles the detector is actually prefetching for — `prefetch.Sequential`,
+  which is exactly the state in which a window exists. An idle descriptor contributes nothing.
+  On the reporting workload's shape that is ~48 rather than ~288, so each reader's share rises
+  about 6×, and the discipline is unchanged: all 48 active readers still get a share.
+
+  **The division is kept, and both alternatives to it were measured first.** Removing the
+  rationing outright costs 13.8–22.4× wall and 4.2–5.2× the bytes with 81–92% of prefetch
+  evicted unread. Replacing it with byte-exact admission on the same total — which agreed with
+  the divisor's realized commitment to within 2.4% — shipped briefly and regressed concurrent
+  readers 5.66×, because a share is an allocation discipline and a total is not one.
+
+  Maintained as deltas from each read's detector transition rather than by scanning handles:
+  `perHandleWindow` runs on every read and the reporting workload has 6229 handles, so an
+  O(handles) scan taking each handle's lock per read would cost more than the misallocation it
+  fixes. `Release` gives the share back, idempotently.
+
+  **Known limitation.** A handle that establishes, reads a little, then idles for the rest of
+  the run keeps its share until it closes or the detector collapses it to Random. That still
+  over-charges, by far less than counting never-read descriptors did. Shedding it needs a
+  read-idle condition, which is a question on #301 rather than a mechanism guessed at here.
+
 - **The mount reports all three bounds on outstanding prefetch, with the binding one named**
   ([#298](https://github.com/scttfrdmn/lith/issues/298)). One handle's window commitment
   (`--max-readahead × --block-size`), the mount-wide `--prefetch-budget`, and
@@ -57,6 +108,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but not enforced. `lith_prefetch_refused_total` is removed with the admission it counted.
 
 ### Added
+
+- **`lith_streaming_handles`: the divisor, as opposed to the descriptor count**
+  ([#301](https://github.com/scttfrdmn/lith/issues/301)). Handles being prefetched for.
+  `lith_open_handles` is kept alongside it and no longer sizes anything; the **gap** between
+  them is the diagnostic — on the workload that found #301, ~288 descriptors against ~48
+  streams, which is precisely what the old divisor over-charged for. A deployment can now see
+  that directly instead of inferring it from wall clock.
 
 - **The mount says when readahead is at the floor, and how many descriptors it takes to get
   there** ([#301](https://github.com/scttfrdmn/lith/issues/301)). The `prefetch bounds` line
@@ -130,6 +188,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question with a much larger blast radius, tracked separately.
 
 ### Fixed
+
+- **`--mem-cache` is documented as not bounding RSS**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)). In-flight prefetch is not charged
+  against the cache it is about to land in, so the footprint is the tier **plus** the
+  outstanding burst — measured additive to 0.2%, and an OOM kill at 30.56 GB RSS for a 20 GB
+  tier on a 33.0 GB box. Also corrected: `--max-readahead`'s help still described the
+  byte-exact admission reverted in #309, and `docs/knobs.md` still said the #301 repair was
+  pending when it had shipped. And `lith_prefetch_issued_total` is now documented as blind to
+  thrash — evicted blocks return as uncovered demand reads, so
+  `lith_prefetch_uncovered_total` is the counter that moves ([#313](https://github.com/scttfrdmn/lith/issues/313)).
 
 - **The mount now reports the readahead window a handle will actually get**
   ([#297](https://github.com/scttfrdmn/lith/issues/297)). It logged the *configured* depth
