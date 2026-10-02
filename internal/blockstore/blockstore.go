@@ -921,8 +921,15 @@ func (bs *BlockStore) dropPrefetched(ck string) bool {
 // PrefetchCommittedBytes is the live total of bytes prefetch has committed and nothing
 // has consumed -- the quantity --prefetch-budget bounds (#301). Compare it to
 // PrefetchBudgetBytes to see whether the budget is near its limit, which the
-// per-handle-window proxy cannot tell you: measured, the proxy over-charges by exactly
-// the open-handle count (tightness = 1/N, matched to within 6.2% at N = 1..256).
+// per-handle-window proxy cannot tell you: measured against the OPEN-DESCRIPTOR count the
+// proxy over-charged by exactly that count (tightness = 1/N, matched to within 6.2% at
+// N = 1..256), which is what #301 changed the divisor's input to fix.
+//
+// Measured but NOT enforced. Byte-exact admission against this total was tried and reverted:
+// it bounds the right quantity and still starved concurrent readers by up to 11x, because
+// the per-handle division is an allocation discipline and a total is not one. Anything that
+// gates on this number needs a release path on handle close first -- rawFS.Release has none,
+// so a closed handle's commitment never clears when the working set fits the memory tier.
 //
 // Counted from DISPATCH, so it includes bytes whose GET is still in flight. Not a
 // resident-memory figure.

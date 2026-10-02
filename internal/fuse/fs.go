@@ -228,6 +228,11 @@ type rawFS struct {
 	pfSeq     atomic.Int64 // mount-wide decision sequence for the trace (#267)
 
 	// missMu/missSeen dedup the ENOENT-lookup breadcrumb (#240): the first time a
+	// streamingHandles is the number of handles that are ESTABLISHED SEQUENTIAL STREAMS,
+	// maintained by deltas from each read's detector transition and from Release. It is the
+	// divisor's input (#301); see perHandleWindow for why it is not len(handles).
+	streamingHandles atomic.Int64
+
 	// floorWarned caps the "readahead at the floor" warning at one line per mount. The
 	// condition is per-read and would otherwise flood (#301).
 	floorWarned atomic.Bool
@@ -305,13 +310,18 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			_, _ = fmt.Fprintln(tf, "seq,fh,pid,key,size,off,len,blk,gap,path,state_before,state_after,max_window,window,dispatched,peak_window")
 		}
 	}
-	// The realized readahead depth and the divisor that produces it (#298). Registered
-	// here rather than in cmd/lith because both are properties of this FS, and neither
-	// was observable at runtime: --max-readahead is logged as configured, and a reader
-	// holding 256 descriptors open reads at the window floor of 2 with nothing to show it.
+	// The realized readahead depth and the divisor that produces it (#298, #301). Registered
+	// here rather than in cmd/lith because all three are properties of this FS, and none was
+	// observable at runtime: --max-readahead is logged as configured, and a reader holding
+	// 256 descriptors open read at the window floor of 2 with nothing to show it.
+	//
+	// Both handle counts are exported, not just the divisor. Their GAP is the diagnostic:
+	// descriptors far above streams is the condition the old divisor charged for, and a
+	// deployment can now see it directly instead of inferring it from wall clock.
 	f.met.RegisterReadaheadWindow(
 		func() float64 { return float64(f.EffectiveWindow()) },
 		func() float64 { return float64(f.OpenHandles()) },
+		func() float64 { return float64(f.StreamingHandles()) },
 	)
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.
@@ -841,6 +851,9 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// never exceeded 17 blocks and the replay assumed 223 (#267). So it is recorded.
 		maxWin := f.perHandleWindow()
 		obs := h.pf.observe(blk, off, end, maxWin, &f.pfSeq)
+		if obs.streamDelta != 0 {
+			f.streamingHandles.Add(obs.streamDelta)
+		}
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
 				seq: obs.seq, fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
@@ -1082,6 +1095,10 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	delete(f.handles, input.Fh)
 	f.mu.Unlock()
 	if h != nil {
+		// Give up this handle's share of the budget, or the divisor only ever grows (#301).
+		if d := h.pf.releaseStreaming(); d != 0 {
+			f.streamingHandles.Add(d)
+		}
 		halvings, resets := h.pf.halvings(), h.pf.resets()
 		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
 		f.met.PrefetchSeeks(halvings, resets)
@@ -1262,20 +1279,12 @@ func (f *rawFS) byteExactThreshold() int64 {
 	return rt
 }
 
-// perHandleWindow is the readahead window, in blocks, a handle may use. It is the
-// configured --max-readahead, capped by what the whole prefetch budget could hold and
-// floored at 2.
-//
-// It divides by the open-handle count, which over-charges by exactly that count (#301) --
-// committed bytes track one window however many handles are charged. Replacing the division
-// with byte-exact admission was tried and REVERTED: it regressed concurrent readers by up to
-// 11x, because the division is an allocation discipline and not merely a total. The fix is to
-// change this divisor's INPUT, not to remove it.
 // OpenHandles is the count of open file descriptors on this mount, per descriptor across
 // every process. It USED to be perHandleWindow's divisor, which is why it is exported: the
 // gauge in #298 exists because nothing at runtime showed that a reader holding 256 files
 // open was silently reading at the window floor. It no longer sizes anything (#301); it is
-// kept as an observable because operators still need to see descriptor pressure.
+// kept as an observable because operators still need to see descriptor pressure, and because
+// the gap between it and StreamingHandles is the size of the error #301 was about.
 func (f *rawFS) OpenHandles() int64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -1286,61 +1295,83 @@ func (f *rawFS) OpenHandles() int64 {
 // --max-readahead whenever the budget or the handle count binds first (#297, #298).
 func (f *rawFS) EffectiveWindow() int64 { return f.perHandleWindow() }
 
+// StreamingHandles is the number of handles the detector is currently prefetching for --
+// established sequential streams. It is perHandleWindow's divisor (#301). The gap between
+// this and OpenHandles is exactly what the old divisor over-charged for: on the reporting
+// workload, ~288 descriptors against ~48 streams.
+func (f *rawFS) StreamingHandles() int64 { return f.streamingHandles.Load() }
+
+// perHandleWindow is the readahead window, in blocks, one handle may use: the configured
+// --max-readahead, capped by the share of the prefetch budget this handle is entitled to,
+// floored at 2. See the body for why there is a share and why its divisor counts streams
+// rather than descriptors (#301).
 func (f *rawFS) perHandleWindow() int64 {
 	maxW := f.maxReadahead()
 	budgetBlocks := f.budgetBlocks()
 	if budgetBlocks <= 0 {
 		return maxW
 	}
-	// THE SHARE. Each handle gets budgetBlocks/N, floored at 2 and capped at maxReadahead.
+	// THE SHARE. Each ESTABLISHED SEQUENTIAL STREAM gets budgetBlocks/N, floored at 2 and
+	// capped at maxReadahead.
 	//
-	// The divisor is known to be WRONG and is kept anyway, which needs explaining.
+	// N is the number of handles the detector is actually prefetching for, NOT the number of
+	// open file descriptors. That distinction is the whole of #301.
 	//
-	// It is wrong because N counts open file DESCRIPTORS -- across processes, per descriptor
-	// rather than per object, including descriptors never read. The error is linear in that
-	// count, because committed bytes track one window however many handles are charged for
-	// it: a mount at 256 descriptors is charged 4295 MB while holding 17.8 MB, and is
-	// throttled 6-10x for the difference. A job merely holding files open drives its own and
-	// every other reader's readahead to the floor of 2 whatever --max-readahead says.
+	// Why a share at all. Removing the rationing costs 13.8-22.4x wall and 4.2-5.2x the bytes
+	// with 81-92% of prefetch evicted unread (bench/prefetch-divisor/). Replacing it with a
+	// byte-exact cap on the same TOTAL was tried (ceeb2b7) and reverted: concurrent readers
+	// regressed 5.66x on the reported arm and up to 11x elsewhere, because the division is an
+	// ALLOCATION DISCIPLINE and not merely a total. 16 x 30 blocks covers sixteen readers
+	// shallowly; 2 x 223 + 14 x 0 commits the same total and covers two, and first-come
+	// admission produces the second. Every total-preserving check agreed with that change,
+	// including two pre-registered falsifiers, which is why the defect it introduced was
+	// found by an external measurement and not here.
 	//
-	// It is kept because removing the division was tried (#301, ceeb2b7, reverted) and
-	// regressed concurrent readers 5.66x on the arm that was asked for and up to 11x
-	// elsewhere -- with both pre-registered falsifiers clean, so nothing here predicted it.
-	// The replacement admitted prefetch against measured committed bytes, which bounds the
-	// same TOTAL byte-exactly and was within 2.4% of the divisor's realized commitment on a
-	// 16-reader oversubscribed tier. That argument compared totals, and the total was never
-	// the thing the divisor provided: it is an ALLOCATION DISCIPLINE. 16 x 30 blocks covers
-	// sixteen readers shallowly; 2 x 223 + 14 x 0 commits the same total and covers two.
-	// Equal totals, opposite outcomes. First-come-first-served admission produces the second.
+	// Why the input was wrong. len(f.handles) counts every open DESCRIPTOR on the mount --
+	// across processes, per descriptor rather than per object, including descriptors never
+	// read. So the charge was linear in a number the reader does not control: at 256
+	// descriptors a mount was charged 4295 MB, held 17.8 MB, and was throttled 6-10x for the
+	// difference. The workload that found this ran both production mounts at the floor of 2
+	// blocks -- 48 ranks x ~6 files is ~288 descriptors against the ~165 that gets you there
+	// -- reading 186 MB/s where 1293 was available, with no flag set wrong.
 	//
-	// Removing the rationing outright is worse still: 13.8-22.4x wall and 4.2-5.2x the bytes
-	// with 81-92% of prefetch evicted unread (bench/prefetch-divisor/).
+	// prefetch.Sequential is the predicate because it is exactly "is being prefetched for":
+	// the window grows geometrically from 2 in that state and nothing is prefetched in Random.
 	//
-	// So the fix is not to the division but to its INPUT -- counting established sequential
-	// streams rather than open descriptors keeps the discipline and drops the over-charge.
-	// That is tracked on #301 and is not this function yet.
-	f.mu.RLock()
-	n := int64(len(f.handles))
-	f.mu.RUnlock()
+	// Two consequences worth knowing, both bounded:
+	//
+	//  1. A handle computes its window from a count that does not yet include itself, since
+	//     perHandleWindow runs before the Observe that establishes it. Self-corrects on the
+	//     next read, and cannot under-charge persistently.
+	//  2. N readers starting together each see a near-zero count and so a full window. The
+	//     geometric ramp is what bounds the resulting burst: a handle's first dispatch is 2
+	//     blocks, not maxReadahead, so the count has settled long before any window is deep.
+	//
+	// KNOWN LIMITATION. A handle that establishes, reads a little, and then idles for the
+	// rest of the run keeps its share until it closes or the detector collapses it to Random.
+	// That still over-charges, just by far less than counting never-read descriptors did.
+	// Shedding it needs a read-idle condition, which needs a clock in the read path; whether
+	// that is worth the churn depends on an access shape this project does not have in hand,
+	// so it is a question on #301 rather than a mechanism guessed at here.
+	n := f.streamingHandles.Load()
 	if n < 1 {
 		n = 1
 	}
 	share, atFloor := shareClamp(budgetBlocks/n, maxW)
 	if atFloor {
-		// WARN ONCE, at the moment it actually happens. The reporting workload ran both
-		// production mounts here and could not tell: the mount logged the configured depth
-		// and `floor_at_descriptors` only PREDICTS the crossing, from a descriptor count
-		// nobody can know at startup because other processes contribute to it. This needs
-		// no prediction -- the share is 2 right now.
+		// WARN ONCE, at the moment it actually happens, because the startup prediction
+		// cannot be trusted alone: it is computed from a stream count nobody knows at mount.
+		// The reporting workload ran both production mounts at the floor and could not tell.
 		if f.floorWarned.CompareAndSwap(false, true) {
-			slog.Warn("readahead is at the 2-block floor: the prefetch budget is divided "+
-				"across more open descriptors than it can fund",
-				"open_descriptors", n,
+			slog.Warn("readahead is at the 2-block floor: more concurrent sequential streams "+
+				"than the prefetch budget can fund",
+				"streaming_handles", n,
+				"open_handles", f.OpenHandles(),
 				"budget_blocks", budgetBlocks,
 				"max_readahead", maxW,
-				"hint", "--prefetch-budget is the numerator of each reader's share; raise it. "+
-					"The descriptor count includes files held open by other processes and "+
-					"descriptors never read (#301).")
+				"hint", "--prefetch-budget is the numerator of every stream's share; raise it. "+
+					"Only handles being read sequentially are counted, so idle descriptors are "+
+					"not the cause (#301).")
 		}
 	}
 	return share

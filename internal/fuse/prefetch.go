@@ -26,6 +26,16 @@ type pfWrapper struct {
 	// concurrently enough could synthesize a gap over the threshold, be classified as
 	// seeking, and lose the readahead it had earned.
 	lastReadEnd int64
+	// streaming is whether this handle is an ESTABLISHED sequential stream -- the
+	// detector is in prefetch.Sequential, so it is actually being prefetched for. This is
+	// the divisor's input (#301), replacing the open-descriptor count.
+	//
+	// Kept here, as a bool under the handle's own mutex, rather than recomputed by walking
+	// every handle: perHandleWindow runs on every read, and the reporting workload has 6229
+	// handles, so an O(handles) scan taking each handle's lock per read would cost more
+	// than the misallocation it fixes. Transitions are reported as a delta to a mount-wide
+	// atomic instead.
+	streaming bool
 }
 
 // coverageWindow / coverageMin are the #221 coverage gate parameters, chosen
@@ -77,6 +87,11 @@ type observation struct {
 	// returned so the trace records the input to the decision rather than a re-derivation
 	// of it (#278).
 	gap int64
+	// streamDelta is the change this read made to the mount-wide established-stream count:
+	// +1 when the handle just became a sequential stream, -1 when it stopped being one, 0
+	// otherwise. Computed under the handle's lock with the transition it describes, for the
+	// same reason `after` is (#267): read afterwards, it could describe a different read.
+	streamDelta int64
 }
 
 // observe drives the detector for one read and returns everything the trace needs, all of
@@ -91,12 +106,13 @@ func (w *pfWrapper) observe(block, off, end, maxWindow int64, seq *atomic.Int64)
 	w.pf.SetMax(maxWindow)
 	d := w.pf.Observe(block, off, end-off, gap)
 	return observation{
-		dispatch: d,
-		seq:      seq.Add(1),
-		after:    w.pf.State(),
-		window:   w.pf.Window(),
-		peak:     w.pf.PeakWindow(),
-		gap:      gap,
+		dispatch:    d,
+		seq:         seq.Add(1),
+		after:       w.pf.State(),
+		window:      w.pf.Window(),
+		peak:        w.pf.PeakWindow(),
+		gap:         gap,
+		streamDelta: w.updateStreaming(),
 	}
 }
 
@@ -114,6 +130,7 @@ func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, seq *ato
 	return observation{
 		dispatch: d, seq: seq.Add(1), after: w.pf.State(),
 		window: w.pf.Window(), peak: w.pf.PeakWindow(), gap: 0,
+		streamDelta: w.updateStreaming(),
 	}
 }
 
@@ -185,4 +202,44 @@ func (w *pfWrapper) peakWindow() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.pf.PeakWindow()
+}
+
+// updateStreaming recomputes whether this handle is an established sequential stream and
+// returns the change to the mount-wide count. Called under w.mu, with the Observe whose
+// transition it reports.
+//
+// prefetch.Sequential is exactly the condition "this handle is being prefetched for": the
+// window grows geometrically from 2 in that state and nothing is prefetched in Random. So a
+// descriptor that is open but never read, or one the detector has given up on, contributes
+// nothing to the divisor -- which is the whole correction.
+func (w *pfWrapper) updateStreaming() int64 {
+	now := w.pf.State() == prefetch.Sequential
+	if now == w.streaming {
+		return 0
+	}
+	w.streaming = now
+	if now {
+		return 1
+	}
+	return -1
+}
+
+// releaseStreaming gives up this handle's share, for the close path. Returns the delta to
+// apply to the mount-wide count, and is idempotent so a double Release cannot drive the
+// count negative.
+//
+// This is the half the reverted admission attempt did not have: rawFS.Release deleted the
+// handle without releasing its prefetch commitment, so under a hard byte cap one closed
+// handle could pin the whole budget forever if the working set fit the memory tier. A
+// divisor cannot leak that way -- it is recomputed from a live count rather than
+// accumulated -- but the count itself still has to be decremented here or it only ever
+// grows.
+func (w *pfWrapper) releaseStreaming() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.streaming {
+		return 0
+	}
+	w.streaming = false
+	return -1
 }

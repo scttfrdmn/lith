@@ -26,11 +26,12 @@ import (
 //     for prefetch not yet demanded": these callers Reserve before a fetch and Release
 //     when it COMPLETES (see rawFS.prefetchWhole, "releasing the reservation when they
 //     complete"), so `reserved` measures bytes being fetched, not bytes held unread. Per-handle
-//     sequential readahead DOES still size its window from Budget(), by dividing it by the
-//     open-handle count — which over-charges by exactly that count (#301). Replacing that
-//     division with byte-exact admission was tried and reverted: the division is an
-//     allocation discipline, not merely a total, and removing it starved concurrent readers
-//     by up to 11x. The open fix is to that divisor's input, not to this interface.
+//     sequential readahead DOES still size its window from Budget(), by dividing it across the
+//     handles that are established sequential streams. It used to divide by the OPEN
+//     DESCRIPTOR count, which over-charged by exactly that count; #301 changed the input, not
+//     the division. Replacing the division with byte-exact admission was also tried and
+//     reverted: a share is an allocation discipline, not merely a total, and removing it
+//     starved concurrent readers by up to 11x.
 //
 //   - Neighborhood: the next keys in Index order under a file's directory, so a
 //     directory being walked in key order can be read ahead across siblings.

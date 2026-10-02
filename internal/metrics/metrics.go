@@ -292,32 +292,38 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 	}, f))
 }
 
-// RegisterReadaheadWindow registers gauges for the readahead depth a handle will
-// actually be given and the divisor that produces it (#298).
+// RegisterReadaheadWindow registers gauges for the readahead depth a handle will actually
+// be given and the two handle counts that bear on it (#298, #301).
 //
-// perHandleWindow is clamp(prefetchBudgetBlocks / openHandles, 2, max-readahead), and
-// openHandles counts every open file DESCRIPTOR on the mount — mount-wide, across
-// processes, including descriptors that have never been read. So a reader holding files
-// open collapses its own and everyone else's prefetch depth, and until these gauges
-// existed there was nothing at runtime that showed it: `--max-readahead` is logged as
-// configured, and the realized window appeared nowhere.
+// perHandleWindow is clamp(prefetchBudgetBlocks / streamingHandles, 2, max-readahead).
+// streamingHandles counts handles the detector is actually prefetching for; openHandles
+// counts every open file DESCRIPTOR on the mount, across processes, including descriptors
+// never read.
 //
-// Measured consequence: 256 open descriptors drive the window to its floor of 2 and cost
-// 6.38x the wall clock on +0.4% bytes and +3% requests — invisible to every byte and
-// request counter, which is why it took an external workload and a dozen gates to find.
-// Both GCHP production mounts ran there.
-func (m *Metrics) RegisterReadaheadWindow(window, openHandles func() float64) {
+// BOTH are exported, and their gap is the point. openHandles USED to be the divisor, which
+// meant a reader holding files open collapsed its own and everyone else's prefetch depth:
+// 256 open descriptors drove the window to its floor of 2 and cost 6.38x the wall clock on
+// +0.4% bytes and +3% requests — invisible to every byte and request counter, which is why
+// it took an external workload and a dozen gates to find, and why both GCHP production
+// mounts ran there. #301 changed the divisor's input, so the gap is now diagnostic rather
+// than causal: wide means many idle descriptors (no longer a problem), narrow-and-crowded
+// means genuinely more streams than the budget can fund (raise --prefetch-budget).
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles func() float64) {
 	if m == nil {
 		return
 	}
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_readahead_window_blocks",
-		Help: "Readahead depth in blocks a handle is currently given: clamp(prefetch-budget/open-handles, 2, --max-readahead). This is the EFFECTIVE window; --max-readahead is only an upper bound on it (#298).",
+		Help: "Readahead depth in blocks a handle is currently given: clamp(prefetch-budget/streaming-handles, 2, --max-readahead). This is the EFFECTIVE window; --max-readahead is only an upper bound on it (#298).",
 	}, window))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_open_handles",
-		Help: "Open file descriptors on the mount. This is the divisor for the readahead window, counted per DESCRIPTOR across all processes including descriptors never read, so holding files open shrinks prefetch depth (#298).",
+		Help: "Open file descriptors on the mount, counted per DESCRIPTOR across all processes including descriptors never read. This USED to be the readahead divisor, which is why holding files open shrank prefetch depth (#298); it no longer is (#301). Compare with lith_streaming_handles.",
 	}, openHandles))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_streaming_handles",
+		Help: "Handles being prefetched for: established sequential streams. This is the divisor for the readahead window (#301). Its gap from lith_open_handles is what the old divisor over-charged for -- on the workload that found this, ~288 descriptors against ~48 streams.",
+	}, streamingHandles))
 }
 
 // RegisterPrefetchBudget registers gauges for what --prefetch-budget actually bounds:
@@ -326,9 +332,10 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles func() float64) {
 //
 // Until these existed the budget was enforced only by a PROXY -- the per-handle window
 // times the open-handle count -- and the proxy was the only observable. That matters
-// because the proxy is what makes the divisor charge for idle file descriptors, at a
+// because the proxy is what made the divisor charge for idle file descriptors, at a
 // measured 6.38x wall-clock cost, and nobody could see whether the real quantity was
-// anywhere near its limit.
+// anywhere near its limit. The divisor now counts streams (#301), but these remain the
+// only view of the quantity itself.
 //
 // Do not check these against the proxy. An estimator built from dispatch counts returns
 // the standing window by construction, so "resident ~= window x handles" is an identity
@@ -339,7 +346,7 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
 	}
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_prefetch_committed_bytes",
-		Help: "Bytes prefetch has committed and nothing has consumed: the quantity --prefetch-budget bounds. Counted from DISPATCH, so it includes bytes still in flight -- this is NOT a resident-memory figure. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for it, and over-charges by the open-handle count (#301).",
+		Help: "Bytes prefetch has committed and nothing has consumed: the quantity --prefetch-budget bounds. Counted from DISPATCH, so it includes bytes still in flight -- this is NOT a resident-memory figure. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for it, and over-charges by the window x handles proxy; compare against lith_streaming_handles, not lith_open_handles (#301).",
 	}, resident))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_prefetch_budget_bytes",
