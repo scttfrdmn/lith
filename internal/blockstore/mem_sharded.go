@@ -40,7 +40,16 @@ func (m *memCache) Unpin(key string) { m.shard(key).Unpin(key) }
 func (m *memCache) MergeUnread(key string, data []byte, f uint16) {
 	m.shard(key).MergeUnread(key, data, f)
 }
-func (m *memCache) MarkUnread(key string)  { m.shard(key).MarkUnread(key) }
+func (m *memCache) MarkUnread(key string) { m.shard(key).MarkUnread(key) }
+
+// UnreadBytes sums the resident-unread bytes across shards (#313).
+func (m *memCache) UnreadBytes() int64 {
+	var n int64
+	for _, sh := range m.shards {
+		n += sh.UnreadBytes()
+	}
+	return n
+}
 func (m *memCache) ClearUnread(key string) { m.shard(key).ClearUnread(key) }
 
 // setOnEvictUnread installs the thrash callback on every shard.

@@ -109,6 +109,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith_prefetch_unread_resident_bytes`: the quantity eviction-before-read is actually
+  about** ([#313](https://github.com/scttfrdmn/lith/issues/313)). Bytes held in the memory
+  tier that nothing has read, read from the tier itself.
+
+  `lith_prefetch_committed_bytes` counts from *dispatch*, so it sums resident-unread **and**
+  still-in-flight — and only the resident half can evict anything. An external measurement
+  found committed/tier separating clean from collapsed runs at **1.20 vs 1.21** across two
+  boxes 12× apart in RAM, a suspiciously tight edge for a ratio whose numerator includes
+  bytes that cannot cause an eviction, and could not explain why committed plateaued near
+  1.55× tier. Both resolve if `committed ≈ resident-unread + in-flight`: resident-unread
+  cannot exceed the tier by construction, so the plateau is the tier plus what is in flight,
+  and the real condition is **resident-unread approaching tier capacity** — at which point
+  every arriving chunk must evict an unread one. That is a mechanism rather than a fitted
+  threshold, and this gauge is what lets it be tested.
+
+  Also immune to a known inaccuracy in the committed figure: prefetch commitment is never
+  released when a handle closes, so committed ratchets on a mount whose working set fits the
+  tier. This is read from the tier and cannot.
+
+  Maintained incrementally across six call sites (mark, clear, three merge paths, both
+  eviction paths), because a scan would be `O(resident)` under a shard lock. Guarded by an
+  invariant test that recomputes from the authoritative state after 4000 randomized
+  operations — that class of counter has drifted in this package before.
+
 - **`lith_streaming_handles`: the divisor, as opposed to the descriptor count**
   ([#301](https://github.com/scttfrdmn/lith/issues/301)). Handles being prefetched for.
   `lith_open_handles` is kept alongside it and no longer sizes anything; the **gap** between

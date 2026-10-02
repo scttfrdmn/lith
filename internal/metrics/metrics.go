@@ -340,7 +340,7 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles 
 // Do not check these against the proxy. An estimator built from dispatch counts returns
 // the standing window by construction, so "resident ~= window x handles" is an identity
 // that will pass whether or not either number is right.
-func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
+func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident func() float64) {
 	if m == nil {
 		return
 	}
@@ -352,6 +352,10 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit func() float64) {
 		Name: "lith_prefetch_budget_bytes",
 		Help: "The --prefetch-budget limit in bytes (default 50%% of --mem-cache). lith_prefetch_committed_bytes is what is actually held against it.",
 	}, limit))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_prefetch_unread_resident_bytes",
+		Help: "Bytes HELD IN THE MEMORY TIER that nothing has read. This -- not lith_prefetch_committed_bytes -- is the quantity eviction-before-read is about: committed counts from dispatch and so includes bytes still in flight, which cannot evict anything. Compare against --mem-cache, not --prefetch-budget: the collapse condition is this approaching tier CAPACITY, at which point every arriving chunk must evict an unread one (#313).",
+	}, unreadResident))
 }
 
 // Handler returns the Prometheus HTTP handler for this registry.
