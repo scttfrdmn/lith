@@ -1103,6 +1103,10 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		halvings, resets := h.pf.halvings(), h.pf.resets()
 		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
 		f.met.PrefetchSeeks(halvings, resets)
+		// #316: the coverage gate's rejections, which are indistinguishable from a correct
+		// classification by every other counter -- byte amplification was 1.001 on the run
+		// that measured 243x.
+		f.met.PrefetchLowCoverage(h.pf.lowCoverage())
 		// #256: make the evidence gate's action observable. Without this the only
 		// visible effect is that `issued` fell, which cannot distinguish a window
 		// the gate refused from one the detector never wanted — and cannot say

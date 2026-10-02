@@ -109,6 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith_prefetch_low_coverage_total`: the counter that makes a non-establishing handle
+  explicable** ([#316](https://github.com/scttfrdmn/lith/issues/316)). Reads the #221 coverage
+  gate forced Random. `Prefetcher.LowCoverage()` has existed since #221 and was never wired to
+  a metric.
+
+  It is the signal that separates two states nothing else distinguishes: a handle that is a
+  scattered walk, as designed, from a handle that is a **dense stream whose sibling reads were
+  absorbed by the shared kernel page cache**. The second was measured at **243× slower** with
+  byte amplification of **1.001** — the cleanest byte count of any cell in that gate and the
+  slowest per distinct byte. Bytes, requests and `prefetch_issued_total` all look correct or
+  better; this counter and `evicted_unread` are the only things that move.
+
 - **`lith_prefetch_unread_resident_bytes`: the quantity eviction-before-read is actually
   about** ([#313](https://github.com/scttfrdmn/lith/issues/313)). Bytes held in the memory
   tier that nothing has read, read from the tier itself.

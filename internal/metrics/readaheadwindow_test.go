@@ -117,3 +117,35 @@ func TestPrefetchBudgetGaugesSeparateResidentFromInFlight(t *testing.T) {
 		t.Error("the resident-unread gauge is reporting the committed total")
 	}
 }
+
+// #316: the coverage gate's rejections must be scrapeable.
+//
+// Concurrent readers of ONE object have each other's reads absorbed by the shared kernel
+// page cache, so each handle sees a punctate offset stream, the #221 coverage gate forces it
+// Random, and nothing prefetches. Measured at 243x slower with byte amplification of 1.001 —
+// so bytes, requests, and `prefetch_issued_total` all look correct or better. This counter
+// and `lith_prefetch_evicted_unread_total` are the only things that move.
+func TestLowCoverageCounterIsScrapeable(t *testing.T) {
+	m := New()
+	scrape := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	// Registered at zero, so an absent series cannot be read as a missing feature.
+	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 0") {
+		t.Error("the counter is not emitted at zero")
+	}
+
+	m.PrefetchLowCoverage(430)
+	m.PrefetchLowCoverage(0) // a handle that never tripped the gate must not change it
+	if got := scrape(); !strings.Contains(got, "lith_prefetch_low_coverage_total 430") {
+		t.Error("scrape missing lith_prefetch_low_coverage_total 430")
+	}
+
+	// Nil-safe, like every other recorder here: a mount without --metrics must not panic.
+	var nilM *Metrics
+	nilM.PrefetchLowCoverage(1)
+}
