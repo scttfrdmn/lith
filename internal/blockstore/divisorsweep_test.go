@@ -16,13 +16,18 @@ import (
 
 // #301: does the prefetch-budget divisor earn its cost?
 //
-// perHandleWindow rations readahead as clamp(budgetBlocks/openHandles, 2, maxReadahead), and
-// that over-charges by exactly the open-handle count -- committed bytes track one window
-// however many handles are charged. Replacing the division with byte-exact admission was
-// tried and REVERTED (see the divisor comment in internal/fuse/fs.go): it starved concurrent
-// readers by up to 11x, because the division is an ALLOCATION DISCIPLINE and not merely a
-// total. 16 x 30 blocks covers sixteen readers shallowly; 2 x 223 + 14 x 0 commits the same
-// total and covers two.
+// perHandleWindow rations readahead as clamp(budgetBlocks/N, 2, maxReadahead). Replacing the
+// division with byte-exact admission on the same TOTAL was tried and REVERTED (see the divisor
+// comment in internal/fuse/fs.go): it starved concurrent readers by up to 11x, because the
+// division is an ALLOCATION DISCIPLINE and not merely a total. 16 x 30 blocks covers sixteen
+// readers shallowly; 2 x 223 + 14 x 0 commits the same total and covers two.
+//
+// N is the count of established sequential streams (#301; it was the open-descriptor count,
+// which over-charged by exactly that count). Every reader in this fixture streams, so N here
+// is the reader count either way -- which is why this sweep is unchanged by that fix and
+// equally cannot measure it. What the input change buys is depth for mounts with idle
+// descriptors, and depth costs WALL CLOCK, which a fake server returning instantly cannot
+// price at all. That half needs real S3.
 //
 // So this guards the share. The two arms are one variable apart: `divisor` advances a
 // frontier budgetBlocks/N ahead as perHandleWindow does, `neutral` advances the whole budget
