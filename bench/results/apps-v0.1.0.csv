@@ -1,0 +1,33 @@
+# lith v0.1.0 application benchmarks. us-east-1, c8gd.4xlarge. Rates(API): inst $0.78384/hr; gp3 $0.08/GB-mo(+$0.005/IOPS-mo,+$0.04/MBps-mo, baseline 3000/125 meets all apps so no provisioning); S3 GET $4e-7; NVMe copy ~1000MB/s, gp3 copy ~125MB/s (session 11); FSx Lustre SSD ~$0.14/GB-mo x 1.2TiB min ~ $0.23/hr; EFS ~$0.30/GB-mo+$0.03/GB-read; io2 NOT needed (peak app IOPS 10-78 << gp3 3000).
+# COPY paths pull the FULL object (can't copy just the working set); lith & in-place pull only the working set. compute_local ~= lith warm (data-local, CPU-bound). Zarr copy = whole store (impractical). R4 ookla us-west-2 (demand region-independent; in-place pyarrow-S3 cross-region errored). S4 (WebDataset/PyTorch) NOT RUN: no us-east-1 public WebDataset dataset; needs staging.
+app,class,substrate,minutes,dollars,GB_pulled,peak_GET_iops,note
+S1,streaming,lith-cold,0.79,0.01052,3.56,74,
+S1,streaming,lith-warm,0.78,0.01031,3.56,74,
+S1,streaming,gp3-copy,1.26,0.01648,3.56,74,
+S1,streaming,nvme-copy,0.84,0.01092,3.56,74,
+S2,streaming,lith-cold,0.89,0.01179,3.60,138,
+S2,streaming,lith-warm,1.02,0.01353,3.60,138,
+S2,streaming,gp3-copy,1.43,0.01871,3.77,138,
+S2,streaming,nvme-copy,0.98,0.01282,3.77,138,
+S3,mixed,lith-cold,0.67,0.00900,0.80,40,"copy=whole store, impractical"
+S3,mixed,lith-warm,0.09,0.00145,0.80,40,"copy=whole store, impractical"
+R1,random,lith-cold,0.13,0.00174,0.32,30,1000 regions touch ~all bgzf blocks
+R1,random,lith-warm,0.12,0.00165,0.32,30,1000 regions touch ~all bgzf blocks
+R1,random,gp3-copy,0.17,0.00223,0.33,30,1000 regions touch ~all bgzf blocks
+R1,random,nvme-copy,0.13,0.00171,0.33,30,1000 regions touch ~all bgzf blocks
+R2,random,lith-cold,0.83,0.01095,0.81,78,
+R2,random,lith-warm,0.74,0.00971,0.81,78,
+R2,random,gp3-copy,2.53,0.03311,13.12,78,
+R2,random,nvme-copy,0.96,0.01257,13.12,78,
+R3,random,lith-cold,0.02,0.00020,0.03,10,trad in-place: h5py/s3fs 1.67s
+R3,random,lith-warm,0.00,0.00005,0.03,10,trad in-place: h5py/s3fs 1.67s
+R3,random,gp3-copy,0.01,0.00010,0.03,10,trad in-place: h5py/s3fs 1.67s
+R3,random,nvme-copy,0.00,0.00005,0.03,10,trad in-place: h5py/s3fs 1.67s
+R4,random,lith-cold,0.04,0.00058,0.31,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
+R4,random,lith-warm,0.00,0.00006,0.31,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
+R4,random,gp3-copy,0.06,0.00072,0.39,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
+R4,random,nvme-copy,0.01,0.00011,0.39,65,ookla us-west-2 (demand region-indep); in-place pyarrow-S3
+S3,mixed,inplace-s3fs-cold,0.17,0.00243,0.80,40,"xarray+s3fs concurrent async chunk fetch; 4x faster COLD than lith (40.1s)"
+S3,mixed,inplace-s3fs-warm,0.14,0.00214,0.80,40,"s3fs no cross-run chunk cache -> warm~=cold; lith warm 5.4s wins"
+R3,random,inplace-s3fs-cold,0.02,0.00029,0.03,10,"h5py over s3fs file-obj; ros3 driver UNAUTHORIZED anonymous (HDF5 1.14 conda-forge 2026-09-08)"
+R3,random,inplace-s3fs-warm,0.01,0.00013,0.03,10,"h5py over s3fs"
