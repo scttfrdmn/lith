@@ -360,7 +360,7 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident func() 
 	}
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_prefetch_committed_bytes",
-		Help: "Bytes prefetch has committed and nothing has consumed: the quantity --prefetch-budget bounds. Counted from DISPATCH, so it includes bytes still in flight -- this is NOT a resident-memory figure. Compare with lith_prefetch_budget_bytes; the per-handle readahead window is only a proxy for it, and over-charges by the window x handles proxy; compare against lith_streaming_handles, not lith_open_handles (#301).",
+		Help: "Bytes prefetch has committed and nothing has consumed, which is exactly resident-unread PLUS queued-for-a-slot PLUS on-the-wire. Charged at DISPATCH, before the prefetch and S3 semaphores, so --inflight-bytes does NOT bound it: that bounds the wire, not the queue. This is not a resident-memory figure. At rest it equals lith_prefetch_unread_resident_bytes exactly; use that one, not this, to judge memory-tier pressure (#313, #320).",
 	}, resident))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_prefetch_budget_bytes",

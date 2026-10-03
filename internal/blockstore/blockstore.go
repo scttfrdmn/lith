@@ -949,8 +949,18 @@ func (bs *BlockStore) dropPrefetched(ck string) bool {
 // gates on this number needs a release path on handle close first -- rawFS.Release has none,
 // so a closed handle's commitment never clears when the working set fits the memory tier.
 //
-// Counted from DISPATCH, so it includes bytes whose GET is still in flight. Not a
-// resident-memory figure.
+// WHAT IT COUNTS, precisely: resident-unread + queued-for-a-slot + on-the-wire. The charge
+// happens in Prefetch, BEFORE fillRun waits on the prefetch and S3 semaphores, and Prefetch
+// runs one goroutine per block -- so the figure includes chunks that are only queued. That
+// matters because --inflight-bytes bounds the WIRE, not the queue, and comparing the two was
+// what made an external measurement read a 9-27 GB "leak" that did not exist (#320).
+//
+// At rest it equals PrefetchUnreadResidentBytes exactly, measured in four isolated cells. Use
+// that one to judge memory-tier pressure; it is the quantity eviction-before-read is about,
+// and it cannot include bytes that have not landed and so cannot evict anything.
+//
+// Release does ratchet this figure -- a closed handle's unconsumed chunks stay charged -- but
+// it opens no gap, because those chunks are still unread-resident and both gauges hold them.
 func (bs *BlockStore) PrefetchCommittedBytes() int64 { return bs.pfCommittedBytes.Load() }
 
 // PrefetchUnreadResidentBytes is the bytes HELD IN THE MEMORY TIER that nothing has read
