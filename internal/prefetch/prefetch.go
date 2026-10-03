@@ -503,6 +503,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 			p.frontier = p.cursor + 1
 			return nil
 		}
+		justEstablished := p.state != Sequential
 		if p.state == Sequential {
 			p.window = min(p.window*2, p.windowCap())
 		} else {
@@ -526,8 +527,35 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		if p.window > p.peakWindow {
 			p.peakWindow = p.window
 		}
-		if p.frontier < p.cursor+1 {
-			p.frontier = p.cursor + 1
+		// THE FIRST BLOCK PREFETCHED USED TO BE cursor+1, SKIPPING THE ONE THE READER IS IN.
+		//
+		// Establishment fires on the first BLOCK ADVANCE, so at that moment the reader has
+		// just crossed into the current block and has most of it still ahead -- 63 more
+		// 128 KiB reads of an 8 MiB block. Clamping the frontier to cursor+1 meant those were
+		// all served as separate demand chunk GETs, so block 1 repeated block 0's cost
+		// exactly (#233).
+		//
+		// Measured on a real mount with --timeline-csv: lag_ms is -1 for chunks 0-15 in every
+		// one of 12 opens -- none of the first sixteen chunks was ever prefetched -- and the
+		// reader is stalled 206-431 ms in block 0 and a further 245-389 ms in block 1, out of
+		// a 569-957 ms read. The first prefetched block was block 2. Those two blocks are the
+		// whole of the ~0.47 s per-open intercept that #284 could not account for.
+		//
+		// Block 0 is irreducible: establishment cannot fire before a block advance, and #231
+		// refuted three ways to establish sooner. Block 1 is not -- the reader is one chunk
+		// into it and the other seven are ahead. Dispatching from the cursor rather than past
+		// it costs nothing when it is already covered, because the chunk singleflight joins a
+		// demand fill already in flight instead of duplicating it.
+		//
+		// Only at establishment. A handle mid-stream has its frontier well ahead, so the
+		// clamp never fires for it, and re-dispatching a block the reader has nearly finished
+		// would be waste rather than lead.
+		first := p.cursor + 1
+		if justEstablished {
+			first = p.cursor
+		}
+		if p.frontier < first {
+			p.frontier = first
 		}
 		return p.advance(p.cursor + 1 + p.window)
 	}
