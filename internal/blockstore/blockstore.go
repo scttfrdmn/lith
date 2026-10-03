@@ -172,7 +172,10 @@ type BlockStore struct {
 	// timeline is the optional per-chunk diagnostic sink (#70); nil unless the
 	// installed Recorder implements chunkTimelineRecorder. When nil the read
 	// path takes no extra clock reads or counter updates.
-	timeline   chunkTimelineRecorder
+	timeline chunkTimelineRecorder
+	// openRec is the optional handle-open sink (#284); nil unless the installed Recorder
+	// implements handleOpenRecorder.
+	openRec    handleOpenRecorder
 	fill       fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
 	backing    backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
 	zdec       *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
@@ -281,6 +284,9 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		inflight:      make(map[string]*chunkState),
 		stale:         make(map[string]struct{}),
 		demand:        make(map[string]*demandGather),
+	}
+	if r, ok := cfg.Recorder.(handleOpenRecorder); ok {
+		bs.openRec = r
 	}
 	if r, ok := cfg.Recorder.(chunkTimelineRecorder); ok {
 		bs.timeline = r
@@ -1079,6 +1085,35 @@ type ChunkEvent struct {
 type chunkTimelineRecorder interface {
 	PrefetchDispatch(key string, chunk int64, at time.Time)
 	ChunkRead(ev ChunkEvent)
+}
+
+// handleOpenRecorder is a further optional extension: implementers are told when the
+// filesystem opens a handle, so a timeline can measure the interval between an application's
+// open and the first byte it gets back (#284).
+//
+// A SEPARATE interface rather than a method on chunkTimelineRecorder, so adding it breaks no
+// existing implementer -- the same reason that one is asserted rather than required. It is
+// asserted independently, so a recorder may implement either, both, or neither.
+//
+// This exists because the instrument needed to explain lith's largest unaccounted-for cost did
+// not. An external deployment fitted a 0.47 s per-object-open intercept -- 72% of a 260 MB
+// read's wall -- and the artifact asked for to explain it, --pf-trace, has no timestamp column
+// at all: its `seq` is a monotonic decision counter. --timeline-csv does have timestamps, but
+// nothing marked the open, so the gap could only be inferred from process start.
+type handleOpenRecorder interface {
+	HandleOpen(key string, size int64, at time.Time)
+}
+
+// NoteHandleOpen records that the filesystem opened a handle on this key, for the optional
+// timeline sink (#284). A no-op when no recorder wants it, which is every mount without
+// --timeline-csv.
+//
+// Lives here rather than in internal/fuse because the Recorder is the store's, and this keeps
+// the one place that knows about optional recorder extensions in one package.
+func (bs *BlockStore) NoteHandleOpen(key string, size int64) {
+	if bs.openRec != nil {
+		bs.openRec.HandleOpen(key, size, time.Now())
+	}
 }
 
 // emitChunk records one demand-chunk timeline event (only called when
