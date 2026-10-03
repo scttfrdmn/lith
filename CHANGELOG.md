@@ -68,6 +68,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stride must now repeat twice before the detector believes it**
+  ([#222](https://github.com/scttfrdmn/lith/issues/222)). The Strided branch declared a
+  pattern on **one** repeated block delta, with no byte-gap bound (unlike the sequential
+  branch beside it) and no coverage check — and deliberately before the seek rule, because a
+  large gap is what a stride is. So its entire evidence was one coincidence.
+
+  That is structural, not theoretical: over a walk spanning `B` blocks, consecutive deltas
+  collide with probability ~`1/B`, so `N` reads yield ~`N/B` false strides. A **genuinely
+  random** `mmap` walk was measured flipping Random → Strided **7 times in 2471 reads**, on
+  gaps of +55 MB, +166 MB and +131 MB, dispatching prefetch for +27 MB over distinct
+  ([#232](https://github.com/scttfrdmn/lith/issues/232)).
+
+  Requiring two repeats takes the rate from ~`1/B` to ~`1/B²`. Measured: **0 flips across 8
+  random walks** of 2471 reads where one repeat predicted ~22 per seed, and the random-walk
+  harness's own byte total fell 4–6%, against the 7% over-fetch measured on hardware. A real
+  strided reader — a FITS cutout walking row segments, a hyperslab — meets two repeats
+  trivially and establishes exactly one read later.
+
+  The run gates **entry only**. Re-counting on an established handle made it predict on
+  alternate reads (11 dispatches over 24 strided reads instead of 21); that was a bug in the
+  first version of this fix, caught because the test asserts dispatch volume and not just the
+  final state.
+
 - **`--mem-cache` below 64 MiB no longer silently disables the memory tier**
   ([#307](https://github.com/scttfrdmn/lith/issues/307)). The tier was a fixed 64 shards, and
   `mem2Q` refuses any store larger than a shard's capacity — so any `--mem-cache` giving

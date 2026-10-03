@@ -61,14 +61,17 @@ func TestSequentialWindowGrowsGeometrically(t *testing.T) {
 
 func TestStridedPredictsNext(t *testing.T) {
 	p := New(32)
-	// delta 5: confirmed on the second delta, then predicts one block ahead.
+	// delta 5, confirmed on the SECOND repeat (strideRun = 2, i.e. three consecutive reads at
+	// the same delta), then predicting one block ahead. It used to confirm on the first
+	// repeat; #222 added the run because one repeat fires on coincidence -- a genuinely
+	// random walk was measured flipping to Strided 7 times in 2471 reads.
 	got := [][]int64{
 		p.Observe(0, 0, 0, 0),  // cold: establish last
-		p.Observe(5, 0, 0, 0),  // first delta 5, not confirmed
-		p.Observe(10, 0, 0, 0), // confirmed -> predict 15
-		p.Observe(15, 0, 0, 0), // predict 20
+		p.Observe(5, 0, 0, 0),  // first delta 5, nothing to compare against
+		p.Observe(10, 0, 0, 0), // delta 5 repeats once: not yet enough evidence
+		p.Observe(15, 0, 0, 0), // repeats twice -> Strided, predict 20
 	}
-	want := [][]int64{nil, nil, {15}, {20}}
+	want := [][]int64{nil, nil, nil, {20}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("strided dispatches = %v, want %v", got, want)
 	}
@@ -223,16 +226,16 @@ func TestDoubleSeekRandomThenRecover(t *testing.T) {
 
 // TestStrideUnchanged: a constant non-unit delta is detected as strided and
 // dispatches only the single next predicted block (evaluated before the seek
-// rule).
+// rule). Confirmation takes two repeats since #222; see TestStridedPredictsNext.
 func TestStrideUnchanged(t *testing.T) {
 	p := New(32)
 	got := [][]int64{
 		p.Observe(0, 0, 0, 0),  // establish
-		p.Observe(8, 0, 0, 0),  // first delta 8, unconfirmed
-		p.Observe(16, 0, 0, 0), // confirmed -> predict 24
-		p.Observe(24, 0, 0, 0), // predict 32
+		p.Observe(8, 0, 0, 0),  // first delta 8, nothing to compare against
+		p.Observe(16, 0, 0, 0), // repeats once: not yet enough evidence
+		p.Observe(24, 0, 0, 0), // repeats twice -> Strided, predict 32
 	}
-	want := [][]int64{nil, nil, {24}, {32}}
+	want := [][]int64{nil, nil, nil, {32}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("strided dispatches = %v, want %v", got, want)
 	}
