@@ -68,6 +68,9 @@ type Prefetcher struct {
 	haveLast  bool
 	lastBlock int64
 	lastDelta int64
+	// deltaRun is how many CONSECUTIVE reads have now repeated lastDelta. A stride is
+	// declared at strideRun repeats, not at one (#222).
+	deltaRun  int
 	state     State
 	window    int64
 	cursor    int64 // highest block demanded
@@ -329,6 +332,10 @@ func absInt64(x int64) int64 {
 // State returns the current detected pattern.
 func (p *Prefetcher) State() State { return p.state }
 
+// strideRun is how many times a non-unit block delta must repeat before the handle is
+// declared Strided (#222). Two repeats -- three consecutive reads at the same delta.
+const strideRun = 2
+
 // covReads is the minimum reads before coverage can judge tiling (#229). Below
 // it the trailing window is too short to separate a stream from a walk, so the
 // handle is treated as not-yet-established and served precise.
@@ -418,13 +425,47 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		return nil
 	}
 
-	// Strided detection (before the seek rule): a constant non-unit delta seen
-	// twice. Not evaluated once a sequential stream is established, so an
-	// in-band reorder whose deltas happen to repeat is not misread as a stride.
+	// Strided detection (before the seek rule): a constant non-unit delta repeated
+	// strideRun times. Not evaluated once a sequential stream is established, so an in-band
+	// reorder whose deltas happen to repeat is not misread as a stride.
+	//
+	// WHY A RUN AND NOT ONE REPEAT (#222). This branch has no byte-gap bound -- unlike the
+	// sequential branch below, which requires absInt64(byteGap) <= seqGapMax -- and no
+	// coverage check, and it runs before the seek rule on purpose, because a large gap is
+	// what a stride IS. So its only evidence is the delta repeating, and one repeat is weak:
+	// over a walk spanning B blocks, consecutive deltas collide by chance with probability
+	// ~1/B, so N reads yield ~N/B false strides.
+	//
+	// That is structural rather than theoretical. A GENUINELY RANDOM mmap walk was measured
+	// flipping Random -> Strided 7 times in 2471 reads, on coincidental gaps of +55 MB,
+	// +166 MB and +131 MB, dispatching prefetch for +27 MB over distinct (#232's 5f-P11; the
+	// prediction for 109 blocks and 2471 reads was ~23, so 7 is the same order). This
+	// package's own random-walk harness had been reporting strided=1 and strided=3 over 281
+	// and 1126 reads before anyone went looking.
+	//
+	// Requiring the delta to repeat twice takes the false-positive rate from ~1/B to ~1/B^2,
+	// which turns that predicted ~23 into ~0.2. A real strided reader -- a FITS cutout
+	// walking row segments, a hyperslab -- meets it trivially and establishes exactly one
+	// read later.
 	if d != 1 && d == p.lastDelta && p.state != Sequential {
+		// The run gates ENTRY only. An already-strided handle must keep predicting on every
+		// read: re-counting here made it dispatch on alternate reads, halving the branch's
+		// usefulness for its legitimate users (11 predictions over 24 strided reads instead
+		// of 21). Caught by TestStrideStillEstablishesForARealStride, which is the reason
+		// that test asserts dispatch volume and not just the final state.
+		if p.state != Strided {
+			p.deltaRun++
+			if p.deltaRun < strideRun {
+				// Not yet enough evidence. Hold the delta so a third read can confirm it,
+				// and dispatch nothing.
+				p.lastDelta = d
+				return nil
+			}
+		}
 		p.state = Strided
 		p.pending = false
 		p.lastDelta = d
+		p.deltaRun = 0
 		p.cursor = blockIdx
 		pred := blockIdx + d
 		if pred >= p.frontier {
@@ -441,6 +482,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 	if (d == 1 || p.inBand(blockIdx)) && absInt64(byteGap) <= p.seqGapMax {
 		p.pending = false
 		p.lastDelta = 1
+		p.deltaRun = 0 // sequential progress breaks any stride run (#222)
 		if blockIdx > p.cursor {
 			p.cursor = blockIdx
 		}
@@ -490,8 +532,12 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		return p.advance(p.cursor + 1 + p.window)
 	}
 
-	// Out of band: a seek.
+	// Out of band: a seek. The run resets because this delta is, by construction, not the one
+	// being counted -- the strided branch above already consumed the matching case. Without
+	// this, a match at delta X followed by a non-match then two matches at delta Y would
+	// reach strideRun on three reads that were never consecutive (#222).
 	p.lastDelta = d
+	p.deltaRun = 0
 	// Coverage gate (#221): a seek landing whose trailing coverage is low is a
 	// scattered walk (metadata traversal, GRIB .idx field sweep, COG overview),
 	// not a stream taking one jump. Do NOT optimistically re-anchor Sequential and

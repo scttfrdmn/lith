@@ -486,18 +486,28 @@ func writeTraceCfg(t *testing.T, partsMax int64, rows string) string {
 // population the report isolated.
 func TestOpenIsConditionalOnPartsThreshold(t *testing.T) {
 	const blk = 8 << 20
-	// Two reads two blocks apart, each with a byte gap larger than one block, so
-	// neither is contiguous. This is the shape that makes read 2's delta equal read
-	// 1's — the strided trigger — but only if Open() set lastBlock to -1.
+	// THREE reads two blocks apart, each with a byte gap larger than one block, so none is
+	// contiguous. This is the shape that makes every delta equal 2 — the strided trigger —
+	// but only if Open() set lastBlock to -1.
+	//
+	// It used to be two reads, because one repeated delta was enough to declare Strided.
+	// #222 now requires the delta to repeat strideRun times, since one repeat fires on
+	// coincidence: a genuinely random walk was measured flipping to Strided 7 times in 2471
+	// reads. So the fixture needs a third read, and the object is scaled up to 120 MB so
+	// block 5 exists within it. The asymmetry under test is unchanged — only the number of
+	// reads needed to reach the branch.
+	const objSize = 120000000
 	rows := fmt.Sprintf(
 		"116,35,17362,obj,%d,%d,131072,1,%d,window,cold,cold,39,0,0,0\n"+
-			"247,35,17362,obj,%d,%d,86016,3,%d,window,cold,cold,39,0,0,0\n",
-		30230325, 12845056, 12845056,
-		30230325, 28487680, 15511552)
+			"247,35,17362,obj,%d,%d,86016,3,%d,window,cold,cold,39,0,0,0\n"+
+			"388,35,17362,obj,%d,%d,86016,5,%d,window,cold,cold,39,0,0,0\n",
+		objSize, 12845056, 12845056,
+		objSize, 28487680, 15511552,
+		objSize, 44000000, 15426304)
 
-	// Object is 30.2 MB. With parts_max 64 MiB it is BELOW the threshold, so the
+	// Object is 120 MB. With parts_max 256 MiB it is BELOW the threshold, so the
 	// mount never called Open() and dispatched nothing — the trace says so.
-	below := writeTraceCfg(t, 64<<20, rows)
+	below := writeTraceCfg(t, 256<<20, rows)
 	cfg, parsed, err := readTrace(below)
 	if err != nil {
 		t.Fatal(err)
@@ -508,11 +518,11 @@ func TestOpenIsConditionalOnPartsThreshold(t *testing.T) {
 			got.mismatches)
 	}
 
-	// With parts_max 16 MiB the same object is ABOVE the threshold, so the mount
-	// would have called Open() — and then read 2 does reach strided and dispatches,
+	// With parts_max 32 MiB the same object is ABOVE the threshold, so the mount
+	// would have called Open() — and then read 3 does reach strided and dispatches,
 	// so a trace claiming 0 dispatches is inconsistent. That asymmetry is the
 	// behaviour under test: the condition must be read from the config, not assumed.
-	above := writeTraceCfg(t, 16<<20, rows)
+	above := writeTraceCfg(t, 32<<20, rows)
 	cfg2, parsed2, err := readTrace(above)
 	if err != nil {
 		t.Fatal(err)
