@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -124,5 +125,59 @@ func TestWriteCSVResistsInjection(t *testing.T) {
 		if got := rec[keyCol]; got != w {
 			t.Fatalf("record %d key = %q, want %q", i, got, w)
 		}
+	}
+}
+
+// #284: an open must appear on the timeline, and the gap to the first chunk read for the same
+// key must be readable from the CSV.
+//
+// That interval is the per-open cost an external deployment fitted at 0.47 s — 72% of a 260 MB
+// read's wall — and no instrument could show where it went. `--pf-trace` has no timestamp
+// column at all; `--timeline-csv` had timestamps but nothing marked the open, so the gap could
+// only be inferred from process start.
+func TestTimelineRecordsHandleOpen(t *testing.T) {
+	m := newMountTimeline()
+	base := m.t0
+
+	m.HandleOpen("obj/big", 260<<20, base.Add(5*time.Millisecond))
+	m.ChunkRead(blockstore.ChunkEvent{
+		At: base.Add(475 * time.Millisecond), Key: "obj/big", Chunk: 0,
+		Kind: "uncovered", Wait: 2 * time.Millisecond,
+	})
+
+	dir := t.TempDir()
+	path := dir + "/t.csv"
+	n, err := m.writeCSV(path)
+	if err != nil {
+		t.Fatalf("writeCSV: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("wrote %d rows, want 2 (the open and the chunk)", n)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	out := string(b)
+
+	// The open is a row, with its own kind, so no CSV schema change was needed and an
+	// existing consumer sees one more kind value rather than a different file.
+	if !strings.Contains(out, ",open,") {
+		t.Errorf("no open row in the CSV:\n%s", out)
+	}
+	// Ordered before the chunk, and at its own timestamp, so the interval is a subtraction.
+	iOpen, iChunk := strings.Index(out, ",open,"), strings.Index(out, ",uncovered,")
+	if iOpen < 0 || iChunk < 0 || iOpen > iChunk {
+		t.Errorf("open row is not ordered before the chunk row:\n%s", out)
+	}
+	if !strings.Contains(out, "5.000,open,") {
+		t.Errorf("open row is not at its own timestamp:\n%s", out)
+	}
+	if !strings.Contains(out, "475.000,uncovered,") {
+		t.Errorf("chunk row is not at its own timestamp:\n%s", out)
+	}
+	// The object size rides in the chunk column, which is the one numeric field an open has.
+	if !strings.Contains(out, strconv.FormatInt(260<<20, 10)) {
+		t.Errorf("open row does not carry the object size:\n%s", out)
 	}
 }

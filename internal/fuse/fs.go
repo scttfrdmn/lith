@@ -651,6 +651,10 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	f.nextFh++
 	f.handles[fh] = h
 	f.mu.Unlock()
+	// Mark the open on the timeline, so the interval between an application's open and the
+	// first byte it gets back is readable rather than inferred (#284). A no-op without
+	// --timeline-csv.
+	f.store.NoteHandleOpen(h.key.Key, fi.Size)
 
 	// CargoShip-backed file (#94): its bytes live in packed `.tar.zst` chunks.
 	// Resolve the read-mapping and stream the covering chunk region; a cargo

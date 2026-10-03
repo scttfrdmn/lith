@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--timeline-csv` records handle opens, so the per-open cost is measurable**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284)). An external deployment fitted a
+  **0.47 s per-object-open** intercept on a 1.5 GB/s box — 72% of a 260 MB read's wall — and no
+  instrument could show where it went. `--pf-trace` has **no timestamp column at all** (its
+  `seq` is a monotonic decision counter), and `--timeline-csv` had timestamps but nothing
+  marked the open, so the gap could only be inferred from process start.
+
+  An open is now a row with `kind=open`, carrying the object size — so the CSV schema is
+  unchanged and an existing consumer sees one more kind value rather than a different file.
+  The interval from that row to the first chunk row for the same key is the per-open cost, read
+  directly. Plumbed as a *separate* optional recorder interface, asserted independently, so no
+  existing `Recorder` implementer has to change.
+
 - **The mount logs its FUSE transport, for symmetry with its S3 transport**
   ([#232](https://github.com/scttfrdmn/lith/issues/232)). `max_read_bytes`,
   `reads_per_chunk`, `max_background`, `congestion_threshold`, the kernel's
@@ -46,6 +59,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   justifying argument agreed with the thing it replaced to within 2.4%.
 
 ### Changed
+
+- **#222's over-fetch is attributed, and the obvious fix is refuted by measurement**
+  ([#222](https://github.com/scttfrdmn/lith/issues/222)). No behaviour change — a
+  characterization test.
+
+  A strided slice reader pays **a whole 1 MiB chunk per 4 KiB read — 256×**. Two mechanisms
+  exist to stop exactly that and neither reaches `Strided`: the byte-exact extent lane gates on
+  `state() == Random`, and the evidence gate's `windowCap()` is consulted only on the
+  Sequential ramp. So extending the demand lane to `Strided` looks like a one-line fix.
+
+  **It is not.** Measured: bytes went **up** by ~14.9 KB per read, because the cost is the
+  strided branch's *prediction*, not the demand read — the branch dispatches one predicted block
+  per read and fetches it whole, and with the demand lane extended the extents were then fetched
+  on top of a prediction that already covered them. The prediction is also *correct* about which
+  block: at stride `d` it predicts `blk+d`, exactly the next read's block. The branch is right
+  about where the reader is going and wrong about how much of it the reader wants.
+
+  Pinned by a test, with the companion bound that any real fix must respect (a strided *bulk*
+  reader is served correctly today and must stay that way). The fix needs the prediction bounded
+  byte-exactly, and there is no byte-range prefetch entry point today — `BlockStore.Prefetch`
+  takes a block index — which is why it is not a one-liner.
 
 - **The readahead evidence gate is on by default in-region**
   ([#284](https://github.com/scttfrdmn/lith/issues/284)). **A behaviour change**, and the first

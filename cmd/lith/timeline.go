@@ -70,6 +70,28 @@ func (m *mountTimeline) PrefetchDispatch(key string, chunk int64, at time.Time) 
 	m.mu.Unlock()
 }
 
+// HandleOpen records an open as a timeline row of its own (#284). It reuses the chunk row
+// rather than adding a column, so the CSV schema is unchanged and the new event appears only
+// as a `kind` value -- an existing consumer sees one more kind, not a different file.
+//
+// The point of it: the gap between an open row and the first chunk row for the same key is the
+// per-open cost, read directly. An external deployment fitted that at 0.47 s on a 1.5 GB/s box
+// -- 72% of a 260 MB read's wall -- and no instrument could show where it went.
+func (m *mountTimeline) HandleOpen(key string, size int64, at time.Time) {
+	m.mu.Lock()
+	m.rows = append(m.rows, chunkRow{
+		ms:   float64(at.Sub(m.t0).Microseconds()) / 1000,
+		key:  key,
+		kind: "open",
+		// A handle, not a chunk. The size goes in the chunk column because it is the one
+		// numeric field an open has and the row is otherwise identical in shape.
+		chunk:  size,
+		waitMs: -1,
+		lagMs:  -1,
+	})
+	m.mu.Unlock()
+}
+
 func (m *mountTimeline) ChunkRead(ev blockstore.ChunkEvent) {
 	lag := -1.0
 	dk := dispatchKey(ev.Key, ev.Chunk)
