@@ -486,6 +486,15 @@ func (bs *BlockStore) complete(k Key, ci int64, cs *chunkState, data []byte, fil
 			bs.mem.MergeUnread(ck, data, filled)
 		} else {
 			bs.mem.Merge(ck, data, filled)
+			// A DEMAND fill supersedes any prefetch commitment on this chunk (#320). A
+			// concurrent Prefetch can commit a chunk a demand fill already owns -- its
+			// lookup sees nothing cached, because the demand fill has not landed yet -- and
+			// the chunk then merges here WITHOUT an unread flag. Nothing would ever release
+			// it: not consume (the demand owner credits nothing, having filled it itself),
+			// not unread-evict (it is not flagged), not failed fill (it succeeded). That is
+			// a commitment charged forever with nothing resident to match it, which is the
+			// only shape that can make committed exceed unread-resident AT REST.
+			bs.dropPrefetched(ck)
 		}
 	} else if blocking {
 		// Prefetch fill failed: drop its prefetched marker.
@@ -524,6 +533,14 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			if out != nil {
 				out[i] = d
 			}
+			// CREDIT THE PREFETCH (#320). This path serves a demand read -- a straddling
+			// GetRange is the common case -- from a chunk prefetch may have fetched, and it
+			// used to return without crediting anything. The chunk then stayed in
+			// `prefetched` AND flagged unread forever: committed and unread-resident both
+			// over-reported, prefetch_used_total under-counted, and the #55 eviction
+			// preference went on protecting a chunk that had been read in preference to one
+			// that had not. fetchExtents has always credited here; ensureChunks never did.
+			bs.creditPrefetch(k, i, isPrefetch)
 			i++
 			continue
 		}
@@ -532,6 +549,7 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			if out != nil {
 				out[i] = cachedData
 			}
+			bs.creditPrefetch(k, i, isPrefetch)
 			i++
 			continue
 		}
@@ -561,6 +579,9 @@ func (bs *BlockStore) ensureChunks(ctx context.Context, k Key, c0, c1, objSize i
 			if out != nil {
 				out[i] = data
 			}
+			// A demand read that JOINED a prefetch's fill has consumed it just as surely as
+			// one that found it cached (#320).
+			bs.creditPrefetch(k, i, isPrefetch)
 			i++
 			continue
 		}
@@ -958,6 +979,21 @@ func (bs *BlockStore) PrefetchUnreadResidentBytes() int64 {
 		return 0
 	}
 	return bs.mem.UnreadBytes()
+}
+
+// creditPrefetch credits a prefetch consumed by a DEMAND read. It is a no-op on the prefetch
+// path, which is the point (#320).
+//
+// A prefetch that finds its own chunk already resident must not credit itself: crediting
+// clears the unread flag, which hands the chunk to the #55 eviction preference as though
+// something had read it, and releases a budget reservation that is still owed. fetchExtents
+// called notePrefetchHit unguarded and could do exactly that after joining a fill that
+// covered fewer extents than it wanted.
+func (bs *BlockStore) creditPrefetch(k Key, ci int64, isPrefetch bool) {
+	if isPrefetch {
+		return
+	}
+	bs.notePrefetchHit(bs.cacheKey(k, ci))
 }
 
 // notePrefetchHit credits a prefetch the first time a demand read consumes a
