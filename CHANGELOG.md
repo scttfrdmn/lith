@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The mount logs its FUSE transport, for symmetry with its S3 transport**
+  ([#232](https://github.com/scttfrdmn/lith/issues/232)). `max_read_bytes`,
+  `reads_per_chunk`, `max_background`, `congestion_threshold`, the kernel's
+  `max_readahead` and the negotiated protocol version. The S3 side has always been
+  observable at mount; this side never was.
+
+  The number worth noticing is **`reads_per_chunk = 8`**: go-fuse sets `max_read` equal to
+  `MaxWrite`, which defaults to 128 KiB, so a 1 MiB chunk reaches the application in eight
+  FUSE round trips — seven of them cache hits returning a sub-slice. That is deliberate and
+  measured (raising it to 1 MiB made each reply exceed go-fuse's splice pipe and forced a
+  copy, a net loss for the CPU-bound multi-reader path), and `internal/fuse/mount.go` now
+  records all three transport limits together rather than only that one, so the next person
+  to wonder about `max_background` does not have to re-derive the other two.
+
+  `max_background` is a go-fuse default of 12 that lith has never set and nobody has measured.
+  It bounds **kernel-initiated** readahead to ~1.1 MB in flight mount-wide; it does not bound
+  application reads, and lith's own prefetch is unaffected because it runs as goroutines
+  against S3 rather than as FUSE requests. Logged rather than changed.
+
+
 ### Changed
 
 - **`mmap` random access is characterized, and the amplification is mostly not lith's**
