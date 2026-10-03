@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The mount logs its FUSE transport, for symmetry with its S3 transport**
+  ([#232](https://github.com/scttfrdmn/lith/issues/232)). `max_read_bytes`,
+  `reads_per_chunk`, `max_background`, `congestion_threshold`, the kernel's
+  `max_readahead` and the negotiated protocol version. The S3 side has always been
+  observable at mount; this side never was.
+
+  The number worth noticing is **`reads_per_chunk = 8`**: go-fuse sets `max_read` equal to
+  `MaxWrite`, which defaults to 128 KiB, so a 1 MiB chunk reaches the application in eight
+  FUSE round trips — seven of them cache hits returning a sub-slice. That is deliberate and
+  measured (raising it to 1 MiB made each reply exceed go-fuse's splice pipe and forced a
+  copy, a net loss for the CPU-bound multi-reader path), and `internal/fuse/mount.go` now
+  records all three transport limits together rather than only that one, so the next person
+  to wonder about `max_background` does not have to re-derive the other two.
+
+  `max_background` is a go-fuse default of 12 that lith has never set and nobody has measured.
+  It bounds **kernel-initiated** readahead to ~1.1 MB in flight mount-wide; it does not bound
+  application reads, and lith's own prefetch is unaffected because it runs as goroutines
+  against S3 rather than as FUSE requests. Logged rather than changed.
+
+- **`lith_readahead_evidence_ratio`, and the latency-derived evidence policy's plumbing**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284)). **No behaviour change**: the policy
+  returns 0 at every latency and a test asserts it.
+
+  `--readahead-evidence-ratio` bounds a committed readahead window to a multiple of the bytes a
+  handle has actually consumed, and it is the one thing measured to fix #284 — where a single
+  process reading one variable of a multi-variable NetCDF-4 file fetched the **whole object**,
+  54.03× over-fetch, equal to `1/coverage` to within 0.4% on two different objects. It is off by
+  default because its cost is sharply RTT-scaled: byte-identical and wall-indistinguishable
+  in-region, and a clean **2.56×** at 58.6 ms.
+
+  The ratio is now consulted **per read** from the endpoint's measured latency rather than
+  latched at open from the flag, so the policy has somewhere to live; the gauge reports which
+  regime a mount landed in. The constants wait on a measured ladder between those two anchor
+  points — this campaign has refuted five mechanisms and shipped one 11× regression whose
+  justifying argument agreed with the thing it replaced to within 2.4%.
+
 ### Changed
 
 - **`mmap` random access is characterized, and the amplification is mostly not lith's**
@@ -27,7 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   So the 326 s is round trips, not bytes: a single-threaded fault stream is serial by
   construction and there is nothing for lith to overlap. Reducing lith's granularity would
   address a small fraction of the bytes and none of the wall clock.
-
 
 ### Fixed
 
@@ -95,26 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint, where the real 58.6 ms round trip wants 44. The new accessor returns
   `(duration, measured bool)`, so a caller has to decide what to do about "not measured yet"
   instead of being handed a number that looks right.
-
-### Added
-
-- **`lith_readahead_evidence_ratio`, and the latency-derived evidence policy's plumbing**
-  ([#284](https://github.com/scttfrdmn/lith/issues/284)). **No behaviour change**: the policy
-  returns 0 at every latency and a test asserts it.
-
-  `--readahead-evidence-ratio` bounds a committed readahead window to a multiple of the bytes a
-  handle has actually consumed, and it is the one thing measured to fix #284 — where a single
-  process reading one variable of a multi-variable NetCDF-4 file fetched the **whole object**,
-  54.03× over-fetch, equal to `1/coverage` to within 0.4% on two different objects. It is off by
-  default because its cost is sharply RTT-scaled: byte-identical and wall-indistinguishable
-  in-region, and a clean **2.56×** at 58.6 ms.
-
-  The ratio is now consulted **per read** from the endpoint's measured latency rather than
-  latched at open from the flag, so the policy has somewhere to live; the gauge reports which
-  regime a mount landed in. The constants wait on a measured ladder between those two anchor
-  points — this campaign has refuted five mechanisms and shipped one 11× regression whose
-  justifying argument agreed with the thing it replaced to within 2.4%.
-
 
 ## [1.3.0] - 2026-10-02
 

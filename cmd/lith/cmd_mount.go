@@ -476,6 +476,20 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	}
 	log.Info("mounted", "bucket", bucket, "prefix", prefix, "mountpoint", mountpoint, "root", root.Prefix(), "keys", root.Len())
 	log.Info("s3 transport", "info", s3client.TransportInfo(f.s3Concurrency), "s3_concurrency", f.s3Concurrency)
+	// The FUSE transport, for symmetry with the line above: the S3 side has always been
+	// observable at mount and this side never was. max_read is what bounds every read lith
+	// receives (a 1 MiB chunk arrives in eight of them), and max_background bounds
+	// kernel-initiated readahead mount-wide. See internal/fuse/mount.go for why max_read is
+	// 128 KiB deliberately and max_background is a default nobody has measured.
+	if ks := srv.KernelSettings(); ks != nil {
+		log.Info("fuse transport",
+			"max_read_bytes", fusefs.NegotiatedMaxWrite(),
+			"reads_per_chunk", int64(blockstore.ChunkSize)/fusefs.NegotiatedMaxWrite(),
+			"max_background", fusefs.NegotiatedMaxBackground(),
+			"congestion_threshold", fusefs.NegotiatedMaxBackground()*3/4,
+			"kernel_max_readahead_bytes", ks.MaxReadAhead,
+			"kernel_proto", fmt.Sprintf("%d.%d", ks.Major, ks.Minor))
+	}
 
 	// Record the mount so `lith mounts`/`lith umount` can find it (#91); removed
 	// on clean exit. Best-effort — a record failure must not fail the mount.
