@@ -165,7 +165,7 @@ func (bs *BlockStore) fetchExtents(ctx context.Context, k Key, ci int64, want ui
 			case "disk":
 				bs.record(func(r Recorder) { r.DiskHit() })
 			}
-			bs.notePrefetchHit(bs.cacheKey(k, ci))
+			bs.creditPrefetch(k, ci, isPrefetch)
 			return d, nil
 		}
 		bs.record(func(r Recorder) { r.Miss() })
@@ -179,7 +179,7 @@ func (bs *BlockStore) fetchExtents(ctx context.Context, k Key, ci int64, want ui
 				return nil, cs.err
 			}
 			if covers(cs.filled, want) {
-				bs.notePrefetchHit(bs.cacheKey(k, ci))
+				bs.creditPrefetch(k, ci, isPrefetch)
 				return cs.data, nil
 			}
 			continue // the in-flight fill covered fewer extents; re-claim the rest

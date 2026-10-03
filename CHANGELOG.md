@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Four paths consumed or superseded a prefetched chunk without crediting it**
+  ([#320](https://github.com/scttfrdmn/lith/issues/320)). All four reproduce; all four are
+  fixed. Two were found by an external deployment reading this code *after* it retracted a
+  9–27 GB "leak" that turned out to be dispatch-side, and which its own cells had not
+  provoked — straddle was 0 and the demand/prefetch race never fired.
+
+  | path | effect |
+  |---|---|
+  | `ensureChunks` tier hit | a **straddling `GetRange`** served from a prefetched chunk credited nothing |
+  | `ensureChunks` join | a demand read that joined a prefetch's fill credited nothing |
+  | `complete`, demand fill | a demand fill landing a chunk a concurrent `Prefetch` had committed left it charged **forever** |
+  | `fetchExtents` | a **prefetch** finding its own chunk resident credited itself a demand hit |
+
+  **This is not only a reporting fix.** A consumed chunk left flagged unread is protected by
+  the #55 eviction preference as though nothing had read it, so the tier keeps a dead chunk in
+  preference to a live one. Conversely the fourth path *cleared* the flag on a chunk nothing
+  had read, handing it to eviction early and releasing a budget reservation still owed. And
+  `lith_prefetch_unread_resident_bytes` is the threshold an external measurement validated 8/8
+  against the collapse condition ([#313](https://github.com/scttfrdmn/lith/issues/313)) — on a
+  straddle-heavy workload it would have read high for the wrong reason.
+
+  The third path is the only shape that can make `committed` exceed `unread-resident` **at
+  rest**: nothing would ever release it — not consume (the demand owner credits nothing, having
+  filled the chunk itself), not unread-evict (it is not flagged), not failed fill (it
+  succeeded). Measured at rest, the two gauges are now equal to the byte.
+
+  `creditPrefetch(k, ci, isPrefetch)` replaces the bare `notePrefetchHit` at every site, so
+  the demand-only guard is in one place rather than remembered at four.
+
 - **Every per-handle prefetch counter is now recorded per read, not at close**
   ([#284](https://github.com/scttfrdmn/lith/issues/284),
   [#316](https://github.com/scttfrdmn/lith/issues/316)). #319 fixed this for the two coverage
