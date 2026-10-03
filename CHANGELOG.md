@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`lith_prefetch_committed_bytes` now says what it counts**
+  ([#320](https://github.com/scttfrdmn/lith/issues/320)). Resident-unread **plus
+  queued-for-a-slot plus on-the-wire**. The charge happens in `Prefetch`, *before* `fillRun`
+  waits on the prefetch and S3 semaphores, and `Prefetch` runs one goroutine per block — so
+  the figure includes chunks that are merely queued, and **`--inflight-bytes` does not bound
+  it**, because that bounds the wire and not the queue.
+
+  Comparing the two is what made an external measurement read a 9–27 GB "leak" that did not
+  exist. At rest the figure equals `lith_prefetch_unread_resident_bytes` exactly, measured in
+  four isolated cells; use that one to judge memory-tier pressure, since it is the only part
+  that can evict anything. `Release` does ratchet the committed figure, but opens no gap: a
+  closed handle's unconsumed chunks are still unread-resident and both gauges hold them.
+
 - **Four paths consumed or superseded a prefetched chunk without crediting it**
   ([#320](https://github.com/scttfrdmn/lith/issues/320)). All four reproduce; all four are
   fixed. Two were found by an external deployment reading this code *after* it retracted a
