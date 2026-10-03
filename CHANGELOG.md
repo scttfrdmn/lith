@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **#233's cold-start cost is pinned by a test, and it rules out the leading explanation for
+  #284's per-open intercept** ([#233](https://github.com/scttfrdmn/lith/issues/233),
+  [#284](https://github.com/scttfrdmn/lith/issues/284)). No behaviour change.
+
+  A cold sequential reader's 128 KiB reads stay inside one 8 MiB block for 64 of them, so the
+  detector never sees a block advance and establishment cannot fire until the reader crosses
+  into block 1 — leaving block 0 served as **eight 1 MiB chunk GETs** instead of one coalesced
+  fetch. Measured offline: establishment at read 64 exactly, 8 GETs inside block 0, 22 GETs
+  total for a byte-exact 64 MiB read. #233 recorded this from hardware and listed three
+  refuted fixes; it now has a regression test rather than only a description.
+
+  **The negative result is the more useful half.** An external deployment fitted a per-open
+  intercept of **0.47 s** on a 1.5 GB/s box — 72% of a 260 MB read's wall — and window
+  establishment on each new handle was the leading hypothesis on both sides. 22 GETs is ~48 ms
+  even fully serialized at that deployment's measured 2.2 ms first-byte latency, two orders
+  short of 470 ms. So the intercept is not the GET count and not establishment.
+
 - **`mmap` random access is characterized, and the amplification is mostly not lith's**
   ([#232](https://github.com/scttfrdmn/lith/issues/232)). No behaviour change — a
   characterization test plus the documented finding.
