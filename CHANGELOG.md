@@ -68,6 +68,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--mem-cache` below 64 MiB no longer silently disables the memory tier**
+  ([#307](https://github.com/scttfrdmn/lith/issues/307)). The tier was a fixed 64 shards, and
+  `mem2Q` refuses any store larger than a shard's capacity — so any `--mem-cache` giving
+  shards under one 1 MiB chunk accepted **nothing**, with no error, no warning and no metric:
+
+  | `--mem-cache` | per shard | |
+  |---|---|---|
+  | 16 MiB | 256 KiB | **dead** |
+  | 32 MiB | 512 KiB | **dead** |
+  | 64 MiB | 1 MiB | the exact boundary |
+
+  The default is 25% of system RAM, so the threshold was a machine with **256 MiB** — a
+  container, a CI runner, a constrained sidecar. Below it every read missed, every re-read
+  re-fetched, and `lith_mem_hit_total` sat at zero, which reads as a cold workload rather than
+  a broken tier.
+
+  `newMemCache` now reduces the shard count until each shard holds at least one chunk, so a
+  16 MiB tier gets 16 shards rather than 64 dead ones. That trades lock contention for a
+  working cache, which is the right trade: a tier too small to give 64 shards a chunk each is
+  also too small for 64 readers to contend over. A capacity below **one chunk** cannot be
+  fixed by scaling and the mount now warns about it explicitly, distinguishing it from
+  `--mem-cache 0`, which is caching deliberately disabled.
+
+  The mount also logs the realized geometry (`shards`, `bytes_per_shard`, `chunks_per_shard`),
+  because the defect was undetectable from the outside. It was found by shrinking a test
+  fixture, where three assertions broke for a reason that made no sense until the tier turned
+  out to be inert.
+
 - **`lith_prefetch_committed_bytes` now says what it counts**
   ([#320](https://github.com/scttfrdmn/lith/issues/320)). Resident-unread **plus
   queued-for-a-slot plus on-the-wire**. The charge happens in `Prefetch`, *before* `fillRun`
