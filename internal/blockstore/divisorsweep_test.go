@@ -51,9 +51,12 @@ func TestPrefetchDivisorEarnsItsCost(t *testing.T) {
 	// reported magnitudes need the larger fixture.
 	// 8 chunks x 4 readers = 32 MiB of distinct demand against a 32 MiB budget, so the
 	// largest cell drives committed to the cap -- which the vacuity check below requires,
-	// and which a smaller fixture failed to do. The budget cannot go much lower: it sets
-	// the tiers (2x and 8x), and a --mem-cache under 64 MiB is DEAD, because 64 shards of
-	// under 1 MiB each refuse every chunk.
+	// and which a smaller fixture failed to do. The budget also sets the tiers (2x and 8x),
+	// and it is deliberately NOT shrunk further even though it now could be: a --mem-cache
+	// under 64 MiB used to be dead, because 64 fixed shards of under 1 MiB each refused every
+	// chunk, and that constraint is gone since newMemCache scales the shard count (#307).
+	// The fixture stays where the published numbers were taken, because changing it would
+	// change what bench/prefetch-divisor's figures mean.
 	chunksPerObj, readerCounts, budget := 8, []int{2, 4}, int64(32)<<20
 	if os.Getenv("LITH_SWEEP_FULL") != "" {
 		chunksPerObj, readerCounts, budget = 32, []int{4, 8, 16}, int64(48)<<20

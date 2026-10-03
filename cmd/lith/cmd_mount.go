@@ -481,6 +481,20 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// receives (a 1 MiB chunk arrives in eight of them), and max_background bounds
 	// kernel-initiated readahead mount-wide. See internal/fuse/mount.go for why max_read is
 	// 128 KiB deliberately and max_background is a default nobody has measured.
+	// The memory tier's realized geometry (#307). A shard that cannot hold one chunk refuses
+	// every store silently, so the configuration that produces it has to be said out loud.
+	if shards, perShard := bs.MemCacheGeometry(); shards > 0 {
+		log.Info("memory tier", "bytes", memCache, "shards", shards, "bytes_per_shard", perShard,
+			"chunks_per_shard", perShard/blockstore.ChunkSize)
+		if memCache > 0 && perShard < blockstore.ChunkSize {
+			log.Warn("memory tier accepts nothing: a shard cannot hold one chunk, so every "+
+				"store is refused and every read is a miss",
+				"bytes", memCache, "bytes_per_shard", perShard,
+				"chunk_size", int64(blockstore.ChunkSize),
+				"hint", fmt.Sprintf("set --mem-cache to at least %d bytes, or 0 to disable "+
+					"caching deliberately", int64(blockstore.ChunkSize)))
+		}
+	}
 	if ks := srv.KernelSettings(); ks != nil {
 		log.Info("fuse transport",
 			"max_read_bytes", fusefs.NegotiatedMaxWrite(),

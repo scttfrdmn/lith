@@ -963,6 +963,20 @@ func (bs *BlockStore) dropPrefetched(ck string) bool {
 // it opens no gap, because those chunks are still unread-resident and both gauges hold them.
 func (bs *BlockStore) PrefetchCommittedBytes() int64 { return bs.pfCommittedBytes.Load() }
 
+// MemCacheGeometry reports the memory tier's realized shard count and per-shard capacity, so
+// a caller can detect the degenerate case where a shard cannot hold one chunk (#307).
+//
+// perShard < ChunkSize with a non-zero capacity means the tier accepts NOTHING: every store is
+// refused silently. newMemCache reduces the shard count to avoid that wherever it can, so the
+// condition now only arises for a total capacity below one chunk. A zero capacity is caching
+// deliberately disabled and is not degenerate.
+func (bs *BlockStore) MemCacheGeometry() (shards int, perShard int64) {
+	if bs.mem == nil {
+		return 0, 0
+	}
+	return bs.mem.geometry()
+}
+
 // PrefetchUnreadResidentBytes is the bytes HELD IN THE MEMORY TIER that nothing has read
 // (#313). Zero when there is no memory tier.
 //
