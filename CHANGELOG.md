@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`mmap` random access is characterized, and the amplification is mostly not lith's**
+  ([#232](https://github.com/scttfrdmn/lith/issues/232)). No behaviour change — a
+  characterization test plus the documented finding.
+
+  A hypothesis of mine is refuted by it: I expected a sustained random walk to oscillate into
+  the detector's `Cold` posture, where the #210 byte-exact gate (`state() == Random`, exactly)
+  fails and a 4 KiB read buys a whole 1 MiB chunk. It does not — 1121 of 1126 reads saw
+  `Random`, and 968 were served byte-exact against 5 whole-chunk. The extent lane holds.
+
+  What the numbers do say: lith is **faithful to the read it is handed** (0.79–0.81× the
+  requested bytes), and its floor is one 64 KiB extent — so a 4 KiB read costs 64 KiB (15.3×)
+  while a 4 KiB *touch* costs whatever the kernel asked for. On the reported run that was
+  ~220 KiB per touch, of which only ~3.4× was extent rounding and the rest was kernel
+  readahead. Both ratios are stable across a 4× fixture change.
+
+  So the 326 s is round trips, not bytes: a single-threaded fault stream is serial by
+  construction and there is nothing for lith to overlap. Reducing lith's granularity would
+  address a small fraction of the bytes and none of the wall clock.
+
+
 ### Fixed
 
 - **`lith_prefetch_committed_bytes` now says what it counts**
