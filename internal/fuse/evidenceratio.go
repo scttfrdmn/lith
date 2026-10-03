@@ -27,20 +27,20 @@ import "time"
 // So the quantity that decides whether the gate is free is one lith already samples. Rules, in
 // order:
 //
-//  1. An explicit --readahead-evidence-ratio wins, always. An operator who set it has said
-//     what they want and is not second-guessed by a latency heuristic.
-//  2. No measurement yet -> 0, today's behaviour. NEVER derive from the seed: that is #292,
-//     where a 40 ms constant masquerades as a device measurement on every endpoint.
-//  3. Otherwise the latency-derived ratio.
-//
-// Rule 3 currently returns 0 for every input, so this is inert by construction. The constants
-// need a TTFB ladder between the two anchor points above, and this campaign has already
-// refuted five mechanisms and shipped one 11x regression whose justifying argument agreed with
-// the thing it replaced to within 2.4%. The policy lands when it is measured, not when it is
-// plausible.
+//  1. A POSITIVE --readahead-evidence-ratio wins, always. An operator who set it has said what
+//     they want and is not second-guessed by a latency heuristic.
+//  2. A NEGATIVE one forces the gate off. 0 now means "decide for me", so there has to be a
+//     way to say "off" and mean it.
+//  3. No measurement yet -> 0, the pre-#284 behaviour. NEVER derive from the seed: that is
+//     #292, where a 40 ms constant masquerades as a device measurement on every endpoint. A
+//     mount engages the gate only once it has measured that the endpoint is near.
+//  4. Otherwise the latency-derived ratio.
 func evidenceRatioFor(configured float64, ttfb time.Duration, measured bool) float64 {
 	if configured > 0 {
 		return configured
+	}
+	if configured < 0 {
+		return 0
 	}
 	if !measured {
 		return 0
@@ -48,13 +48,42 @@ func evidenceRatioFor(configured float64, ttfb time.Duration, measured bool) flo
 	return latencyDerivedEvidenceRatio(ttfb)
 }
 
+// defaultEvidenceRatio and nearEndpointTTFB are the measured policy (#284).
+//
+// The ratio is 4 because every cell that decided this used 4; no other value has been
+// measured on any shape.
+//
+// The latency bound is DELIBERATELY CONSERVATIVE and is not an interpolation. The evidence is
+// two endpoints and nothing between them:
+//
+//	2.2 ms  : slice readers win on both axes; a whole-object fast consumer pays +5% to +20%
+//	58.6 ms : a whole-object fast consumer pays +135% (r = 2.35, zero overlap)
+//
+// 5 ms is a little over twice the measured-good point, which is the smallest bound that still
+// absorbs ordinary same-region variance. Picking a threshold in the middle of the gap and
+// calling it derived is exactly what this campaign has been punished for: five refuted
+// mechanisms, and one 11x regression shipped on an argument that agreed with the thing it
+// replaced to within 2.4%. A mount at 20 ms is unmeasured, so it keeps the old behaviour and
+// loses nothing it had.
+const (
+	defaultEvidenceRatio = 4.0
+	nearEndpointTTFB     = 5 * time.Millisecond
+)
+
 // latencyDerivedEvidenceRatio is the policy proper: the gate ratio for an endpoint whose
 // first-byte latency has been MEASURED at ttfb.
 //
-// Deliberately 0 everywhere pending Phase 2's ladder. Kept as its own function so the policy
-// has one place to live and one place to be tested, and so turning it on is a change to this
-// body alone rather than to the plumbing.
+// Kept as its own function so the policy has one place to live and one place to be tested.
+//
+// WHAT THE GATE BUYS where it engages, all measured on real S3: a single process reading one
+// variable of a multi-variable NetCDF-4 file goes from fetching the WHOLE object to 2.65x of
+// what it wanted -- 54x over-fetch down to 2.65x, and 20.4x fewer bytes cross-region where it
+// also wins wall clock (r = 0.84). What it costs is a fixed ~0.07-0.18 s on the one shape that
+// pays, a fast consumer reading most of an object: r = 1.047 to 1.206 in-region across a 14.5x
+// size range and two boxes, bounded because the baseline carries its own fixed cost.
 func latencyDerivedEvidenceRatio(ttfb time.Duration) float64 {
-	_ = ttfb
+	if ttfb > 0 && ttfb <= nearEndpointTTFB {
+		return defaultEvidenceRatio
+	}
 	return 0
 }

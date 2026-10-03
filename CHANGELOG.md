@@ -47,6 +47,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The readahead evidence gate is on by default in-region**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284)). **A behaviour change**, and the first
+  one to the prefetch path since the #301 revert.
+
+  `--readahead-evidence-ratio` bounds a committed readahead window to a multiple of the bytes a
+  handle has actually read. A single process reading one variable of a multi-variable NetCDF-4
+  file was measured fetching the **whole object** — 1217.8 MB for the 22.5 MB it wanted,
+  **54.03×**, with the over-fetch equal to `1/coverage` to within 0.4% on two different
+  objects. At ratio 4 the same read fetches 59.8 MB: **2.65×**, and 37 GETs instead of 175.
+
+  `0`, the default, now **decides from measured first-byte latency**: ratio 4 at or under 5 ms,
+  off above it, and off until a fill has measured the endpoint — never derived from the 40 ms
+  seed. A positive value forces a ratio; a **negative** value forces the gate off, since 0 no
+  longer means that.
+
+  **Why latency-gated rather than simply on.** The cost falls on one shape — a fast consumer
+  reading most of an object, where the shallower ramp is the bottleneck — and is sharply
+  RTT-scaled:
+
+  | endpoint | slice reader | whole object, fast consumer |
+  |---|---|---|
+  | in-region, 2.2 ms | wins | r = 1.05–1.21 |
+  | cross-region, 58.6 ms | **r = 0.84**, wins both axes | **r = 2.35**, zero overlap |
+
+  Five cells, two boxes, warm and cold mounts, every arm interleaved. The 5 ms bound is
+  deliberately conservative — a little over twice the measured-good point — because **nothing
+  is measured between 2.2 and 58.6 ms** and picking a threshold in that gap is what this
+  campaign has repeatedly been punished for. A mount at 20 ms keeps the behaviour it had.
+
+  The cost is also **fixed rather than proportional**: +0.07–0.18 s across a 14.5× object-size
+  range, where proportional would have made the 3.78 GB case +2.0 s and it measured +0.14 s.
+  Two of the author's predictions were refuted on the way to this (a per-mount intercept, and a
+  2.2–3.4× ratio in the 64 MiB–1 GB band); the shipped bound is the one that survived.
+
 - **#233's cold-start cost is pinned by a test, and it rules out the leading explanation for
   #284's per-open intercept** ([#233](https://github.com/scttfrdmn/lith/issues/233),
   [#284](https://github.com/scttfrdmn/lith/issues/284)). No behaviour change.
