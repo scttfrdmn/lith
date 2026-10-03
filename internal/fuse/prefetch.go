@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/prefetch"
 )
 
@@ -26,6 +27,8 @@ type pfWrapper struct {
 	// concurrently enough could synthesize a gap over the threshold, be classified as
 	// seeking, and lose the readahead it had earned.
 	lastReadEnd int64
+	// blockSize is this handle's fill block, needed to re-apply the evidence ratio per read.
+	blockSize int64
 	// streaming is whether this handle is an ESTABLISHED sequential stream -- the
 	// detector is in prefetch.Sequential, so it is actually being prefetched for. This is
 	// the divisor's input (#301), replacing the open-descriptor count.
@@ -52,6 +55,9 @@ const (
 )
 
 func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) *pfWrapper {
+	// blockSize is retained so the evidence ratio can be re-applied per read: the gate's
+	// ratio is now latency-derived and so time-varying, where it used to be latched here
+	// from the flag (#284/#292).
 	pf := prefetch.New(maxReadahead)
 	// A read landing more than one block past the previous is a seek, not
 	// sequential progress, however in-band it looks (#210/M16 1b).
@@ -64,7 +70,7 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) 
 	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
 	// default; ratio <= 0 is a no-op.
 	pf.SetEvidence(evidenceRatio, blockSize)
-	return &pfWrapper{pf: pf}
+	return &pfWrapper{pf: pf, blockSize: blockSize}
 }
 
 // observation is everything a trace row needs about one decision, captured while
@@ -91,16 +97,15 @@ type observation struct {
 	// returned so the trace records the input to the decision rather than a re-derivation
 	// of it (#278).
 	gap int64
-	// covDelta / covHeldDelta are this read's contribution to the two coverage-gate counters.
+	// counters is this read's contribution to every per-handle prefetch counter.
 	//
 	// Returned per read, and added to the metrics in the read path, because folding them in at
 	// Release makes them USELESS ON A RUNNING JOB -- which is how they shipped and how an
-	// external deployment found them: both read 0 in every 2 Hz sample through a 48-rank run
-	// and only appeared (527, 522) in the final scrape after the job was killed and its
-	// handles closed. A workload that holds its handles open for the whole run, which is the
-	// normal shape here, could never see the defect these count.
-	covDelta     int64
-	covHeldDelta int64
+	// external deployment found them: they read 0 in every 2 Hz sample through a 48-rank run
+	// and only appeared in the final scrape after the job was killed and its handles closed.
+	// A workload that holds its handles open for the whole run, which is the normal shape
+	// here, could never see the defects these count.
+	counters metrics.PrefetchDelta
 	// streamDelta is the change this read made to the mount-wide established-stream count:
 	// +1 when the handle just became a sequential stream, -1 when it stopped being one, 0
 	// otherwise. Computed under the handle's lock with the transition it describes, for the
@@ -112,24 +117,26 @@ type observation struct {
 // it captured under the handle's lock. The read's end offset is taken rather than its
 // length so the byte gap and the new endpoint are both derived here, atomically with the
 // Observe they feed (#278).
-func (w *pfWrapper) observe(block, off, end, maxWindow int64, seq *atomic.Int64) observation {
+func (w *pfWrapper) observe(block, off, end, maxWindow int64, evRatio float64, seq *atomic.Int64) observation {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	gap := off - w.lastReadEnd
 	w.lastReadEnd = end
 	w.pf.SetMax(maxWindow)
-	cov0, held0 := w.pf.LowCoverage(), w.pf.CoverageHeld()
+	// Per read, exactly like SetMax: the ratio is latency-derived and the endpoint's measured
+	// latency changes as fills complete. Applied under this lock, with the Observe it governs.
+	w.pf.SetEvidence(evRatio, w.blockSize)
+	before := w.counterSnapshot()
 	d := w.pf.Observe(block, off, end-off, gap)
 	return observation{
-		covDelta:     w.pf.LowCoverage() - cov0,
-		covHeldDelta: w.pf.CoverageHeld() - held0,
-		dispatch:     d,
-		seq:          seq.Add(1),
-		after:        w.pf.State(),
-		window:       w.pf.Window(),
-		peak:         w.pf.PeakWindow(),
-		gap:          gap,
-		streamDelta:  w.updateStreaming(),
+		counters:    w.counterSnapshot().Since(before),
+		dispatch:    d,
+		seq:         seq.Add(1),
+		after:       w.pf.State(),
+		window:      w.pf.Window(),
+		peak:        w.pf.PeakWindow(),
+		gap:         gap,
+		streamDelta: w.updateStreaming(),
 	}
 }
 
@@ -138,17 +145,17 @@ func (w *pfWrapper) observe(block, off, end, maxWindow int64, seq *atomic.Int64)
 // object metadata, so neither the #210/M16-1b byte-gap gate nor the #221 coverage gate
 // should fire; it still advances the endpoint so a later windowed read on the same handle
 // measures from the right place.
-func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, seq *atomic.Int64) observation {
+func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, evRatio float64, seq *atomic.Int64) observation {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.lastReadEnd = end
 	w.pf.SetMax(maxWindow)
-	cov0, held0 := w.pf.LowCoverage(), w.pf.CoverageHeld()
+	w.pf.SetEvidence(evRatio, w.blockSize)
+	before := w.counterSnapshot()
 	d := w.pf.Observe(block, off, end-off, 0)
 	return observation{
-		covDelta:     w.pf.LowCoverage() - cov0,
-		covHeldDelta: w.pf.CoverageHeld() - held0,
-		dispatch:     d, seq: seq.Add(1), after: w.pf.State(),
+		counters: w.counterSnapshot().Since(before),
+		dispatch: d, seq: seq.Add(1), after: w.pf.State(),
 		window: w.pf.Window(), peak: w.pf.PeakWindow(), gap: 0,
 		streamDelta: w.updateStreaming(),
 	}
@@ -198,18 +205,6 @@ func (w *pfWrapper) halvings() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.pf.Halvings()
-}
-
-func (w *pfWrapper) deEstablished() int64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.pf.DeEstablished()
-}
-
-func (w *pfWrapper) evidence() (held, withheld int64) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.pf.EvidenceHeld(), w.pf.EvidenceWithheld()
 }
 
 func (w *pfWrapper) window() int64 {
@@ -267,4 +262,23 @@ func (w *pfWrapper) releaseStreaming() int64 {
 	}
 	w.streaming.Store(false)
 	return -1
+}
+
+// counterSnapshot reads every per-handle prefetch counter as cumulative totals. Called under
+// w.mu, before and after an Observe, so the difference is exactly that read's contribution.
+//
+// A snapshot-and-diff rather than seven callbacks from the detector: the counters live in
+// internal/prefetch as plain int64 fields, and reading them is cheaper than threading a
+// recorder through the state machine.
+func (w *pfWrapper) counterSnapshot() metrics.PrefetchDelta {
+	held, withheld := w.pf.EvidenceHeld(), w.pf.EvidenceWithheld()
+	return metrics.PrefetchDelta{
+		Seek:             w.pf.LowCoverage(),
+		CoverageHeld:     w.pf.CoverageHeld(),
+		Halvings:         w.pf.Halvings(),
+		Resets:           w.pf.Resets(),
+		EvidenceHeld:     held,
+		EvidenceWithheld: withheld,
+		DeEstablished:    w.pf.DeEstablished(),
+	}
 }

@@ -145,9 +145,14 @@ type node struct {
 
 // fileHandle carries per-open-file state, including its prefetcher.
 type fileHandle struct {
-	key       blockstore.Key
-	size      int64
-	pf        *pfWrapper
+	key  blockstore.Key
+	size int64
+	pf   *pfWrapper
+	// pfMet is this handle's resolved prefetch counters, looked up once at Open so a
+	// per-read record is a few atomic adds rather than a WithLabelValues lookup under the
+	// registry mutex. Resolving at Open also makes the labelled series exist from the first
+	// open rather than the first close (#253, #316).
+	pfMet     *metrics.PrefetchHandle
 	smallDone bool
 	smallMu   sync.Mutex
 	// partsDispatched is set once a whole-file parts fetch (#69) has been
@@ -328,6 +333,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		func() float64 { return float64(f.EffectiveWindow()) },
 		func() float64 { return float64(f.OpenHandles()) },
 		func() float64 { return float64(f.StreamingHandles()) },
+		f.evidenceRatio,
 	)
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.
@@ -635,9 +641,10 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 		return fuse.Status(syscall.EROFS)
 	}
 	h := &fileHandle{
-		key:  blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
-		size: fi.Size,
-		pf:   newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin()),
+		key:   blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
+		size:  fi.Size,
+		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin()),
+		pfMet: f.met.PrefetchHandleFor(sizeClass(fi.Size)),
 	}
 	f.mu.Lock()
 	fh := f.nextFh
@@ -857,11 +864,13 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// measured at 2.70x more dispatch than the mount, on a capture where the mount
 		// never exceeded 17 blocks and the replay assumed 223 (#267). So it is recorded.
 		maxWin := f.perHandleWindow(h.pf.isStreaming())
-		obs := h.pf.observe(blk, off, end, maxWin, &f.pfSeq)
+		obs := h.pf.observe(blk, off, end, maxWin, f.evidenceRatio(), &f.pfSeq)
 		if obs.streamDelta != 0 {
 			f.streamingHandles.Add(obs.streamDelta)
 		}
-		f.met.PrefetchCoverage(obs.covDelta, obs.covHeldDelta)
+		if !obs.counters.Empty() {
+			h.pfMet.Record(obs.counters)
+		}
 		if f.pfTrace != nil {
 			f.tracePF(pfTraceRow{
 				seq: obs.seq, fh: input.Fh, pid: input.Pid, key: h.key.Key, size: h.size,
@@ -1107,18 +1116,13 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 		if d := h.pf.releaseStreaming(); d != 0 {
 			f.streamingHandles.Add(d)
 		}
-		halvings, resets := h.pf.halvings(), h.pf.resets()
-		f.cfg.PrefetchStats.record(halvings, resets, h.pf.peakWindow())
-		f.met.PrefetchSeeks(halvings, resets)
-		// #256: make the evidence gate's action observable. Without this the only
-		// visible effect is that `issued` fell, which cannot distinguish a window
-		// the gate refused from one the detector never wanted — and cannot say
-		// whether the gate fires on the large objects or the small ones.
-		// Called unconditionally: the metric emits its labelled series at zero so an
-		// absent line cannot be mistaken for a missing feature (#256 field report).
-		held, withheld := h.pf.evidence()
-		f.met.PrefetchEvidenceClamped(sizeClass(h.size), held, withheld)
-		f.met.PrefetchDeEstablished(sizeClass(h.size), h.pf.deEstablished())
+		// PrefetchStats is a summary object for the unmount log line, not a Prometheus
+		// counter, so it is still folded in here. Every METRIC this used to record at
+		// Release is now recorded per read instead: folding them in at close made all of
+		// them read zero for the entire life of a job that holds its handles open, which
+		// is the normal shape, and that is how two separate defects stayed invisible
+		// (#316, #319).
+		f.cfg.PrefetchStats.record(h.pf.halvings(), h.pf.resets(), h.pf.peakWindow())
 	}
 }
 
@@ -1249,6 +1253,15 @@ func (f *rawFS) objectKey(relPath string) string {
 
 // coverageMin is the #221 coverage threshold in force: the configured override, or the
 // characterized default.
+// evidenceRatio is the #256 gate ratio in force right now: the operator's setting if any,
+// else derived from the endpoint's MEASURED first-byte latency. Consulted per read because
+// the measurement changes as fills complete, and because deriving it at open would read the
+// 40 ms seed instead of the device (#292).
+func (f *rawFS) evidenceRatio() float64 {
+	ttfb, measured := f.store.MeasuredTTFB()
+	return evidenceRatioFor(f.cfg.ReadaheadEvidenceRatio, ttfb, measured)
+}
+
 func (f *rawFS) coverageMin() float64 {
 	if f.cfg.CoverageMin > 0 {
 		return f.cfg.CoverageMin

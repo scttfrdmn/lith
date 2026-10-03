@@ -36,7 +36,7 @@ func TestByteGapIsConsistentWithSomeSerialization(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			off := int64(i) * perRead
-			obs := w.observe(off/blockSz, off, off+perRead, 223, &seq)
+			obs := w.observe(off/blockSz, off, off+perRead, 223, 0, &seq)
 			gaps[i] = obs.gap
 		}(i)
 	}
@@ -71,21 +71,21 @@ func TestObservedGapIsTheValueTheDetectorSaw(t *testing.T) {
 	w := newPFWrapper(223, blockSz, 0, coverageMin)
 	var seq atomic.Int64
 	// First read starts at 0: gap 0 against a fresh endpoint.
-	if obs := w.observe(0, 0, 1<<20, 223, &seq); obs.gap != 0 {
+	if obs := w.observe(0, 0, 1<<20, 223, 0, &seq); obs.gap != 0 {
 		t.Errorf("first read gap = %d, want 0", obs.gap)
 	}
 	// Contiguous continuation: gap 0.
-	if obs := w.observe(0, 1<<20, 2<<20, 223, &seq); obs.gap != 0 {
+	if obs := w.observe(0, 1<<20, 2<<20, 223, 0, &seq); obs.gap != 0 {
 		t.Errorf("contiguous read gap = %d, want 0", obs.gap)
 	}
 	// A seek forward by exactly one block: the gap is the hole, and it is reported.
 	off := int64(2<<20) + blockSz
-	if obs := w.observe(off/blockSz, off, off+(1<<20), 223, &seq); obs.gap != blockSz {
+	if obs := w.observe(off/blockSz, off, off+(1<<20), 223, 0, &seq); obs.gap != blockSz {
 		t.Errorf("seek gap = %d, want %d", obs.gap, blockSz)
 	}
 	// A backward seek reports a negative gap rather than being clamped away: Observe takes
 	// the magnitude, so the sign must survive to the trace for a reader to see the seek.
-	if obs := w.observe(0, 0, 1<<20, 223, &seq); obs.gap >= 0 {
+	if obs := w.observe(0, 0, 1<<20, 223, 0, &seq); obs.gap >= 0 {
 		t.Errorf("backward seek gap = %d, want negative", obs.gap)
 	}
 }

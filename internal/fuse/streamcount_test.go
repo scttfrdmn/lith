@@ -30,7 +30,7 @@ func TestStreamDeltaIsReportedOncePerTransition(t *testing.T) {
 	establishes := 0
 	for i := int64(0); i < 32; i++ {
 		off := i * blockSize
-		obs := w.observe(i, off, off+blockSize, 223, &seq)
+		obs := w.observe(i, off, off+blockSize, 223, 0, &seq)
 		count += obs.streamDelta
 		if obs.streamDelta == 1 {
 			establishes++
@@ -83,7 +83,7 @@ func TestCollapseToRandomReleasesTheShare(t *testing.T) {
 	var count int64
 	for i := int64(0); i < 32; i++ {
 		off := i * blockSize
-		count += w.observe(i, off, off+blockSize, 223, &seq).streamDelta
+		count += w.observe(i, off, off+blockSize, 223, 0, &seq).streamDelta
 	}
 	if count != 1 {
 		t.Fatalf("fixture: count = %d after a sequential walk, want 1", count)
@@ -93,7 +93,7 @@ func TestCollapseToRandomReleasesTheShare(t *testing.T) {
 	// does the count must come back down.
 	for i := int64(0); i < 64 && count != 0; i++ {
 		off := (1000 + i*997) * blockSize
-		count += w.observe(off/blockSize, off, off+4096, 223, &seq).streamDelta
+		count += w.observe(off/blockSize, off, off+4096, 223, 0, &seq).streamDelta
 	}
 	if w.state() == prefetch.Sequential {
 		t.Skipf("the detector stayed Sequential through 64 scattered reads; this fixture no "+
@@ -122,7 +122,7 @@ func TestStreamDeltaUnderConcurrentReadsOnOneHandle(t *testing.T) {
 			for i := int64(0); i < 64; i++ {
 				blk := int64(g)*64 + i
 				off := blk * blockSize
-				count.Add(w.observe(blk, off, off+blockSize, 223, &seq).streamDelta)
+				count.Add(w.observe(blk, off, off+blockSize, 223, 0, &seq).streamDelta)
 			}
 		}(g)
 	}
