@@ -1138,6 +1138,18 @@ type prefetchWaitRecorder interface {
 	PrefetchWait(d time.Duration)
 }
 
+// ttfbRecorder is an optional Recorder extension: implementers receive every fill's
+// first-byte latency, so the DISTRIBUTION is observable and not just the rolling median the
+// evidence policy reads (#341).
+//
+// The distribution is what mattered: #340's bound was placed from in-region p90 (42.7 ms)
+// against a median of 28.2 ms, and that spread had to be recovered from a --timeline-csv
+// because nothing exported it. Kept optional, on the same type-assertion pattern, so no
+// existing Recorder implementer changes.
+type ttfbRecorder interface {
+	S3TTFB(d time.Duration)
+}
+
 func (bs *BlockStore) recordPrefetchWait(d time.Duration) {
 	if r, ok := bs.rec.(prefetchWaitRecorder); ok {
 		r.PrefetchWait(d)

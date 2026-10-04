@@ -95,6 +95,9 @@ func (bs *BlockStore) recordTTFB(d time.Duration) {
 	if d <= 0 {
 		return
 	}
+	if r, ok := bs.rec.(ttfbRecorder); ok {
+		r.S3TTFB(d)
+	}
 	bs.ttfbMu.Lock()
 	bs.ttfbSamples = append(bs.ttfbSamples, d)
 	if len(bs.ttfbSamples) > ttfbMax {

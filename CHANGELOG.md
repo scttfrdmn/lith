@@ -38,13 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`lith_s3_ttfb_seconds`: the evidence policy's input, alongside its output**
-  ([#341](https://github.com/scttfrdmn/lith/issues/341)). The rolling median S3 first-byte
-  latency, 0 until a fill has measured the endpoint. Only the policy's *output*
-  (`lith_readahead_evidence_ratio`) was observable, so on a scrape "the gate is off" and "the
-  gate is off because its bound is in the wrong unit" looked identical — #340 had to be
-  diagnosed from the source. Explicitly documented as **not a round trip**: in-region this is
-  ~28 ms against an RTT of ~2 ms, and confusing the two is what #340 was.
+- **The evidence policy's INPUT, three series** ([#341](https://github.com/scttfrdmn/lith/issues/341)).
+  Only the policy's *output* (`lith_readahead_evidence_ratio`) was observable, so on a scrape
+  "the gate is off", "the gate is off because nothing has measured the endpoint yet" and "the
+  gate is off because its bound is in the wrong unit" all looked identical — #340 had to be
+  diagnosed from the source.
+  - `lith_ttfb_median_seconds` — the rolling median first-byte latency, i.e. the exact value
+    `evidenceRatioFor` reads. Documented as **not a round trip**: in-region this is ~28 ms
+    against an RTT of ~2 ms, and confusing the two is what #340 was.
+  - `lith_ttfb_measured` (0/1) — so a seed-valued median cannot be mistaken for a
+    measurement. The median reads 0 in both cases; this is what separates them.
+  - `lith_ttfb_seconds` — a histogram of the raw per-fill samples, because the median alone
+    was not what placed the bound. The in-region spread (p10 22.6 / median 28.2 / p90 42.7)
+    is what anchors 50 ms, and it had to be recovered from a `--timeline-csv`. Buckets are
+    centred on the measured regimes rather than Prometheus's defaults, which have nothing
+    between 25 ms and 50 ms — the interval the bound sits in. `le="0.05"` against `_count`
+    answers "will the default engage here" from one scrape, with no quantile estimation.
 
 
 ### Fixed

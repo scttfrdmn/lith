@@ -344,6 +344,12 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			}
 			return d.Seconds()
 		},
+		func() float64 {
+			if _, measured := f.store.MeasuredTTFB(); measured {
+				return 1
+			}
+			return 0
+		},
 	)
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.
