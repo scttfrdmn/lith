@@ -20,7 +20,17 @@ import (
 const (
 	gapFloor = 256 << 10
 	gapCeil  = 64 << 20
-	ttfbMax  = 8 // rolling window of measured first-byte latencies
+	ttfbMax  = 8 // rolling window of measured first-byte latencies, read by the evidence policy
+	// The floor window (#349). ttfbMax = 8 is far too short to be a policy input: over a
+	// stream of ~16 serial demand GETs followed by a burst up to --s3-concurrency deep, an
+	// 8-sample window is always dominated by whichever phase just happened, which is the
+	// whole mechanism of #349. A floor needs a window that spans both phases.
+	ttfbFloorWindow = 256
+	// Enough samples that a quantile means something. Below this FloorTTFB reports
+	// not-measured rather than a figure from three fills -- the #292 rule: force the caller
+	// to handle "not yet" instead of handing it a number that looks right.
+	ttfbFloorMin  = 32
+	ttfbFloorPctl = 10
 )
 
 // ProjectionCoalesceGap caps the coalesce gap for the byte-precise projection
@@ -90,7 +100,40 @@ func (bs *BlockStore) MeasuredTTFB() (time.Duration, bool) {
 	return s[len(s)/2], true
 }
 
-// recordTTFB feeds a fill's first-byte latency into the rolling window.
+// FloorTTFB reports a LOAD-INVARIANT estimate of the endpoint's first-byte latency: a low
+// quantile over a window long enough to span a handle's phases. Second return false means
+// not enough fills have completed to estimate it.
+//
+// Why a floor rather than the median MeasuredTTFB returns (#349). Queueing and contention
+// can only ADD to a first-byte latency, so the low end of a window is a lower bound on what
+// the endpoint itself costs, and load cannot push it up. The median cannot make that claim:
+// measured in-region, it reads ~28 ms on an idle mount and ~100 ms during the mount's own
+// prefetch burst -- above both the evidence gate's 50 ms bound and the 58.6 ms cross-region
+// round trip the bound's far side is anchored on. A busy near endpoint and an idle far one
+// are not separable on the median.
+//
+// The far-side anchor survives on the floor by construction, which is the property that
+// makes this worth having: a first byte cannot arrive sooner than one round trip, so a
+// cross-region endpoint's floor cannot drop under its RTT however idle it is.
+//
+// NOTHING READS THIS YET. It is exported and instrumented so the deciding measurement can
+// be taken -- whether a floor separates in-region-under-load from cross-region-idle -- before
+// any policy is moved onto it. If it does not separate, first-byte latency is the wrong
+// input and this is what refutes it.
+func (bs *BlockStore) FloorTTFB() (time.Duration, bool) {
+	bs.ttfbMu.Lock()
+	defer bs.ttfbMu.Unlock()
+	if len(bs.ttfbFloorWin) < ttfbFloorMin {
+		return 0, false
+	}
+	s := append([]time.Duration(nil), bs.ttfbFloorWin...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	// A low quantile, not the minimum: one anomalously fast sample should not define the
+	// endpoint. With the floor window full this is the 10th percentile.
+	return s[len(s)*ttfbFloorPctl/100], true
+}
+
+// recordTTFB feeds a fill's first-byte latency into the rolling windows.
 func (bs *BlockStore) recordTTFB(d time.Duration) {
 	if d <= 0 {
 		return
@@ -99,6 +142,13 @@ func (bs *BlockStore) recordTTFB(d time.Duration) {
 		r.S3TTFB(d)
 	}
 	bs.ttfbMu.Lock()
+	// The long window, for the load-invariant floor (#349). Kept separate from the 8-sample
+	// window below rather than replacing it: the policy's current input must not change
+	// while the floor is only an instrument.
+	bs.ttfbFloorWin = append(bs.ttfbFloorWin, d)
+	if len(bs.ttfbFloorWin) > ttfbFloorWindow {
+		bs.ttfbFloorWin = bs.ttfbFloorWin[1:]
+	}
 	bs.ttfbSamples = append(bs.ttfbSamples, d)
 	if len(bs.ttfbSamples) > ttfbMax {
 		bs.ttfbSamples = bs.ttfbSamples[1:]

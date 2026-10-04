@@ -161,6 +161,7 @@ type BlockStore struct {
 	ttfbMu       sync.Mutex
 	ttfbSeed     time.Duration
 	ttfbSamples  []time.Duration
+	ttfbFloorWin []time.Duration // long window for the load-invariant floor (#349)
 
 	// Demand batching (#124/session 30): concurrent footer demand misses on one
 	// object are collected for one scheduling tick and dispatched as a single
