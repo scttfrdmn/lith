@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **M17-D, gateway seam: the NFS readahead divisor counts MOUNTS, not readers**
+  ([#219](https://github.com/scttfrdmn/lith/issues/219),
+  [#337](https://github.com/scttfrdmn/lith/issues/337)). Characterized, not fixed.
+
+  `windowBlocks()` divides the prefetch budget by `activeClients()`, which counts clients that
+  sent a MOUNT within `ClientIdle` (5 minutes by default). A client that mounts and reads
+  nothing holds a share for those five minutes, so an actively-reading client's window
+  collapses **48×, from 96 blocks to the 2-block floor, from mounts alone**.
+
+  That is #301 in the gateway: there the divisor counted every open file descriptor including
+  never-read ones, and a job merely holding files open drove every reader to the same floor at
+  6–10× the wall clock. The fix was not to remove the division but to change its input.
+
+  The gateway's analogue of that input already exists — `roFS.states` carries a per-path
+  `lastTouch`, updated in `stateFor`, which NFS's statelessness calls on **every read**. The
+  code's stated reason for measuring from MOUNT ("per-op client activity is not visible through
+  go-nfs's stateless read path") is true of go-nfs and not of lith's own state map.
+
+  Left as a characterization because changing a prefetch divisor is the change class that
+  produced an 11× regression in this project, and the gateway's throughput cannot be measured
+  here. The test becomes the assertion when the input is fixed.
+
+
 ### Fixed
 
 - **`Open` built a file handle from a MIX of two index versions during a refresh**
