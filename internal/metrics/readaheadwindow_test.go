@@ -17,6 +17,7 @@ import (
 func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	m := New()
 	window, handles, streams, evRatio, ttfb, measured := 223.0, 1.0, 1.0, 0.0, 0.0, 0.0
+	floor := 0.0
 	m.RegisterReadaheadWindow(
 		func() float64 { return window },
 		func() float64 { return handles },
@@ -24,6 +25,7 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		func() float64 { return evRatio },
 		func() float64 { return ttfb },
 		func() float64 { return measured },
+		func() float64 { return floor },
 	)
 
 	scrape := func() string {
@@ -46,6 +48,9 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		// And the flag that disambiguates it: a median of 0 here means "nothing measured",
 		// which is a different state from "measured, and fast". Both report the gate off.
 		"lith_ttfb_measured 0",
+		// The load-invariant floor (#349), 0 until enough fills have completed. Emitted
+		// at zero so an absent series cannot be read as a missing feature.
+		"lith_ttfb_floor_seconds 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape missing %q", want)
@@ -84,6 +89,25 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("with a measured 28.2ms TTFB and the gate off, scrape missing %q", want)
 		}
+	}
+
+	// THE #349 SEPARATION, as two scrapes the MEDIAN cannot tell apart. A busy in-region
+	// mount and an idle cross-region one both report a median near 100 ms, so the evidence
+	// policy reads them identically and turns itself off for both. Their FLOORS differ by
+	// more than 2x, because queueing can only add: the near endpoint's fast fills are still
+	// in the window, and the far one has none and cannot have any.
+	ttfb, measured, floor = 0.1010, 1, 0.0226 // in-region, under its own prefetch burst
+	nearLoaded := scrape()
+	ttfb, measured, floor = 0.0986, 1, 0.0586 // cross-region, idle
+	farIdle := scrape()
+	if !strings.Contains(nearLoaded, "lith_ttfb_floor_seconds 0.0226") ||
+		!strings.Contains(farIdle, "lith_ttfb_floor_seconds 0.0586") {
+		t.Error("the floor gauge does not separate a loaded near endpoint from an idle far one")
+	}
+	if !strings.Contains(nearLoaded, "lith_ttfb_median_seconds 0.101") ||
+		!strings.Contains(farIdle, "lith_ttfb_median_seconds 0.0986") {
+		t.Fatal("fixture: both arms must report a median above the 50ms bound, or the " +
+			"floor is not what distinguishes them")
 	}
 
 	// THE AMBIGUITY #341 NAMED, as two scrapes that differ in exactly one series. Both report

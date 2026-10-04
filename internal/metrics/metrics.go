@@ -330,7 +330,7 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 // mounts ran there. #301 changed the divisor's input, so the gap is now diagnostic rather
 // than causal: wide means many idle descriptors (no longer a problem), narrow-and-crowded
 // means genuinely more streams than the budget can fund (raise --prefetch-budget).
-func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio, ttfbSeconds, ttfbMeasured func() float64) {
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio, ttfbSeconds, ttfbMeasured, ttfbFloor func() float64) {
 	if m == nil {
 		return
 	}
@@ -350,6 +350,10 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles,
 		Name: "lith_ttfb_median_seconds",
 		Help: "Rolling median S3 FIRST-BYTE latency -- the exact input evidenceRatioFor reads. Not a network round trip: in-region this is ~28 ms against an RTT of ~2 ms, and confusing the two is what made v1.4.0's evidence default never engage (#340). Pair with lith_ttfb_measured: this reads 0 when nothing has been measured yet (#341).",
 	}, ttfbSeconds))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_ttfb_floor_seconds",
+		Help: "A LOAD-INVARIANT estimate of the endpoint's first-byte latency: the 10th percentile over a 256-fill window. 0 until enough fills have completed. Queueing can only ADD to a first-byte latency, so the low end of a window is a lower bound on what the endpoint costs and load cannot raise it -- unlike lith_ttfb_median_seconds, which reads ~28 ms on an idle in-region mount and ~100 ms during that same mount's prefetch burst (#349). NOTHING READS THIS YET: it is here so the deciding measurement can be taken before the evidence policy is moved onto it.",
+	}, ttfbFloor))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_ttfb_measured",
 		Help: "1 once a fill has measured the endpoint's first-byte latency, 0 before. Without it, a mount in the evidence gate's \"off\" regime looks identical from outside whether nothing has been measured yet, the measurement is above the bound, or the policy is wrong -- and #340 was the second of those, diagnosable only from the source (#341).",

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith_ttfb_floor_seconds`: a load-invariant first-byte latency, as an instrument**
+  ([#349](https://github.com/scttfrdmn/lith/issues/349)). The 10th percentile over a 256-fill
+  window, beside the 8-sample median the evidence policy reads.
+
+  The median is **load-sensitive**: measured in-region it reads ~28 ms on an idle mount and
+  ~100 ms during that same mount's own prefetch burst — above the 50 ms bound *and* above the
+  58.6 ms cross-region round trip the bound's far side is anchored on, so a busy near endpoint
+  and an idle far one are not separable on it. Worse, the gate's decision changes the burst
+  depth that produces the reading, which makes the policy **bistable**: off keeps itself off,
+  because the high reading is produced by the over-fetch the gate exists to stop.
+
+  A floor can make a claim the median cannot: queueing and contention only *add* to a
+  first-byte latency, so the low end of a window is a lower bound on what the endpoint itself
+  costs. The far-side anchor survives by construction — a first byte does not arrive sooner
+  than one round trip, so a cross-region floor cannot drop under its RTT however idle it is.
+
+  **Nothing reads it.** This is the #322 phase-1 pattern: the instrument lands first so the
+  deciding measurement — does a floor separate in-region-under-load from cross-region-idle? —
+  can be taken before any policy is moved onto it, and
+  `TestFloorTTFBIsAnInstrumentAndNothingReadsIt` is *supposed* to fail when that happens.
+  Also recorded: `ttfbMax = 8` is too short to be a policy input regardless of the statistic,
+  since an 8-sample window over a serial demand prefix followed by a burst is always
+  dominated by whichever phase just happened.
+
 ## [1.5.0] - 2026-10-03
 
 ### Fixed
