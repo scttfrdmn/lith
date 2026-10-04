@@ -285,3 +285,90 @@ func TestFrameCacheConcurrentRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// M17-D (#219), frame-cache seam under EVICTION. TestFrameCacheConcurrentRace above verifies
+// content under concurrency but with a budget large enough to hold every frame, so the LRU
+// never runs. The frame cache's two documented edges are both eviction-shaped:
+//
+//   - least-recently-used frames are dropped under budget pressure, while other goroutines
+//     may hold the decoded slice they got from acquire's cached path;
+//   - "a single frame larger than the whole budget is decoded and served (waiters get its
+//     bytes) but not retained, so it cannot pin the budget".
+//
+// Neither was under concurrency. A frame dropped mid-read, a waiter served from a flight whose
+// entry was never inserted, or an eviction racing an insert would all surface as wrong bytes
+// and as nothing else — which is the class #219 exists for, and the one `-race` cannot report
+// because every access here is already under c.mu or ordered by close(fl.done).
+func TestFrameCacheConcurrentUnderEviction(t *testing.T) {
+	srv := fake.New()
+	const nFrames = 8
+	const frameU = int64(2) << 20
+	k, master := makeFramedChunk(t, srv, "evict.tar.zst", nFrames, frameU)
+	total := int64(nFrames) * frameU
+
+	// A frame budget that holds TWO of the eight frames, so the LRU is evicting throughout
+	// and a frame is routinely dropped between one reader decoding it and another wanting it.
+	bs := newStore(t, srv, Config{
+		BlockSize: 1 << 20, MaxRange: 64 << 20, FrameCache: 2 * frameU, Recorder: &backRec{},
+	})
+
+	workers, iters := 32, 40
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				// Walk the frames out of order, so every worker evicts what others want.
+				fr := int64((w*7 + i*3) % nFrames)
+				off := fr*frameU + int64(i*4096)%(frameU-8192)
+				got, err := bs.GetRange(context.Background(), k, off, 8192, total)
+				if err != nil {
+					t.Errorf("read at %d: %v", off, err)
+					return
+				}
+				if string(got) != string(master[off:off+8192]) {
+					t.Errorf("read at %d (frame %d): bytes mismatch under eviction", off, fr)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	t.Logf("%d workers x %d reads over %d frames, budget %d frames: every byte verified",
+		workers, iters, nFrames, 2)
+}
+
+// The oversized path under concurrency: a frame larger than the whole budget is served to
+// waiters but never retained, so every read re-decodes it. Many readers hitting one such frame
+// at once is the case where a waiter could be handed a flight whose entry does not exist.
+func TestFrameCacheOversizedFrameConcurrent(t *testing.T) {
+	srv := fake.New()
+	const frameU = int64(4) << 20
+	k, master := makeFramedChunk(t, srv, "oversize.tar.zst", 2, frameU)
+	total := 2 * frameU
+
+	// Budget smaller than ONE frame: nothing is ever retained.
+	bs := newStore(t, srv, Config{
+		BlockSize: 1 << 20, MaxRange: 64 << 20, FrameCache: frameU / 2, Recorder: &backRec{},
+	})
+
+	var wg sync.WaitGroup
+	for w := 0; w < 24; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			off := int64(w) * 4096 % (frameU - 4096)
+			got, err := bs.GetRange(context.Background(), k, off, 4096, total)
+			if err != nil {
+				t.Errorf("read at %d: %v", off, err)
+				return
+			}
+			if string(got) != string(master[off:off+4096]) {
+				t.Errorf("read at %d: bytes mismatch on an un-retainable frame", off)
+			}
+		}(w)
+	}
+	wg.Wait()
+	t.Logf("24 concurrent readers of a frame larger than the whole budget: every byte verified")
+}

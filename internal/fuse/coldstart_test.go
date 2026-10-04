@@ -113,21 +113,27 @@ func TestColdSequentialGetShape(t *testing.T) {
 			"coalescing behaviour has changed", block0Gets, want)
 	}
 
-	// THE FIGURE, pinned. 22 before #332 and 17 after, both stable across six runs (the
-	// post-fix value occasionally reads 18, so the bound is 20). The earlier bound here was
-	// 4x the ideal — 32 — which would not have noticed #332 being reverted, and a fix worth
-	// ~140 ms per open should not rest on a bound that loose.
+	// THE TOTAL IS LOAD-SENSITIVE AND IS LOGGED, NOT PINNED TIGHTLY. 22 before #332 and 17
+	// after in isolation, but background prefetch races this read loop: whether a prefetched
+	// block lands before the demand read reaches it decides whether that read also issues a
+	// GET, so a loaded machine sees more. A bound of 20 was tried and flaked in the full-tree
+	// run -- which is the measurement-discipline rule in CONTRIBUTING.md applied to a bound
+	// rather than to a figure: this one needed its distribution too.
 	//
-	// 22 -> 17 is block 1's five GETs. Block 0's eight remain and are #233.
-	if gets > 20 {
-		t.Errorf("%d GETs for %d MiB, more than 20 — this was 22 before #332 and 17 after, so "+
-			"either the establishment dispatch no longer covers the block the reader is in, "+
-			"or fetching has degenerated toward per-chunk", gets, objBytes>>20)
+	// So the loose bound here only catches degeneration toward per-chunk fetching across the
+	// whole read. The tight, deterministic assertion for #332 lives where it belongs, on the
+	// detector: internal/prefetch's TestEstablishmentDispatchesTheCurrentBlock asserts the
+	// first dispatched block IS the one the reader is in, which is a state-machine property
+	// with no timing in it.
+	if max := objBytes / int64(blockstore.ChunkSize) / 2; int64(gets) > max {
+		t.Errorf("%d GETs for %d MiB, more than %d — fetching has degenerated toward "+
+			"per-chunk across the whole read, not just block 0", gets, objBytes>>20, max)
 	}
 	if gets < int(objBytes/blockSize) {
 		t.Errorf("%d GETs for %d MiB is below one per block (%d): the fixture is serving from "+
 			"cache and measures nothing", gets, objBytes>>20, objBytes/blockSize)
 	}
+
 	if total != objBytes {
 		t.Errorf("fetched %d bytes for a %d-byte object: a whole sequential read must be "+
 			"byte-exact", total, objBytes)

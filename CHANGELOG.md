@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M17-D: the frame cache under eviction, and two test defects of my own**
+  ([#219](https://github.com/scttfrdmn/lith/issues/219)). The frame-cache seam is **clean**;
+  the two defects were in the tests meant to guard #332.
+
+  `TestFrameCacheConcurrentRace` verified content under concurrency but with a budget large
+  enough to hold every frame, so the LRU never ran — and both of the frame cache's documented
+  edges are eviction-shaped (least-recently-used frames dropped while other goroutines hold the
+  decoded slice; a frame larger than the whole budget served to waiters but never retained).
+  Both now run under concurrency with content verified: 32 workers × 40 reads over 8 frames
+  with a 2-frame budget, and 24 concurrent readers of an un-retainable frame. Clean under
+  `-race`, repeated.
+
+  **And two assertions of mine were wrong, in the same direction.**
+  `TestColdSequentialGetShape`'s total-GET bound of 20 was tightened onto a **load-sensitive**
+  number — background prefetch racing the read loop decides whether a demand read also issues a
+  GET — and it flaked in the full-tree run. That is the measurement-discipline rule applied to
+  a *bound* rather than a figure: it needed its distribution too. The total is now logged with a
+  bound that only catches degeneration to per-chunk fetching.
+  `TestEstablishmentDispatchesTheCurrentBlock`, which I had cited as the tight deterministic
+  backstop, asserted `dispatched[0] > 2` — and the pre-#332 value is exactly 2, so **it passed
+  with the fix reverted.** Now asserts equality against the block establishment happened on,
+  verified by reverting #332 and watching it fail.
+
 - **M17-D, gateway seam: the NFS readahead divisor counts MOUNTS, not readers**
   ([#219](https://github.com/scttfrdmn/lith/issues/219),
   [#337](https://github.com/scttfrdmn/lith/issues/337)). Characterized, not fixed.

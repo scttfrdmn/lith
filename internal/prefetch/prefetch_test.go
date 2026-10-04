@@ -259,40 +259,41 @@ func TestStrideUnchanged(t *testing.T) {
 func TestEstablishmentDispatchesTheCurrentBlock(t *testing.T) {
 	p := New(32)
 	// Contiguous block advances, which is what a sequential 128 KiB reader looks like to the
-	// detector once it crosses a block boundary.
+	// detector once it crosses a block boundary. Record WHICH block establishment happened
+	// on, because the whole assertion is that the dispatch starts there and not past it.
 	var dispatched []int64
-	for i := int64(0); i < 4; i++ {
-		dispatched = append(dispatched, p.Observe(i, i<<23, 1<<17, 0)...)
-		if p.State() == Sequential {
+	establishedOn := int64(-1)
+	for i := int64(0); i < 8; i++ {
+		d := p.Observe(i, i<<23, 1<<17, 0)
+		if p.State() == Sequential && establishedOn < 0 {
+			establishedOn = i
+			dispatched = d
 			break
 		}
 	}
-	if p.State() != Sequential {
-		t.Fatalf("state = %v after four contiguous advances, want Sequential", p.State())
+	if establishedOn < 0 {
+		t.Fatalf("never established over 8 contiguous advances (state %v)", p.State())
 	}
 	if len(dispatched) == 0 {
 		t.Fatal("establishment dispatched nothing")
 	}
+	t.Logf("established on block %d; dispatched %v", establishedOn, dispatched)
 
-	// The cursor at establishment is the block just entered. The first dispatched block must
-	// BE that block, not the one after it.
-	cursor := dispatched[0]
-	t.Logf("established at cursor %d; first dispatched block %d; dispatched %d blocks",
-		cursor, dispatched[0], len(dispatched))
-
-	// Reconstruct which block the detector was on: the reads were blocks 0..n, and the last
-	// one observed before establishment is the cursor.
+	// THE ASSERTION, and it must be equality. A first version said `dispatched[0] > 2`, which
+	// the pre-#332 behaviour satisfies exactly -- cursor+1 is 2 when establishment is on
+	// block 1 -- so it passed with the fix reverted. Verified by reverting it: this now fails
+	// and that one did not.
+	if dispatched[0] != establishedOn {
+		t.Errorf("first dispatched block is %d, want %d (the block the reader is IN). "+
+			"Pre-#332 this was establishedOn+1, leaving the rest of the reader's own block "+
+			"to be demand-fetched a chunk at a time — the other half of #233's cost.",
+			dispatched[0], establishedOn)
+	}
 	for i, b := range dispatched {
 		if i > 0 && b != dispatched[i-1]+1 {
 			t.Errorf("dispatched blocks are not contiguous: %v", dispatched)
 			break
 		}
-	}
-	// The property: the block the reader is in is included. Before this fix the first
-	// dispatched block was cursor+1 and the reader's own block was never prefetched.
-	if len(dispatched) > 0 && dispatched[0] > 2 {
-		t.Errorf("first dispatched block is %d; a reader that established on block 1 or 2 "+
-			"must have its own block dispatched, not skipped (%v)", dispatched[0], dispatched)
 	}
 }
 
