@@ -168,10 +168,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stalled 206–431 ms in block 0 and a further 245–389 ms in block 1, out of a 569–957 ms read.
   The first prefetched block was block **2**.
 
-  Offline, a cold sequential 64 MiB read drops from **22 GETs to 16**. Block 0's 8 are
-  irreducible (establishment cannot fire before a block advance, and #231 refuted three ways to
-  establish sooner); block 1's 7 extra are not. At the ~28 ms in-region first-byte latency for
-  a 1 MiB GET that is ~170 ms per open.
+  Offline, a cold sequential 64 MiB read drops from **22 GETs to 17** (both stable across six
+  runs; the post-fix figure occasionally reads 18). Block 0's 8 are irreducible — establishment
+  cannot fire before a block advance, and #231 refuted three ways to establish sooner — so the
+  five recovered are block 1's. At the ~28 ms in-region first-byte latency for a 1 MiB GET that
+  is **~140 ms per open**.
 
   Dispatching from the cursor costs nothing where the block is already covered: the chunk
   singleflight joins a demand fill in flight rather than duplicating it. Applied at
