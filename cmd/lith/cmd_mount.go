@@ -283,6 +283,16 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		defer func() { _ = closeIdx() }()
 	}
 
+	// Provenance check for EVERY path above (#217, M17-B case 2). An index names keys and
+	// the bucket comes from the mount, so an index built against one bucket and loaded
+	// against another resolves every key in the wrong bucket — serving whatever lives at
+	// those keys, with sizes and mtimes from the index, so nothing looks wrong until a
+	// checksum fails. In-process builds (auto-list, --cargoship) pass trivially; the paths
+	// this guards are --index-file, --index and @ref, where the index is a loaded artifact.
+	if err := checkIndexBucket(ix, bucket, indexSourceName(f)); err != nil {
+		return err
+	}
+
 	// Root the mount at the requested prefix. For an auto-built index this is a
 	// pass-through (it was built at the prefix); for a loaded index built at or
 	// above the prefix, it is a sub-root view — so one whole-bucket index can

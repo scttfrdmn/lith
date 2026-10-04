@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,4 +122,54 @@ func TestOverlappingCompressedFramesServeAnotherFramesBytes(t *testing.T) {
 	// The gate that now stops it is at the only layer that can see it: the manifest parser.
 	// See TestFrameTableRejectsOverlappingCompressedSpans in internal/cargoship -- a read
 	// path handed this table has already satisfied every cross-check available to it.
+}
+
+// Close must not tear down the shared zstd decoder while a fill is still decoding.
+//
+// Prefetch is fire-and-forget (`go store.Prefetch(...)`) in both the FUSE and NFS read
+// paths, so an unmount can land while a fill is mid-decode. Close only drained the disk
+// write-behind queue; it then called zdec.Close(), which closes a channel another goroutine
+// is selecting on. Found by -race in CI, on the first test that both reads framed chunks AND
+// registers Close as a cleanup -- every earlier cargo test did one or the other.
+//
+// Reachable in production at unmount, where the cost is a panic on the way out rather than
+// wrong data, but it is still a crash and the fix is a lifetime lock that in-flight decodes
+// hold for reading.
+func TestCloseWaitsForInFlightFrameDecodes(t *testing.T) {
+	srv := fake.New()
+	const nFrames = 8
+	const frameU = int64(1) << 20
+	k, _ := makeStampedChunk(t, srv, "chunk.tar.zst", nFrames, frameU)
+	total := int64(nFrames) * frameU
+
+	for round := 0; round < 25; round++ {
+		bs, err := New(srv, Config{Bucket: "bkt", BlockSize: 1 << 20, MemCache: 256 << 20,
+			MaxRange: 64 << 20, Recorder: &backRec{}})
+		if err != nil {
+			t.Fatalf("new: %v", err)
+		}
+
+		// Fire-and-forget prefetches across the whole chunk, exactly as the read paths
+		// dispatch them, then close underneath them without waiting.
+		for b := int64(0); b*(1<<20) < total; b++ {
+			go bs.Prefetch(context.Background(), k, b, total)
+		}
+		bs.Close()
+
+		// A decode arriving after Close must fail, not panic and not race. Issue more
+		// after the close so the post-Close path is exercised too.
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				// Errors are expected and fine; a panic or a race is not.
+				_, _ = bs.GetRange(context.Background(), k, int64(i)*frameU, 4096, total)
+			}(i)
+		}
+		wg.Wait()
+
+		// Close is idempotent, and a second one must not double-close the decoder.
+		bs.Close()
+	}
 }

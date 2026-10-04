@@ -70,6 +70,9 @@ func resolvePointer(ctx context.Context, client s3client.API, bucket, dataset, r
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve @%s: load index %q: %w", ref, indexKey, err)
 	}
+	if err := checkIndexBucket(ix, bucket, indexKey); err != nil {
+		return nil, "", fmt.Errorf("resolve @%s: %w", ref, err)
+	}
 	// Chunkless-manifest / empty-namespace guard (same class as #141): a published
 	// index is always backed by a framed archive with at least one file. An index
 	// built from a chunkless (direct-upload) manifest is rejected at build time by
@@ -101,4 +104,37 @@ func readPointerObject(ctx context.Context, client s3client.API, key string) ([]
 func sha256Sum(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
+}
+
+// checkIndexBucket refuses an index whose recorded bucket is not the bucket it is being
+// mounted against (lith#217, M17-B case 2).
+//
+// An index names keys; the bucket comes from the mount. So an index built against one bucket
+// and loaded against another resolves every key in the WRONG bucket — serving whatever
+// happens to live at those keys, under this dataset's name, with sizes and mtimes from the
+// index so nothing looks wrong until a checksum fails. A CURRENT's `index_sha256` does not
+// help: it binds the index's BYTES, not its meaning.
+//
+// An index with NO recorded bucket is accepted. `index.Build` leaves the field empty unless
+// the builder sets it, so refusing those would break indexes built before it was populated;
+// absence of provenance is not a mismatch. This mirrors the check --cargoship already makes
+// on its manifest's bucket.
+func checkIndexBucket(ix *index.Index, bucket, indexKey string) error {
+	if got := ix.Bucket(); got != "" && got != bucket {
+		return fmt.Errorf("index %q was built for bucket %q but is being mounted against bucket %q — every key it names would resolve in the wrong bucket (lith#217)", indexKey, got, bucket)
+	}
+	return nil
+}
+
+// indexSourceName names the index in an error: the artifact it came from when it is a loaded
+// one, else the in-process source, so a provenance mismatch says WHICH index to go look at.
+func indexSourceName(f *mountFlags) string {
+	switch {
+	case f.indexFile != "":
+		return f.indexFile
+	case f.cargoship != "":
+		return f.cargoship
+	default:
+		return "the loaded index"
+	}
 }

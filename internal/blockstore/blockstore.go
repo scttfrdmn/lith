@@ -175,11 +175,20 @@ type BlockStore struct {
 	timeline chunkTimelineRecorder
 	// openRec is the optional handle-open sink (#284); nil unless the installed Recorder
 	// implements handleOpenRecorder.
-	openRec    handleOpenRecorder
-	fill       fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
-	backing    backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
-	zdec       *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
-	zdecOnce   sync.Once
+	openRec  handleOpenRecorder
+	fill     fillRecorder    // optional sparse-fill metrics sink (#118); nil when unimplemented
+	backing  backingRecorder // optional CargoShip backing metrics sink (#94); nil when unimplemented
+	zdec     *zstd.Decoder   // shared zstd frame decoder (DecodeAll is concurrency-safe); nil until first cargoship fill
+	zdecOnce sync.Once
+	// zdecMu guards the decoder's LIFETIME, not its use: every decode holds it for
+	// reading (DecodeAll is concurrency-safe, so they do not serialize) and Close takes
+	// it for writing, which is what makes it wait for in-flight decodes. Prefetch is
+	// fire-and-forget (`go store.Prefetch(...)`), so without this an unmount could close
+	// the decoder underneath a fill still decoding -- a close of a channel another
+	// goroutine is selecting on. Found by -race in CI (#217 work); reachable in
+	// production at unmount, where the only cost is a panic on the way out.
+	zdecMu     sync.RWMutex
+	zdecClosed bool
 	frameCache *frameCache  // decoded CargoShip frame LRU (#137); nil when disabled
 	inflightN  atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
@@ -359,6 +368,10 @@ func (bs *BlockStore) Close() {
 			close(bs.stop)
 			bs.writersWG.Wait()
 		}
+		// Wait for in-flight decodes, then refuse any that arrive later.
+		bs.zdecMu.Lock()
+		bs.zdecClosed = true
+		bs.zdecMu.Unlock()
 		if bs.zdec != nil {
 			bs.zdec.Close()
 		}
