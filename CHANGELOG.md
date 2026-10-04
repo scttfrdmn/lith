@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-04
+
 ### Added
 
 - **`lith_ttfb_floor_seconds`: a load-invariant first-byte latency, as an instrument**
@@ -2347,7 +2349,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/scttfrdmn/lith/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/scttfrdmn/lith/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/scttfrdmn/lith/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/scttfrdmn/lith/compare/v1.2.0...v1.3.0
