@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-03
+
 ### Fixed
 
 - **`Close` tore down the shared zstd decoder while a fill was still decoding.** Prefetch is
@@ -143,27 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "verified the gate is live" check that accompanied #330 passed against 27 µs, which clears
   any bound including the broken one.
 
-### Added
-
-- **The evidence policy's INPUT, three series** ([#341](https://github.com/scttfrdmn/lith/issues/341)).
-  Only the policy's *output* (`lith_readahead_evidence_ratio`) was observable, so on a scrape
-  "the gate is off", "the gate is off because nothing has measured the endpoint yet" and "the
-  gate is off because its bound is in the wrong unit" all looked identical — #340 had to be
-  diagnosed from the source.
-  - `lith_ttfb_median_seconds` — the rolling median first-byte latency, i.e. the exact value
-    `evidenceRatioFor` reads. Documented as **not a round trip**: in-region this is ~28 ms
-    against an RTT of ~2 ms, and confusing the two is what #340 was.
-  - `lith_ttfb_measured` (0/1) — so a seed-valued median cannot be mistaken for a
-    measurement. The median reads 0 in both cases; this is what separates them.
-  - `lith_ttfb_seconds` — a histogram of the raw per-fill samples, because the median alone
-    was not what placed the bound. The in-region spread (p10 22.6 / median 28.2 / p90 42.7)
-    is what anchors 50 ms, and it had to be recovered from a `--timeline-csv`. Buckets are
-    centred on the measured regimes rather than Prometheus's defaults, which have nothing
-    between 25 ms and 50 ms — the interval the bound sits in. `le="0.05"` against `_count`
-    answers "will the default engage here" from one scrape, with no quantile estimation.
-
-
-### Fixed
 
 - **A refresh that moved an inode between two existing paths served the WRONG FILE'S BYTES**
   ([#217](https://github.com/scttfrdmn/lith/issues/217),
@@ -189,7 +170,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `A → X` pointing at B, moving the wrong-bytes failure rather than removing it.
 
 
+
+- **`Open` built a file handle from a MIX of two index versions during a refresh**
+  ([#219](https://github.com/scttfrdmn/lith/issues/219)). `rawFS.Open` loaded the index three
+  separate times — `Stat` for the size, `ETagHashOf` for the cache key, `BackingOf` for the
+  cargo parts. Each load is individually safe (the index is an atomic pointer), but a
+  concurrent `SwapIndex` landing between two of them gave the handle **a size from one version
+  and a cache key from another**. The handle then read bytes bounded by one version's length
+  under the other version's ETag.
+
+  **Measured at 33% of opens** — 10,438 of 32,000 — under continuous swap. `-race` reports
+  nothing, because every load is correct in isolation; this is the class #219 was opened for,
+  where a race serves wrong bytes rather than crashing.
+
+  `liveIndex` is a struct behind one atomic pointer precisely so a single load yields a
+  coherent view. `Open` now takes it once, and so do `readdir` (which had four loads, two
+  inside the entry loop, so a swap mid-listing could return entries from one version with
+  attributes from another — and `ReadDirPlus` registers those with the kernel, which caches
+  them) and `StatFs` (two loads, so `df` could disagree with itself). Every FUSE op now takes
+  exactly one.
+
 ### Added
+
+- **The evidence policy's INPUT, three series** ([#341](https://github.com/scttfrdmn/lith/issues/341)).
+  Only the policy's *output* (`lith_readahead_evidence_ratio`) was observable, so on a scrape
+  "the gate is off", "the gate is off because nothing has measured the endpoint yet" and "the
+  gate is off because its bound is in the wrong unit" all looked identical — #340 had to be
+  diagnosed from the source.
+  - `lith_ttfb_median_seconds` — the rolling median first-byte latency, i.e. the exact value
+    `evidenceRatioFor` reads. Documented as **not a round trip**: in-region this is ~28 ms
+    against an RTT of ~2 ms, and confusing the two is what #340 was.
+  - `lith_ttfb_measured` (0/1) — so a seed-valued median cannot be mistaken for a
+    measurement. The median reads 0 in both cases; this is what separates them.
+  - `lith_ttfb_seconds` — a histogram of the raw per-fill samples, because the median alone
+    was not what placed the bound. The in-region spread (p10 22.6 / median 28.2 / p90 42.7)
+    is what anchors 50 ms, and it had to be recovered from a `--timeline-csv`. Buckets are
+    centred on the measured regimes rather than Prometheus's defaults, which have nothing
+    between 25 ms and 50 ms — the interval the bound sits in. `le="0.05"` against `_count`
+    answers "will the default engage here" from one scrape, with no quantile estimation.
+
+
 
 - **M17-D: the frame cache under eviction, and two test defects of my own**
   ([#219](https://github.com/scttfrdmn/lith/issues/219)). The frame-cache seam is **clean**;
@@ -237,28 +257,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   here. The test becomes the assertion when the input is fixed.
 
 
-### Fixed
-
-- **`Open` built a file handle from a MIX of two index versions during a refresh**
-  ([#219](https://github.com/scttfrdmn/lith/issues/219)). `rawFS.Open` loaded the index three
-  separate times — `Stat` for the size, `ETagHashOf` for the cache key, `BackingOf` for the
-  cargo parts. Each load is individually safe (the index is an atomic pointer), but a
-  concurrent `SwapIndex` landing between two of them gave the handle **a size from one version
-  and a cache key from another**. The handle then read bytes bounded by one version's length
-  under the other version's ETag.
-
-  **Measured at 33% of opens** — 10,438 of 32,000 — under continuous swap. `-race` reports
-  nothing, because every load is correct in isolation; this is the class #219 was opened for,
-  where a race serves wrong bytes rather than crashing.
-
-  `liveIndex` is a struct behind one atomic pointer precisely so a single load yields a
-  coherent view. `Open` now takes it once, and so do `readdir` (which had four loads, two
-  inside the entry loop, so a swap mid-listing could return entries from one version with
-  attributes from another — and `ReadDirPlus` registers those with the kernel, which caches
-  them) and `StatFs` (two loads, so `df` could disagree with itself). Every FUSE op now takes
-  exactly one.
-
-### Added
 
 - **M17-D: a seam stress harness that verifies BYTES, not counts**
   ([#219](https://github.com/scttfrdmn/lith/issues/219)). Every concurrency test in the
@@ -274,7 +272,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   third of the object so eviction runs concurrently with the fills — is **clean**: 48 workers ×
   400 iterations under `-race`, 1538 GETs, every byte verified. A clean run is a passing result.
   The second seam found the `Open` tear above.
-
 
 ## [1.4.0] - 2026-10-04
 
@@ -2314,7 +2311,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/scttfrdmn/lith/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/scttfrdmn/lith/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/scttfrdmn/lith/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/scttfrdmn/lith/compare/v1.1.3...v1.2.0
