@@ -739,12 +739,17 @@ func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize, readLo, rea
 		want = maskForLen(chunkLenOf(ci, objSize))
 	}
 	var t0 time.Time
-	hit := false
+	hit, pf := false, false
 	if bs.timeline != nil {
 		t0 = time.Now()
 		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, want) {
 			hit = true
 		}
+		// Captured BEFORE fetchExtents, which credits the prefetch and drops the marker --
+		// read afterwards it is always false. It was hardcoded false here, so the timeline's
+		// `prefetched` column read false on every hit and uncovered row including hits whose
+		// lag_ms proved they had been prefetched (#284, reported from the field).
+		_, pf = bs.prefetched.Load(bs.cacheKey(k, ci))
 	}
 	d, err := bs.fetchExtents(ctx, k, ci, want, objSize, false, fillDemand)
 	if err != nil {
@@ -752,9 +757,9 @@ func (bs *BlockStore) Chunk(ctx context.Context, k Key, ci, objSize, readLo, rea
 	}
 	if bs.timeline != nil {
 		if hit {
-			bs.emitChunk(k, ci, "hit", false, 0, t0)
+			bs.emitChunk(k, ci, "hit", pf, 0, t0)
 		} else {
-			bs.emitChunk(k, ci, "uncovered", false, time.Since(t0), t0)
+			bs.emitChunk(k, ci, "uncovered", pf, time.Since(t0), t0)
 		}
 	}
 	return d, nil

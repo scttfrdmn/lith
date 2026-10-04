@@ -153,6 +153,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **On establishment, prefetch the block the reader is IN rather than starting past it**
+  ([#233](https://github.com/scttfrdmn/lith/issues/233),
+  [#284](https://github.com/scttfrdmn/lith/issues/284)). This is roughly half of the ~0.47 s
+  per-object-open cost that #284 could not account for.
+
+  Establishment fires on the first **block advance**, so at that moment the reader has just
+  crossed into the current block with most of it still ahead — 63 more 128 KiB reads of an
+  8 MiB block. The frontier was clamped to `cursor+1`, so every one of those was served as a
+  separate demand chunk GET and **block 1 repeated block 0's cost exactly**.
+
+  Measured on a real mount with `--timeline-csv`: `lag_ms` was **−1 for chunks 0–15 in every
+  one of 12 opens** — none of the first sixteen chunks was ever prefetched — with the reader
+  stalled 206–431 ms in block 0 and a further 245–389 ms in block 1, out of a 569–957 ms read.
+  The first prefetched block was block **2**.
+
+  Offline, a cold sequential 64 MiB read drops from **22 GETs to 16**. Block 0's 8 are
+  irreducible (establishment cannot fire before a block advance, and #231 refuted three ways to
+  establish sooner); block 1's 7 extra are not. At the ~28 ms in-region first-byte latency for
+  a 1 MiB GET that is ~170 ms per open.
+
+  Dispatching from the cursor costs nothing where the block is already covered: the chunk
+  singleflight joins a demand fill in flight rather than duplicating it. Applied at
+  establishment only — a handle mid-stream has its frontier well ahead, so the clamp never
+  fires for it.
+
+- **The timeline's `prefetched` column was hardcoded `false`**
+  ([#284](https://github.com/scttfrdmn/lith/issues/284)). `emitChunk` received a literal
+  `false` on every hit and uncovered row, so `--timeline-csv` reported `prefetched=false` even
+  for hits whose `lag_ms` proved they had been prefetched. Now read from `bs.prefetched`
+  *before* `fetchExtents` credits the prefetch and drops the marker — read afterwards it is
+  always false. Found in the field on the first run that used the column.
+
 - **A stride must now repeat twice before the detector believes it**
   ([#222](https://github.com/scttfrdmn/lith/issues/222)). The Strided branch declared a
   pattern on **one** repeated block delta, with no byte-gap bound (unlike the sequential

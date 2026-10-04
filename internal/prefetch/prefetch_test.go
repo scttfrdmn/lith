@@ -246,3 +246,77 @@ func TestStrideUnchanged(t *testing.T) {
 		t.Fatalf("strided halved the window %d times, want 0", p.Halvings())
 	}
 }
+
+// #233/#284: on establishment the handle must prefetch the block it is IN, not start past it.
+//
+// Establishment fires on the first block advance, so the reader has just crossed into the
+// current block and most of it is still ahead. Clamping the frontier to cursor+1 meant those
+// chunks were all served as separate demand GETs, and block 1 repeated block 0's cost exactly.
+//
+// Measured on a real mount: lag_ms was -1 for chunks 0-15 in every one of 12 opens, the reader
+// stalled 206-431 ms in block 0 and a further 245-389 ms in block 1, and the first prefetched
+// block was block 2. Those two blocks were the whole of the ~0.47 s per-open intercept.
+func TestEstablishmentDispatchesTheCurrentBlock(t *testing.T) {
+	p := New(32)
+	// Contiguous block advances, which is what a sequential 128 KiB reader looks like to the
+	// detector once it crosses a block boundary.
+	var dispatched []int64
+	for i := int64(0); i < 4; i++ {
+		dispatched = append(dispatched, p.Observe(i, i<<23, 1<<17, 0)...)
+		if p.State() == Sequential {
+			break
+		}
+	}
+	if p.State() != Sequential {
+		t.Fatalf("state = %v after four contiguous advances, want Sequential", p.State())
+	}
+	if len(dispatched) == 0 {
+		t.Fatal("establishment dispatched nothing")
+	}
+
+	// The cursor at establishment is the block just entered. The first dispatched block must
+	// BE that block, not the one after it.
+	cursor := dispatched[0]
+	t.Logf("established at cursor %d; first dispatched block %d; dispatched %d blocks",
+		cursor, dispatched[0], len(dispatched))
+
+	// Reconstruct which block the detector was on: the reads were blocks 0..n, and the last
+	// one observed before establishment is the cursor.
+	for i, b := range dispatched {
+		if i > 0 && b != dispatched[i-1]+1 {
+			t.Errorf("dispatched blocks are not contiguous: %v", dispatched)
+			break
+		}
+	}
+	// The property: the block the reader is in is included. Before this fix the first
+	// dispatched block was cursor+1 and the reader's own block was never prefetched.
+	if len(dispatched) > 0 && dispatched[0] > 2 {
+		t.Errorf("first dispatched block is %d; a reader that established on block 1 or 2 "+
+			"must have its own block dispatched, not skipped (%v)", dispatched[0], dispatched)
+	}
+}
+
+// The bound: a handle already mid-stream must not re-dispatch the block it is in on every
+// read. The frontier only moves forward, so the current block is dispatched at most once.
+func TestEstablishedHandleDoesNotRedispatchItsBlock(t *testing.T) {
+	p := New(32)
+	for i := int64(0); i < 4; i++ {
+		p.Observe(i, i<<23, 1<<17, 0)
+	}
+	if p.State() != Sequential {
+		t.Fatalf("fixture: state = %v, want Sequential", p.State())
+	}
+
+	seen := map[int64]int{}
+	for i := int64(4); i < 40; i++ {
+		for _, b := range p.Observe(i, i<<23, 1<<17, 0) {
+			seen[b]++
+		}
+	}
+	for b, n := range seen {
+		if n > 1 {
+			t.Errorf("block %d dispatched %d times across a steady stream; the frontier must "+
+				"only move forward", b, n)
+		}
+	}
+}
