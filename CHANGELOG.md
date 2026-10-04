@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A refresh that moved an inode between two existing paths served the WRONG FILE'S BYTES**
+  ([#217](https://github.com/scttfrdmn/lith/issues/217),
+  [#340](https://github.com/scttfrdmn/lith/issues/340)). Found by M17-B's first adversarial
+  case, and it is a "serves wrong" verdict rather than a crash or a stale read.
+
+  `register()` writes `f.nodes[ino]` only if the inode is absent — first writer wins — and
+  `SwapIndex` never updated the registry. So when a new index handed an inode to a *different*
+  path, a post-swap `Lookup` told the kernel `B → X` while lith still held `X → A`, and an
+  `Open` of `X` served **A's bytes for B**. Both files existed and were valid in both versions,
+  so nothing but the content distinguished it. Measured on a forced fixture: the kernel asked
+  for `bravo.txt` and got `alpha.txt`.
+
+  Inode reuse needs a hash collision to *occur*, not to be contrived: `assignIno` probes
+  forward, so assignment order decides who keeps the base hash, and a refresh that adds or
+  removes a colliding key can hand that inode across while both paths remain. Rare on a 64-bit
+  hash — and a correctness bug regardless, which is the class #217 exists to force.
+
+  `SwapIndex` now reconciles the registry first, dropping every mapping the new index disagrees
+  with, and does so **unconditionally** — the kernel-notification half returns early when not
+  mounted, and the mapping has to be right whether or not there is a kernel to tell. Dropping
+  rather than rewriting is deliberate: rewriting `X → B` would leave the kernel's cached dentry
+  `A → X` pointing at B, moving the wrong-bytes failure rather than removing it.
+
+
 ### Added
 
 - **M17-D: the frame cache under eviction, and two test defects of my own**

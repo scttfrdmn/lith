@@ -400,7 +400,43 @@ func (f *rawFS) Init(server *fuse.Server) { f.server = server }
 func (f *rawFS) SwapIndex(r index.Reader) {
 	old := f.ix.Load().r
 	f.ix.Store(&liveIndex{r: r})
+	// Reconcile the node registry BEFORE notifying the kernel, and unconditionally -- the
+	// notification half returns early when not mounted, and the mapping must be correct
+	// whether or not there is a kernel to tell (#217).
+	f.reconcileNodes(r)
 	f.invalidateOnSwap(old, r)
+}
+
+// reconcileNodes drops every ino -> path mapping the new index disagrees with (#217).
+//
+// register() is first-writer-wins and f.nodes was never updated on a swap, so an inode the new
+// index hands to a DIFFERENT path kept resolving to the old one. Both paths exist and are
+// valid, so the result was not stale, it was incoherent: a post-swap Lookup told the kernel
+// B -> X while lith still held X -> A, and an Open of X served A's bytes for B. Measured as
+// "serves wrong" on a forced fixture.
+//
+// Inode reuse does not need a hash collision to be contrived into existence, only one to
+// occur: assignIno probes forward, so assignment ORDER decides who keeps the base hash. A
+// refresh that adds or removes a key colliding with another can hand that inode across while
+// both paths remain. Rare on a 64-bit hash, and a correctness bug regardless -- #217 exists to
+// force exactly this class.
+//
+// Dropping rather than rewriting is deliberate. Rewriting X -> B would leave the kernel's
+// cached dentry A -> X pointing at B, moving the wrong-bytes failure rather than removing it.
+// A dropped node makes the next Lookup re-register from the current index, and
+// invalidateOnSwap tells the kernel to re-look-up.
+func (f *rawFS) reconcileNodes(updated index.Reader) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for ino, n := range f.nodes {
+		if ino == fuse.FUSE_ROOT_ID {
+			continue // the mount root is fixed, not derived from a key
+		}
+		fi, err := updated.Stat("/" + n.path)
+		if err != nil || fi.Ino != ino {
+			delete(f.nodes, ino)
+		}
+	}
 }
 
 // invalidateOnSwap tells the kernel to drop its cached view of every known entry
