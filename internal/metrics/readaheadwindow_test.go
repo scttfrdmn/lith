@@ -15,12 +15,13 @@ import (
 // counter could have caught it. These gauges are the thing that would have.
 func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	m := New()
-	window, handles, streams, evRatio := 223.0, 1.0, 1.0, 0.0
+	window, handles, streams, evRatio, ttfb := 223.0, 1.0, 1.0, 0.0, 0.0
 	m.RegisterReadaheadWindow(
 		func() float64 { return window },
 		func() float64 { return handles },
 		func() float64 { return streams },
 		func() float64 { return evRatio },
+		func() float64 { return ttfb },
 	)
 
 	scrape := func() string {
@@ -37,6 +38,9 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		"lith_streaming_handles 1",
 		// Off by default, and emitted so an absent line cannot be read as a missing feature.
 		"lith_readahead_evidence_ratio 0",
+		// The policy's INPUT, 0 until a fill has measured the endpoint (#341). Without this
+		// series, #340's never-engaging default could only be diagnosed from the source.
+		"lith_s3_ttfb_seconds 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape missing %q", want)
@@ -59,6 +63,21 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	}
 	if strings.Contains(got, "lith_readahead_window_blocks 223") {
 		t.Error("the window gauge is latched at its configured value; it must report the realized one")
+	}
+
+	// THE PAIRING THAT WOULD HAVE CAUGHT #340: a mount reporting a real in-region first-byte
+	// latency with the evidence ratio still 0. Before #341 only the ratio was visible, so
+	// "the gate is off" and "the gate is off because its bound is in the wrong unit" looked
+	// identical on a scrape.
+	window, handles, streams, evRatio, ttfb = 223, 1, 1, 0, 0.0282
+	got = scrape()
+	for _, want := range []string{
+		"lith_s3_ttfb_seconds 0.0282",
+		"lith_readahead_evidence_ratio 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("with a measured 28.2ms TTFB and the gate off, scrape missing %q", want)
+		}
 	}
 
 	// THE DIAGNOSTIC #301 turns on: descriptors far above streams. Both counts must be

@@ -318,7 +318,7 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 // mounts ran there. #301 changed the divisor's input, so the gap is now diagnostic rather
 // than causal: wide means many idle descriptors (no longer a problem), narrow-and-crowded
 // means genuinely more streams than the budget can fund (raise --prefetch-budget).
-func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio func() float64) {
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio, ttfbSeconds func() float64) {
 	if m == nil {
 		return
 	}
@@ -334,6 +334,10 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles,
 		Name: "lith_streaming_handles",
 		Help: "Handles being prefetched for: established sequential streams. This is the divisor for the readahead window (#301). Its gap from lith_open_handles is what the old divisor over-charged for -- on the workload that found this, ~288 descriptors against ~48 streams.",
 	}, streamingHandles))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_s3_ttfb_seconds",
+		Help: "Rolling median S3 FIRST-BYTE latency across recent fills -- the input the #256 evidence-gate policy reads, and the quantity its latency bound is in. 0 means no fill has measured the endpoint yet, in which case the gate is off regardless. Not a network round trip: in-region this is ~28 ms against an RTT of ~2 ms, and confusing the two is what made v1.4.0's default never engage (#340, #341).",
+	}, ttfbSeconds))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_readahead_evidence_ratio",
 		Help: "The #256 evidence-gate ratio in force: a committed readahead window may not exceed this multiple of the bytes a handle has actually consumed. 0 means the gate is off, which is the default and is also what a mount reports before any fill has measured the endpoint's latency. Non-zero without --readahead-evidence-ratio set means the latency-derived policy engaged (#284).",

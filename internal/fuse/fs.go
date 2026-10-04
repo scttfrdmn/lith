@@ -334,6 +334,16 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		func() float64 { return float64(f.OpenHandles()) },
 		func() float64 { return float64(f.StreamingHandles()) },
 		f.evidenceRatio,
+		// The evidence policy's INPUT, alongside its output (#341). Without it the regime a
+		// mount landed in could not be read off /metrics at all -- which is why #340's
+		// never-engaging default had to be diagnosed from the source.
+		func() float64 {
+			d, measured := f.store.MeasuredTTFB()
+			if !measured {
+				return 0
+			}
+			return d.Seconds()
+		},
 	)
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.

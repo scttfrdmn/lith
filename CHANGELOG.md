@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **v1.4.0's evidence-gate default never engaged: the bound was in the wrong unit**
+  ([#340](https://github.com/scttfrdmn/lith/issues/340)). v1.4.0's release note says the gate
+  is on by default in-region. **It was not.** An external deployment measured the default mount
+  reproducing #284's 54.02× over-fetch byte for byte, with `lith_readahead_evidence_ratio`
+  reading 0 after 162 completed fills.
+
+  The policy reads `MeasuredTTFB` — the rolling median of S3 **first-byte** latency per fill —
+  and `nearEndpointTTFB` was set to 5 ms, justified as "a little over twice the measured-good
+  point" where that point was **2.2 ms, the network round trip**. In-region first-byte latency
+  is 28.2 ms median (p10 22.6, p90 42.7, n=84), so the bound sat 4.5× below p10 and no
+  in-region mount could ever engage. **This is the same unit mix-up as #329**, where 2.2 ms was
+  used as a 1 MiB GET's unit price; that one was caught in an argument, this one shipped as a
+  constant.
+
+  Now **50 ms**, anchored on both sides rather than guessed: above the whole measured in-region
+  distribution (p90 42.7), and below the 58.6 ms cross-region round trip, which a first-byte
+  latency **cannot undercut by construction** — so the far side needs no measurement. Erring
+  low is also the safe direction: too low costs only the saving, too high is the measured 2.35×
+  regression at distance.
+
+  The test that should have caught it used the measured **RTTs** (2.2 and 58.6 ms) against a
+  bound the policy applies to TTFB — both numbers real, neither the quantity under test. It is
+  now in TTFB, asserts the bound's relation to both anchors rather than its literal value, and
+  carries the fixture trap explicitly: a fake server returns in microseconds, so the
+  "verified the gate is live" check that accompanied #330 passed against 27 µs, which clears
+  any bound including the broken one.
+
+### Added
+
+- **`lith_s3_ttfb_seconds`: the evidence policy's input, alongside its output**
+  ([#341](https://github.com/scttfrdmn/lith/issues/341)). The rolling median S3 first-byte
+  latency, 0 until a fill has measured the endpoint. Only the policy's *output*
+  (`lith_readahead_evidence_ratio`) was observable, so on a scrape "the gate is off" and "the
+  gate is off because its bound is in the wrong unit" looked identical — #340 had to be
+  diagnosed from the source. Explicitly documented as **not a round trip**: in-region this is
+  ~28 ms against an RTT of ~2 ms, and confusing the two is what #340 was.
+
+
+### Fixed
+
 - **A refresh that moved an inode between two existing paths served the WRONG FILE'S BYTES**
   ([#217](https://github.com/scttfrdmn/lith/issues/217),
   [#340](https://github.com/scttfrdmn/lith/issues/340)). Found by M17-B's first adversarial
