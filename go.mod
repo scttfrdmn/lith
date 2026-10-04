@@ -15,7 +15,7 @@ require (
 	github.com/klauspost/compress v1.20.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.9
+	github.com/spf13/pflag v1.0.10
 	github.com/willscott/go-nfs v0.0.4
 	github.com/zeebo/xxh3 v1.0.2
 )
