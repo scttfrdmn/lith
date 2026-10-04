@@ -136,9 +136,18 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 	}
 
 	// The long window must outlive the policy's 8-sample one: that is the entire point.
-	// After ttfbMax fast fills the median is fast, while the floor still remembers the
-	// slow ones -- and vice versa, which is the #349 shape.
-	for i := 0; i < 200; i++ {
+	// After ttfbMax slow fills the median is slow, while the floor still remembers the fast
+	// ones -- the #349 shape.
+	//
+	// AND THE LIMIT, stated rather than discovered later. The floor is load-invariant only
+	// while at least ttfbFloorPctl% of the window's fills are unqueued; a p10 tolerates up
+	// to 90% slow. Past that it rises, and the gate turns off again. That tolerance is a
+	// property of the percentile, it is the quantity cell 2 of #349 measures, and the first
+	// draft of this test had it coupled to ttfbFloorMin by accident.
+	for i := 0; i < 40; i++ { // a demand prefix worth of fast fills
+		bs.recordTTFB(24 * time.Millisecond)
+	}
+	for i := 0; i < 200; i++ { // and a burst: 40/250 = 16% fast, above the p10 line
 		bs.recordTTFB(110 * time.Millisecond)
 	}
 	med, _ := bs.MeasuredTTFB()
@@ -147,9 +156,22 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 		t.Errorf("median %v after 200 slow fills; the 8-window did not turn over", med)
 	}
 	if floor > 50*time.Millisecond {
-		t.Errorf("floor %v after 200 slow fills: the long window is not retaining the fast "+
-			"samples that make it a floor", floor)
+		t.Errorf("floor %v with 16%% of the window still fast: the long window is not "+
+			"retaining the samples that make it a floor", floor)
 	}
+
+	// Now past the tolerance: top the window up with slow fills until the fast ones are
+	// under 10% of it. The floor SHOULD rise -- if fewer than one fill in ten gets an
+	// unqueued first byte, there is no evidence left about the endpoint's own latency, and
+	// reporting a stale low figure would be worse than reporting the truth.
+	for i := 0; i < ttfbFloorWindow; i++ {
+		bs.recordTTFB(110 * time.Millisecond)
+	}
+	if floor, _ := bs.FloorTTFB(); floor < 100*time.Millisecond {
+		t.Errorf("floor %v after the window went fully slow; past its tolerance the floor "+
+			"must follow, not latch a figure no recent fill supports", floor)
+	}
+
 }
 
 // THIS TEST IS SUPPOSED TO FAIL when the policy moves onto the floor (#349).
@@ -182,5 +204,105 @@ func TestFloorTTFBIsAnInstrumentAndNothingReadsIt(t *testing.T) {
 	if med == floor {
 		t.Error("MeasuredTTFB and FloorTTFB returned the same value; the policy's input " +
 			"has been changed without this test being updated")
+	}
+}
+
+// The floor must be observable on #284's shape, which is the workload the evidence gate
+// exists for: one process reading one variable of a NetCDF-4 file, ~23-24 fills in total.
+//
+// ttfbFloorMin shipped at 32, so for that shape the floor NEVER populated -- the instrument
+// could not see the only workload whose over-fetch it was built to decide about. The external
+// cells on #349 show it from the other side: 140 samples over six sequential opens, ~23 each,
+// and a single-open mount never reaches 32.
+//
+// At 10 the floor is available partway through the serial demand prefix, which is before
+// prefetch commits at block 2 -- so the decision is made on demand latencies, which is
+// exactly the quantity the policy wants.
+func TestFloorTTFBIsAvailableOnASingleSmallReadsWorthOfFills(t *testing.T) {
+	bs := &BlockStore{ttfbSeed: 40 * time.Millisecond}
+
+	// #284's measured shape: ~16 serial demand GETs on blocks 0-1, then the burst.
+	const demandFills = 16
+	var firstAvailable int
+	for i := 0; i < demandFills; i++ {
+		bs.recordTTFB(time.Duration(22+i%12) * time.Millisecond)
+		if _, ok := bs.FloorTTFB(); ok && firstAvailable == 0 {
+			firstAvailable = i + 1
+		}
+	}
+	if firstAvailable == 0 {
+		t.Fatalf("no floor after %d demand fills: the instrument cannot observe #284's "+
+			"shape, which is the workload the gate exists for", demandFills)
+	}
+	if firstAvailable > demandFills {
+		t.Errorf("floor first available at fill %d, after the demand prefix ends at %d; the "+
+			"decision would be made on burst latencies", firstAvailable, demandFills)
+	}
+	t.Logf("floor first available at fill %d of a %d-fill demand prefix", firstAvailable, demandFills)
+
+	// And it reads the demand latency, not the seed and not a burst figure.
+	floor, _ := bs.FloorTTFB()
+	if floor < 20*time.Millisecond || floor > 30*time.Millisecond {
+		t.Errorf("floor %v after the demand prefix; want the ~22-34ms demand latency", floor)
+	}
+
+	// The whole 24-fill read, burst included: the floor must still report the demand
+	// latency, because that is what the endpoint costs when nothing is queued ahead.
+	for i := 0; i < 8; i++ {
+		bs.recordTTFB(time.Duration(95+i*2) * time.Millisecond)
+	}
+	med, _ := bs.MeasuredTTFB()
+	floor, _ = bs.FloorTTFB()
+	if med <= 50*time.Millisecond {
+		t.Fatalf("fixture: median %v is inside the bound, so this read does not reproduce "+
+			"the #349 ambiguity", med)
+	}
+	if floor > 50*time.Millisecond {
+		t.Errorf("after a 24-fill read the floor is %v (median %v): the gate would still "+
+			"turn itself off on #284's shape", floor, med)
+	}
+
+	// Never defined by the single smallest sample, at the smallest permitted window.
+	small := &BlockStore{ttfbSeed: 40 * time.Millisecond}
+	small.recordTTFB(1 * time.Millisecond) // one implausible outlier
+	for i := 0; i < ttfbFloorMin-1; i++ {
+		small.recordTTFB(60 * time.Millisecond)
+	}
+	if floor, ok := small.FloorTTFB(); !ok {
+		t.Error("no floor at exactly ttfbFloorMin samples")
+	} else if floor < 50*time.Millisecond {
+		t.Errorf("floor %v at the minimum window: one 1ms outlier defined it, so the "+
+			"estimator is a minimum at this size", floor)
+	}
+}
+
+// floorIndex is never 0, at any n.
+//
+// Tested directly rather than through FloorTTFB, because the clamp only bites below
+// ttfbFloorMin samples and the constants make that unreachable -- so the obvious assertion
+// (feed exactly ttfbFloorMin and check an outlier is excluded) PASSES WITH THE CLAMP
+// REMOVED. It did, on the first draft. An assertion that cannot fail is not an assertion.
+func TestFloorIndexIsNeverTheMinimum(t *testing.T) {
+	// Never 0, at any n -- that is the clamp's whole job and it must hold even for sizes
+	// FloorTTFB will not pass it.
+	for n := 1; n <= ttfbFloorWindow; n++ {
+		if i := floorIndex(n); i < 1 {
+			t.Fatalf("floorIndex(%d) = %d: the smallest sample defines the floor", n, i)
+		}
+	}
+	// In range for every size the caller can actually reach. Below ttfbFloorMin, FloorTTFB
+	// returns not-measured and never indexes, so n < 10 is not a case to satisfy -- and
+	// asserting it was this test's own bug: floorIndex(1) = 1 is out of range for one
+	// sample, which is correct and unreachable.
+	for n := ttfbFloorMin; n <= ttfbFloorWindow; n++ {
+		if i := floorIndex(n); i >= n {
+			t.Fatalf("floorIndex(%d) = %d is out of range for %d samples", n, i, n)
+		}
+	}
+	// And it is the percentile once the window is big enough for one.
+	for n, want := range map[int]int{10: 1, 12: 1, 24: 2, 32: 3, 140: 14, 256: 25} {
+		if got := floorIndex(n); got != want {
+			t.Errorf("floorIndex(%d) = %d, want %d", n, got, want)
+		}
 	}
 }

@@ -26,10 +26,22 @@ const (
 	// 8-sample window is always dominated by whichever phase just happened, which is the
 	// whole mechanism of #349. A floor needs a window that spans both phases.
 	ttfbFloorWindow = 256
-	// Enough samples that a quantile means something. Below this FloorTTFB reports
-	// not-measured rather than a figure from three fills -- the #292 rule: force the caller
-	// to handle "not yet" instead of handing it a number that looks right.
-	ttfbFloorMin  = 32
+	// Enough samples that a quantile means something, and NO MORE than that.
+	//
+	// This was 32, which made the floor unobservable on the workload the evidence gate
+	// exists for: #284's shape -- one process reading one variable of a NetCDF-4 file --
+	// is 23-24 fills in total, so the floor would never have populated for it. The external
+	// cells on #349 show the same thing from the other side: 140 samples over SIX sequential
+	// opens, i.e. ~23 per open, and a single-open mount never reaches 32.
+	//
+	// 10 is the smallest window at which the p10 index is still >= 1, so the single
+	// smallest sample never defines the floor at any size -- the outlier property, kept
+	// without costing the bootstrap. At 10 it is the second-smallest; at 256, the 25th.
+	//
+	// It still reports not-measured below this rather than quoting a figure from three
+	// fills (#292's rule: make the caller handle "not yet" instead of handing it a number
+	// that looks right).
+	ttfbFloorMin  = 10
 	ttfbFloorPctl = 10
 )
 
@@ -128,9 +140,23 @@ func (bs *BlockStore) FloorTTFB() (time.Duration, bool) {
 	}
 	s := append([]time.Duration(nil), bs.ttfbFloorWin...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	// A low quantile, not the minimum: one anomalously fast sample should not define the
-	// endpoint. With the floor window full this is the 10th percentile.
-	return s[len(s)*ttfbFloorPctl/100], true
+	return s[floorIndex(len(s))], true
+}
+
+// floorIndex is the order statistic FloorTTFB reads: the ttfbFloorPctl-th percentile, never
+// index 0.
+//
+// A low quantile, not the minimum -- one anomalously fast sample must not define the
+// endpoint. Pulled out as a function because the >= 1 clamp is only load-bearing below
+// ttfbFloorMin samples, which the constants make unreachable, so an assertion on FloorTTFB
+// cannot exercise it; testing the index directly can. (The first version of that test
+// passed with the clamp removed, which is the kind of assertion this project has learned to
+// distrust.)
+func floorIndex(n int) int {
+	if i := n * ttfbFloorPctl / 100; i > 1 {
+		return i
+	}
+	return 1
 }
 
 // recordTTFB feeds a fill's first-byte latency into the rolling windows.
