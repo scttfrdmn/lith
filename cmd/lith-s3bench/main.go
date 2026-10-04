@@ -150,7 +150,13 @@ func main() {
 		cursor    atomic.Int64
 		bytesRead atomic.Int64
 		lat       = make([][]time.Duration, *workers)
-		wg        sync.WaitGroup
+		// FIRST-BYTE latency, kept separately from lat. lat is timed to after
+		// io.ReadFull, so at an 8 MiB part the transfer buries the first byte entirely --
+		// which is why this tool could not answer #350 until now. Recorded at the same
+		// seam BlockStore.recordTTFB uses (immediately after the GET returns, before any
+		// body read), so the two are the same quantity.
+		ttfb = make([][]time.Duration, *workers)
+		wg   sync.WaitGroup
 	)
 	deadline := time.Now().Add(*dur)
 	rusStart := getCPU()
@@ -161,7 +167,7 @@ func main() {
 		go func(w int) {
 			defer wg.Done()
 			buf := make([]byte, *partStr)
-			var mine []time.Duration
+			var mine, mineTTFB []time.Duration
 			for time.Now().Before(deadline) {
 				idx := int(cursor.Add(1)-1) % len(reqs)
 				r := reqs[idx]
@@ -175,6 +181,9 @@ func main() {
 					fmt.Fprintln(os.Stderr, "get:", err)
 					continue
 				}
+				// GetObject returns once the response headers are in, so this is the
+				// first-byte latency and not the transfer.
+				mineTTFB = append(mineTTFB, time.Since(t0))
 				n, err := io.ReadFull(out.Body, buf[:r.length])
 				_ = out.Body.Close()
 				if err != nil && err != io.ErrUnexpectedEOF {
@@ -185,6 +194,7 @@ func main() {
 				mine = append(mine, time.Since(t0))
 			}
 			lat[w] = mine
+			ttfb[w] = mineTTFB
 		}(w)
 	}
 	wg.Wait()
@@ -192,13 +202,17 @@ func main() {
 	close(stopSample)
 	rusEnd := getCPU()
 
-	// Merge latencies.
-	var all []time.Duration
-	for _, m := range lat {
-		all = append(all, m...)
+	// Merge latencies. pctOf is shared so the full-request and first-byte percentiles
+	// cannot drift apart in how they are computed.
+	merge := func(per [][]time.Duration) []time.Duration {
+		var all []time.Duration
+		for _, m := range per {
+			all = append(all, m...)
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+		return all
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
-	pct := func(p float64) time.Duration {
+	pctOf := func(all []time.Duration, p float64) time.Duration {
 		if len(all) == 0 {
 			return 0
 		}
@@ -208,10 +222,37 @@ func main() {
 		}
 		return all[i]
 	}
+	all := merge(lat)
+	allTTFB := merge(ttfb)
+	pct := func(p float64) time.Duration { return pctOf(all, p) }
+	tpct := func(p float64) time.Duration { return pctOf(allTTFB, p) }
+	// The fraction at or under a bound, which is how the evidence policy's input is scored
+	// externally (#349): bucket{le=...}/count. Reported directly so a sweep does not need
+	// a Prometheus scrape to answer "which latency regime is this".
+	fracUnder := func(all []time.Duration, bound time.Duration) float64 {
+		if len(all) == 0 {
+			return 0
+		}
+		n := 0
+		for _, d := range all {
+			if d <= bound {
+				n++
+			}
+		}
+		return 100 * float64(n) / float64(len(all))
+	}
 
 	mbps := float64(bytesRead.Load()) / (1 << 20) / wall.Seconds()
 	cpuSec := rusEnd - rusStart
 	ncpu := float64(runtime.NumCPU())
+	// TTFB line first: #350 is about whether depth buys throughput with LATENCY, so the
+	// first-byte distribution and the aggregate belong side by side at every width.
+	fmt.Printf("TTFB   workers=%d part=%dMiB  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
+		*workers, *partStr>>20, len(allTTFB),
+		float64(tpct(10).Microseconds())/1000, float64(tpct(50).Microseconds())/1000,
+		float64(tpct(90).Microseconds())/1000, float64(tpct(99).Microseconds())/1000,
+		fracUnder(allTTFB, 25*time.Millisecond), fracUnder(allTTFB, 50*time.Millisecond),
+		fracUnder(allTTFB, 60*time.Millisecond))
 	fmt.Printf("RESULT workers=%d part=%dMiB http=%v rbuf=%d  agg=%.0f MB/s  reqs=%d  p50=%.1fms p99=%.1fms  maxconns=%d  cpu=%.1fs (%.0f%% of %g cores)\n",
 		*workers, *partStr>>20, *useHTTP, *readBuffer,
 		mbps, len(all), float64(pct(50).Microseconds())/1000, float64(pct(99).Microseconds())/1000,
