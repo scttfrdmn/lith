@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -42,13 +43,26 @@ func (bs *BlockStore) recordBacking(f func(backingRecorder)) {
 // cap the decoder here so a giant frame is a clear error, never an OOM.
 const maxFrameBytes = 512 << 20
 
-func (bs *BlockStore) decoder() *zstd.Decoder {
+// errStoreClosed is returned by a decode that arrives after Close. A fire-and-forget
+// prefetch in flight at unmount is the normal way to reach it, and the caller's only
+// sensible response is to drop the fill -- the mount is going away.
+var errStoreClosed = errors.New("blockstore: closed")
+
+// decoder claims the shared frame decoder for one decode. The returned release must be
+// called when the decode is done; ok is false once the store is closing, so a late
+// fire-and-forget prefetch fails cleanly instead of racing Close's teardown.
+func (bs *BlockStore) decoder() (dec *zstd.Decoder, release func(), ok bool) {
+	bs.zdecMu.RLock()
+	if bs.zdecClosed {
+		bs.zdecMu.RUnlock()
+		return nil, nil, false
+	}
 	bs.zdecOnce.Do(func() {
 		// DecodeAll is safe for concurrent use; one shared decoder serves all fills.
 		bs.zdec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0),
 			zstd.WithDecoderMaxMemory(maxFrameBytes))
 	})
-	return bs.zdec
+	return bs.zdec, bs.zdecMu.RUnlock, true
 }
 
 // fetchReader returns a reader over [off,off+length) of k's logical byte space
@@ -228,7 +242,11 @@ func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargosh
 		return "", 0, io.ErrUnexpectedEOF
 	}
 
-	dec := bs.decoder()
+	dec, release, ok := bs.decoder()
+	if !ok {
+		return "", decBytes, errStoreClosed
+	}
+	defer release()
 	for i := lo; i <= hi; i++ {
 		f := frames[i]
 		cs := f.CompOff - compStart

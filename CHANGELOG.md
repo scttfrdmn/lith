@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Close` tore down the shared zstd decoder while a fill was still decoding.** Prefetch is
+  fire-and-forget (`go store.Prefetch(...)`) in both the FUSE and NFS read paths, so an
+  unmount can land mid-decode. `Close` drained the disk write-behind queue and then called
+  `zdec.Close()`, which closes a channel another goroutine is selecting on.
+
+  In-flight decodes now hold a lifetime lock for reading — `DecodeAll` is concurrency-safe, so
+  they do not serialize — and `Close` takes it for writing, which is what makes it wait. A
+  decode arriving after `Close` fails cleanly instead of racing, since the only sensible
+  response to a late prefetch is to drop the fill: the mount is going away.
+
+  Found by `-race` in CI, on the first test that both reads framed chunks **and** registers
+  `Close` as a cleanup — every earlier cargo test did one or the other. Reachable in
+  production at unmount, where the cost is a panic on the way out rather than wrong data.
+
 - **A `CURRENT` could name an index built for a different bucket, and lith mounted it**
   ([#217](https://github.com/scttfrdmn/lith/issues/217)). M17-B case 2, and the fourth
   "serves wrong" verdict.
