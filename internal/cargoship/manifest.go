@@ -162,6 +162,9 @@ func Parse(b []byte) (*Manifest, error) {
 				return nil, fmt.Errorf("cargoship manifest: chunk %d frame %d compressed span [%d,%d) exceeds object size %d", ci, fi, f.CompressedOffset, f.CompressedOffset+f.CompressedSize, c.CompressedSize)
 			}
 		}
+		if err := checkCompressedSpansDisjoint(ci, c.Frames); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Manifest{
@@ -205,6 +208,44 @@ func resolveChunkKey(prefix, s3Key string) string {
 		return s3Key
 	}
 	return prefix + "/" + s3Key
+}
+
+// checkCompressedSpansDisjoint enforces that no two frames of a chunk claim the
+// same compressed bytes (lith#217, M17-B case 2). The validation above has always
+// been documented as requiring this; it only ever bounded each span against the
+// object, so two frames could alias one byte range.
+//
+// That is a SERVES WRONG shape, not a cosmetic one. A frame's compressed span is
+// the GET and its uncompressed span is where the result lands, so pointing frame
+// B's compressed span at frame A's bytes makes a read at B's offset return A's
+// content — successfully, at exactly the declared length, and with a PASSING
+// per-frame checksum, because that checksum covers the compressed bytes and they
+// really are the bytes fetched. Measured in
+// blockstore.TestOverlappingCompressedFramesServeAnotherFramesBytes. The read
+// path cannot catch it: by then every cross-check it has is satisfied by
+// construction, which is why the gate is here.
+//
+// GAPS ARE LEGAL and must stay legal: zstd skippable frames sit between data
+// frames — a frame index is itself one — so this forbids overlap only. It also
+// makes no ordering assumption, since Frames is ordered by UNCOMPRESSED offset
+// and nothing in the format requires the compressed order to match.
+func checkCompressedSpansDisjoint(ci int, frames []rawFrameEntry) error {
+	type span struct {
+		off, end int64
+		fi       int
+	}
+	spans := make([]span, 0, len(frames))
+	for fi, f := range frames {
+		spans = append(spans, span{f.CompressedOffset, f.CompressedOffset + f.CompressedSize, fi})
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].off < spans[j].off })
+	for i := 1; i < len(spans); i++ {
+		if spans[i].off < spans[i-1].end {
+			return fmt.Errorf("cargoship manifest: chunk %d frames %d and %d overlap in the compressed object — spans [%d,%d) and [%d,%d) claim the same bytes, so a read of one would decode the other's content (lith#217)",
+				ci, spans[i-1].fi, spans[i].fi, spans[i-1].off, spans[i-1].end, spans[i].off, spans[i].end)
+		}
+	}
+	return nil
 }
 
 // sortFramesByUncomp is defensive: frames should already be sorted, but a
