@@ -113,13 +113,20 @@ func TestColdSequentialGetShape(t *testing.T) {
 			"coalescing behaviour has changed", block0Gets, want)
 	}
 
-	// THE BOUND that makes this a negative result for #284: whatever a cold whole-object read
-	// costs, it is not enough GETs to be a ~0.5 s fixed cost at in-region latency. Allowing
-	// 4x the ideal leaves room for the post-establishment dispatch shape while still failing
-	// if fetching degenerates to per-chunk throughout.
-	if max := 4 * objBytes / blockSize; int64(gets) > max {
-		t.Errorf("%d GETs for %d MiB, more than %d — fetching has degenerated toward "+
-			"per-chunk across the whole read, not just block 0", gets, objBytes>>20, max)
+	// THE FIGURE, pinned. 22 before #332 and 17 after, both stable across six runs (the
+	// post-fix value occasionally reads 18, so the bound is 20). The earlier bound here was
+	// 4x the ideal — 32 — which would not have noticed #332 being reverted, and a fix worth
+	// ~140 ms per open should not rest on a bound that loose.
+	//
+	// 22 -> 17 is block 1's five GETs. Block 0's eight remain and are #233.
+	if gets > 20 {
+		t.Errorf("%d GETs for %d MiB, more than 20 — this was 22 before #332 and 17 after, so "+
+			"either the establishment dispatch no longer covers the block the reader is in, "+
+			"or fetching has degenerated toward per-chunk", gets, objBytes>>20)
+	}
+	if gets < int(objBytes/blockSize) {
+		t.Errorf("%d GETs for %d MiB is below one per block (%d): the fixture is serving from "+
+			"cache and measures nothing", gets, objBytes>>20, objBytes/blockSize)
 	}
 	if total != objBytes {
 		t.Errorf("fetched %d bytes for a %d-byte object: a whole sequential read must be "+
