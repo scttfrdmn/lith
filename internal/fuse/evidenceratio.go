@@ -48,26 +48,38 @@ func evidenceRatioFor(configured float64, ttfb time.Duration, measured bool) flo
 	return latencyDerivedEvidenceRatio(ttfb)
 }
 
-// defaultEvidenceRatio and nearEndpointTTFB are the measured policy (#284).
+// defaultEvidenceRatio and nearEndpointTTFB are the measured policy (#284, corrected in #340).
 //
 // The ratio is 4 because every cell that decided this used 4; no other value has been
 // measured on any shape.
 //
-// The latency bound is DELIBERATELY CONSERVATIVE and is not an interpolation. The evidence is
-// two endpoints and nothing between them:
+// THE BOUND IS IN TTFB, AND v1.4.0 SHIPPED IT IN RTT. That is the whole of #340. The policy
+// reads BlockStore.MeasuredTTFB, which is the rolling median of S3 FIRST-BYTE latency per
+// fill. The original 5 ms was justified as "a little over twice the measured-good point" where
+// that point was 2.2 ms -- the network ROUND TRIP. In-region first-byte latency is 28.2 ms
+// median (p10 22.6, p90 42.7, n=84), so the bound sat 4.5x below p10 and NO in-region mount
+// ever engaged: an external deployment measured the default reproducing #284's 54.02x
+// over-fetch byte for byte, with the gauge reading 0 after 162 completed fills.
 //
-//	2.2 ms  : slice readers win on both axes; a whole-object fast consumer pays +5% to +20%
-//	58.6 ms : a whole-object fast consumer pays +135% (r = 2.35, zero overlap)
+// It is the same unit mix-up as #329, where 2.2 ms was used as a 1 MiB GET's unit price. That
+// one was caught in an argument; this one shipped as a constant.
 //
-// 5 ms is a little over twice the measured-good point, which is the smallest bound that still
-// absorbs ordinary same-region variance. Picking a threshold in the middle of the gap and
-// calling it derived is exactly what this campaign has been punished for: five refuted
-// mechanisms, and one 11x regression shipped on an argument that agreed with the thing it
-// replaced to within 2.4%. A mount at 20 ms is unmeasured, so it keeps the old behaviour and
-// loses nothing it had.
+// 50 ms IS ANCHORED ON BOTH SIDES, so it is not a guess in an unmeasured gap:
+//
+//	lower bound, MEASURED: in-region TTFB p90 is 42.7 ms, so 50 clears the whole
+//	                       in-region distribution and the median of eight samples
+//	                       the policy actually reads is nowhere near it.
+//	upper bound, BY CONSTRUCTION: TTFB includes at least one round trip, so a
+//	                       cross-region endpoint at 58.6 ms RTT cannot report a TTFB
+//	                       below 58.6 ms. No measurement is needed to exclude it.
+//
+// Erring low is also the safe direction: too low and the gate never engages, which is the
+// pre-#330 behaviour and costs only the saving. Too high and it engages at distance, which is
+// the measured 2.35x regression on a whole-object fast consumer.
 const (
 	defaultEvidenceRatio = 4.0
-	nearEndpointTTFB     = 5 * time.Millisecond
+	// nearEndpointTTFB is a FIRST-BYTE latency, not a round trip. See above.
+	nearEndpointTTFB = 50 * time.Millisecond
 )
 
 // latencyDerivedEvidenceRatio is the policy proper: the gate ratio for an endpoint whose

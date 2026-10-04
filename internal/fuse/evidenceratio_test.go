@@ -65,29 +65,46 @@ func TestEvidenceRatioFor(t *testing.T) {
 // the gate must not engage anywhere in the unmeasured middle, because the cost of being wrong
 // there is 135% and the cost of being cautious is only a missed saving.
 func TestLatencyDerivedEvidenceRatio(t *testing.T) {
+	// THE VALUES HERE ARE FIRST-BYTE LATENCIES, NOT ROUND TRIPS, and that distinction is why
+	// this test could not catch #340. The previous table used 2.2 ms and 58.6 ms -- the
+	// measured RTTs -- against a bound that the policy applies to TTFB. Both numbers were
+	// real and neither was the quantity under test, so the table passed while no in-region
+	// mount could ever engage the gate.
+	const (
+		inRegionP10    = 22600 * time.Microsecond // measured, n=84
+		inRegionMedian = 28200 * time.Microsecond
+		inRegionP90    = 42700 * time.Microsecond
+		crossRegionRTT = 58600 * time.Microsecond // TTFB cannot be below this at distance
+	)
 	for _, tc := range []struct {
 		name string
 		ttfb time.Duration
 		want float64
 	}{
-		// Engaged: at and below the bound. 2.2 ms is the measured-good point.
-		{"the measured in-region point", 2200 * time.Microsecond, defaultEvidenceRatio},
-		{"very near", 500 * time.Microsecond, defaultEvidenceRatio},
-		{"exactly at the bound", nearEndpointTTFB, defaultEvidenceRatio},
+		// ENGAGED across the whole measured in-region distribution. p90 is the one that
+		// matters: a bound between the median and p90 would engage only sometimes.
+		{"in-region p10", inRegionP10, defaultEvidenceRatio},
+		{"in-region median", inRegionMedian, defaultEvidenceRatio},
+		{"in-region p90", inRegionP90, defaultEvidenceRatio},
+		{"just inside the bound", nearEndpointTTFB, defaultEvidenceRatio},
 
-		// NOT engaged: everything above it, including the whole unmeasured middle. A mount at
-		// 20 ms has never been measured, so it keeps the behaviour it had.
+		// NOT ENGAGED at distance. TTFB includes a round trip, so a cross-region endpoint
+		// cannot report below its RTT -- this side is excluded by construction, not by a
+		// measurement, which is what makes the bound anchored rather than interpolated.
+		{"cross-region RTT floor", crossRegionRTT, 0},
+		{"cross-region plausible TTFB", 85 * time.Millisecond, 0},
 		{"just past the bound", nearEndpointTTFB + time.Microsecond, 0},
-		{"10 ms, unmeasured", 10 * time.Millisecond, 0},
-		{"20 ms, unmeasured", 20 * time.Millisecond, 0},
-		{"the 40 ms seed value", 40 * time.Millisecond, 0},
-		{"the measured cross-region point", 58600 * time.Microsecond, 0},
 		{"far", time.Second, 0},
 
-		// A non-positive latency is not a measurement of a near endpoint and must not engage
-		// the gate by arithmetic accident.
+		// A non-positive latency is not a measurement and must not engage by accident.
 		{"zero", 0, 0},
 		{"negative", -time.Millisecond, 0},
+
+		// AND THE TRAP THAT HID #340: a fixture latency no real endpoint has. The fake
+		// server returns in microseconds, so my "verified the gate is live" check passed
+		// against 27us -- a value that clears any bound, including the broken one. Kept as a
+		// case so the table says out loud that passing here is not evidence of anything.
+		{"a fake server's microseconds, which prove nothing", 27 * time.Microsecond, defaultEvidenceRatio},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := latencyDerivedEvidenceRatio(tc.ttfb); got != tc.want {
@@ -95,23 +112,35 @@ func TestLatencyDerivedEvidenceRatio(t *testing.T) {
 			}
 		})
 	}
+
+	// THE TWO ANCHORS, asserted as a relation rather than as literals, so a future change to
+	// the bound has to stay inside them.
+	if nearEndpointTTFB <= inRegionP90 {
+		t.Errorf("bound %v is at or below in-region p90 %v: the gate would engage only "+
+			"sometimes in-region, which is #340", nearEndpointTTFB, inRegionP90)
+	}
+	if nearEndpointTTFB >= crossRegionRTT {
+		t.Errorf("bound %v is at or above the cross-region RTT %v: TTFB includes a round "+
+			"trip, so the gate could engage at distance, which is the measured 2.35x "+
+			"regression", nearEndpointTTFB, crossRegionRTT)
+	}
 }
 
 // End to end through the decision function, which is what the read path calls: the gate now
 // engages by DEFAULT on a near endpoint, and only there.
 func TestEvidenceRatioEngagesByDefaultOnlyNearby(t *testing.T) {
 	// Unconfigured and near: engaged. This is the behaviour change.
-	if got := evidenceRatioFor(0, 2*time.Millisecond, true); got != defaultEvidenceRatio {
-		t.Errorf("unconfigured at 2ms measured = %v, want %v (the gate must now default on "+
+	if got := evidenceRatioFor(0, 28*time.Millisecond, true); got != defaultEvidenceRatio {
+		t.Errorf("unconfigured at an in-region 28ms TTFB = %v, want %v (the gate must now default on "+
 			"in-region)", got, defaultEvidenceRatio)
 	}
 	// Unconfigured and far: unchanged.
-	if got := evidenceRatioFor(0, 58*time.Millisecond, true); got != 0 {
-		t.Errorf("unconfigured at 58ms measured = %v, want 0", got)
+	if got := evidenceRatioFor(0, 85*time.Millisecond, true); got != 0 {
+		t.Errorf("unconfigured at a cross-region 85ms TTFB = %v, want 0", got)
 	}
 	// Unconfigured and UNMEASURED: unchanged, whatever the seed says. A mount engages the gate
 	// only once it has measured the endpoint itself (#292).
-	if got := evidenceRatioFor(0, 2*time.Millisecond, false); got != 0 {
+	if got := evidenceRatioFor(0, 28*time.Millisecond, false); got != 0 {
 		t.Errorf("unconfigured and unmeasured = %v, want 0 — the gate engaged on the seed", got)
 	}
 	// A NEGATIVE setting forces it off, at any latency. 0 now means "decide for me", so there

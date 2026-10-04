@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // #298: the realized readahead window and its divisor were invisible at runtime —
@@ -15,12 +16,14 @@ import (
 // counter could have caught it. These gauges are the thing that would have.
 func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	m := New()
-	window, handles, streams, evRatio := 223.0, 1.0, 1.0, 0.0
+	window, handles, streams, evRatio, ttfb, measured := 223.0, 1.0, 1.0, 0.0, 0.0, 0.0
 	m.RegisterReadaheadWindow(
 		func() float64 { return window },
 		func() float64 { return handles },
 		func() float64 { return streams },
 		func() float64 { return evRatio },
+		func() float64 { return ttfb },
+		func() float64 { return measured },
 	)
 
 	scrape := func() string {
@@ -37,6 +40,12 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 		"lith_streaming_handles 1",
 		// Off by default, and emitted so an absent line cannot be read as a missing feature.
 		"lith_readahead_evidence_ratio 0",
+		// The policy's INPUT, 0 until a fill has measured the endpoint (#341). Without this
+		// series, #340's never-engaging default could only be diagnosed from the source.
+		"lith_ttfb_median_seconds 0",
+		// And the flag that disambiguates it: a median of 0 here means "nothing measured",
+		// which is a different state from "measured, and fast". Both report the gate off.
+		"lith_ttfb_measured 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape missing %q", want)
@@ -59,6 +68,40 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 	}
 	if strings.Contains(got, "lith_readahead_window_blocks 223") {
 		t.Error("the window gauge is latched at its configured value; it must report the realized one")
+	}
+
+	// THE PAIRING THAT WOULD HAVE CAUGHT #340: a mount reporting a real in-region first-byte
+	// latency with the evidence ratio still 0. Before #341 only the ratio was visible, so
+	// "the gate is off" and "the gate is off because its bound is in the wrong unit" looked
+	// identical on a scrape.
+	window, handles, streams, evRatio, ttfb, measured = 223, 1, 1, 0, 0.0282, 1
+	got = scrape()
+	for _, want := range []string{
+		"lith_ttfb_median_seconds 0.0282",
+		"lith_ttfb_measured 1",
+		"lith_readahead_evidence_ratio 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("with a measured 28.2ms TTFB and the gate off, scrape missing %q", want)
+		}
+	}
+
+	// THE AMBIGUITY #341 NAMED, as two scrapes that differ in exactly one series. Both report
+	// ratio 0; only the flag says which is which. The first is a mount that has not measured
+	// its endpoint yet, where the gate is correctly inert. The second is #340: measured,
+	// in-region, and still off because the bound was in the wrong unit.
+	ttfb, measured = 0, 0
+	unmeasured := scrape()
+	ttfb, measured = 0.0282, 1
+	measuredScrape := scrape()
+	if !strings.Contains(unmeasured, "lith_ttfb_measured 0") ||
+		!strings.Contains(measuredScrape, "lith_ttfb_measured 1") {
+		t.Error("the measured flag does not distinguish a seed-valued median from a measurement")
+	}
+	if !strings.Contains(unmeasured, "lith_readahead_evidence_ratio 0") ||
+		!strings.Contains(measuredScrape, "lith_readahead_evidence_ratio 0") {
+		t.Fatal("fixture: both arms must report the gate off, or the flag is not what " +
+			"distinguishes them")
 	}
 
 	// THE DIAGNOSTIC #301 turns on: descriptors far above streams. Both counts must be
@@ -179,4 +222,72 @@ func TestCoverageCountersAreSeparableAndLive(t *testing.T) {
 	nilM.PrefetchHandleFor(">64MiB").Record(PrefetchDelta{Seek: 1, CoverageHeld: 1})
 	var nilH *PrefetchHandle
 	nilH.Record(PrefetchDelta{Seek: 1})
+}
+
+// #341: the raw first-byte latencies as a DISTRIBUTION, not only the rolling median the
+// evidence policy reads.
+//
+// #340's bound was placed from the in-region spread -- p10 22.6 / median 28.2 / p90 42.7 ms --
+// and that spread had to be recovered from a --timeline-csv, because the median was the only
+// thing exported. A median alone also cannot show a bimodal endpoint, which is the shape that
+// would make ANY single threshold wrong.
+func TestTTFBHistogramExposesTheDistributionNotJustTheMedian(t *testing.T) {
+	m := New()
+	scrape := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	// Registered before any observation, so an absent series cannot be read as a missing
+	// feature -- the mistake this whole family of counters was added to stop.
+	if got := scrape(); !strings.Contains(got, `lith_ttfb_seconds_count 0`) {
+		t.Fatal("the histogram is not emitted before its first observation")
+	}
+
+	// The measured in-region distribution, as reported on #340.
+	for _, ms := range []float64{22.6, 24.1, 26.0, 28.2, 29.9, 33.4, 42.7} {
+		m.S3TTFB(time.Duration(ms * float64(time.Millisecond)))
+	}
+	got := scrape()
+	for _, want := range []string{
+		`lith_ttfb_seconds_count 7`,
+		// THE BUCKET THAT DECIDES THE POLICY. The 50 ms bound is a bucket boundary on
+		// purpose: le="0.05" vs _count is "is my endpoint inside the regime the default
+		// assumes", answerable from one scrape and no quantile estimation.
+		`lith_ttfb_seconds_bucket{le="0.05"} 7`,
+		// And the resolution that matters either side of the median: Prometheus's default
+		// buckets jump 0.025 -> 0.05, which would put the entire in-region distribution in
+		// one bucket and show nothing.
+		`lith_ttfb_seconds_bucket{le="0.025"} 2`,
+		`lith_ttfb_seconds_bucket{le="0.03"} 5`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape missing %q", want)
+		}
+	}
+
+	// A cross-region endpoint must land ABOVE the bound's bucket, or the one scrape that is
+	// supposed to say "the default will not engage here" cannot say it.
+	m.S3TTFB(58600 * time.Microsecond)
+	got = scrape()
+	if !strings.Contains(got, `lith_ttfb_seconds_bucket{le="0.05"} 7`) {
+		t.Error("a 58.6ms cross-region sample fell inside the 50ms bucket")
+	}
+	if !strings.Contains(got, `lith_ttfb_seconds_bucket{le="0.06"} 8`) {
+		t.Error("a 58.6ms sample is not resolved below 100ms; the cross-region regime is " +
+			"indistinguishable from a pathological one")
+	}
+
+	// Nil-safe, like every other recorder here: a mount without --metrics must not panic.
+	var nilM *Metrics
+	nilM.S3TTFB(28 * time.Millisecond)
+	// And a non-positive duration is not an observation -- recordTTFB drops those, so the
+	// histogram must agree with the median it sits beside rather than skewing toward zero.
+	m.S3TTFB(0)
+	m.S3TTFB(-1)
+	if got := scrape(); !strings.Contains(got, `lith_ttfb_seconds_count 8`) {
+		t.Error("a zero or negative latency was observed as a sample")
+	}
 }

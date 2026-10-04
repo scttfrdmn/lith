@@ -30,6 +30,7 @@ type Metrics struct {
 	uncovered     prometheus.Counter
 	pfLowCoverage prometheus.Counter
 	pfCovHeld     prometheus.Counter
+	ttfb          prometheus.Histogram
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -98,6 +99,17 @@ func New() *Metrics {
 		pfLowCoverage: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_low_coverage_total",
 			Help: "Reads the #221 coverage gate forced Random on a SEEK landing: a scattered walk, which is the gate working as designed. Incremented live, per read. Pair with lith_prefetch_coverage_held_total -- that one rising while this stays flat is the #316 shape (#221, #316).",
+		}),
+		ttfb: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "lith_ttfb_seconds",
+			Help: "S3 first-byte latency per fill. The DISTRIBUTION, not the rolling median the evidence policy reads -- #340's latency bound was placed from in-region p90 (42.7 ms) against a median of 28.2 ms, and that spread had to be recovered from a --timeline-csv because nothing exported it (#341). Buckets span in-region (~28 ms) through cross-region (>58 ms) first-byte latencies.",
+			// Centred on the measured regimes rather than Prometheus's defaults, which top
+			// out at 10 s and have nothing between 25 ms and 50 ms -- the interval the
+			// evidence bound sits in.
+			Buckets: []float64{
+				0.001, 0.005, 0.010, 0.020, 0.025, 0.030, 0.040, 0.050,
+				0.060, 0.080, 0.100, 0.200, 0.500, 1.0,
+			},
 		}),
 		pfCovHeld: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_coverage_held_total",
@@ -220,7 +232,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.ttfb, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -318,7 +330,7 @@ func (m *Metrics) RegisterQueueDepth(f func() float64) {
 // mounts ran there. #301 changed the divisor's input, so the gap is now diagnostic rather
 // than causal: wide means many idle descriptors (no longer a problem), narrow-and-crowded
 // means genuinely more streams than the budget can fund (raise --prefetch-budget).
-func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio func() float64) {
+func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles, evidenceRatio, ttfbSeconds, ttfbMeasured func() float64) {
 	if m == nil {
 		return
 	}
@@ -334,6 +346,14 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles,
 		Name: "lith_streaming_handles",
 		Help: "Handles being prefetched for: established sequential streams. This is the divisor for the readahead window (#301). Its gap from lith_open_handles is what the old divisor over-charged for -- on the workload that found this, ~288 descriptors against ~48 streams.",
 	}, streamingHandles))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_ttfb_median_seconds",
+		Help: "Rolling median S3 FIRST-BYTE latency -- the exact input evidenceRatioFor reads. Not a network round trip: in-region this is ~28 ms against an RTT of ~2 ms, and confusing the two is what made v1.4.0's evidence default never engage (#340). Pair with lith_ttfb_measured: this reads 0 when nothing has been measured yet (#341).",
+	}, ttfbSeconds))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_ttfb_measured",
+		Help: "1 once a fill has measured the endpoint's first-byte latency, 0 before. Without it, a mount in the evidence gate's \"off\" regime looks identical from outside whether nothing has been measured yet, the measurement is above the bound, or the policy is wrong -- and #340 was the second of those, diagnosable only from the source (#341).",
+	}, ttfbMeasured))
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lith_readahead_evidence_ratio",
 		Help: "The #256 evidence-gate ratio in force: a committed readahead window may not exceed this multiple of the bytes a handle has actually consumed. 0 means the gate is off, which is the default and is also what a mount reports before any fill has measured the endpoint's latency. Non-zero without --readahead-evidence-ratio set means the latency-derived policy engaged (#284).",
@@ -385,6 +405,15 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) PrefetchWait(d time.Duration) {
 	if m != nil {
 		m.prefetchWait.Observe(d.Seconds())
+	}
+}
+
+// S3TTFB observes one fill's first-byte latency (blockstore's optional ttfbRecorder
+// extension). Non-positive durations are not observations, matching recordTTFB's own guard,
+// so the histogram agrees with the median gauge beside it. Nil-safe.
+func (m *Metrics) S3TTFB(d time.Duration) {
+	if m != nil && d > 0 {
+		m.ttfb.Observe(d.Seconds())
 	}
 }
 
