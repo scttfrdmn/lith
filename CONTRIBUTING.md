@@ -46,6 +46,37 @@ fixtures under `internal/index/testdata/golden` enforce it).
 - `make test` (race-enabled) passes; new code has tests and touches no network.
 - Every `.go` file carries the `// SPDX-License-Identifier: Apache-2.0` header.
 
+## Quoting a performance number
+
+This project's findings are mostly measurements, and the measurements get quoted — into
+`CHANGELOG.md`, into issues, and back to the deployments that reported them. Three rules, each
+of which exists because its absence cost a wrong conclusion that had already been published.
+
+**Model the cost with its denominator.** State the full expression, including what it divides
+by, and where each term came from. The error lives in the term that seems obvious: a 1 MiB
+in-region S3 GET costs **~28 ms** to first byte, not the 2.2 ms network round trip — that one
+mistake made a 225 ms cost look like 15 ms and got an issue closed. A whole-object read's
+baseline is `intercept + size/rate`, not `size/rate`. And `grep` for bounds before modelling a
+path: two models have been refuted by a clamp already present in the function being modelled
+(`EOF` and dedup in `Prefetch`, and the `cursor+1` frontier clamp).
+
+**Never quote one draw.** Repeat the run — six is enough to see variance — and measure the
+**before** state under the same conditions, by temporarily reverting the change rather than
+trusting a figure from an earlier session or a different fixture. A GET count published as
+`22 → 16` was `22 → 17` on six repeats. Report the stable value or the range.
+
+**Assert volume, not presence.** A test that checks a state, a non-zero, or a loose bound
+cannot catch a regression of the thing it was written for: `TestColdSequentialGetShape` once
+allowed "≤ 4× the ideal" and would not have noticed its own fix being reverted. Assert the
+number, tightly enough that reverting fails, with a floor so a fixture serving everything from
+cache fails instead of passing quietly. And have the fixture state its own precondition —
+several tests here have passed while proving nothing, by skipping silently, by reaching a
+different detector state than intended, or by using a 1 MiB-block store to measure an
+8 MiB-block effect.
+
+A number that changes a default or goes into a release note is worth re-checking on `main`
+after the merge. That is one command, and it is what caught the `16` above.
+
 ## License
 
 By contributing you agree that your contributions are licensed under the
