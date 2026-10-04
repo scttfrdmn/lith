@@ -4,6 +4,7 @@ package nfs
 
 import (
 	"context"
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -92,18 +93,38 @@ func (f *roFS) Capabilities() billy.Capability {
 
 func norm(p string) string { return "/" + strings.TrimPrefix(path.Clean("/"+p), "/") }
 
-func (f *roFS) key(vpath string) blockstore.Key {
+// backing returns the read descriptor for a virtual path: the blockstore key, the ORIGIN of
+// the file's bytes within that key's coordinate space, and the SIZE of that space.
+//
+// For an object-backed file the file *is* the object, so the origin is 0 and the space is the
+// file's size. For a CargoShip-backed file the key is the packed chunk, the origin is the
+// file's `archive_offset` in that chunk's uncompressed tar stream, and the space is the
+// chunk's uncompressed total — all three different from the file's own coordinates.
+//
+// Those last two used to be dropped (lith#217): `key` rewrote the key to the chunk and then
+// ReadAt passed the FILE's offset and the FILE's size against it, so a file at
+// `archive_offset: 512` — every file in a real archive, a tar header preceding the data — was
+// served from the chunk's offset 0. Wrong bytes, no error.
+func (f *roFS) backing(vpath string, size int64) (k blockstore.Key, origin, space int64, err error) {
 	rel := strings.TrimPrefix(vpath, "/")
-	k := blockstore.Key{Key: f.cfg.Index.Prefix() + rel, ETagHash: f.cfg.Index.ETagHashOf(vpath)}
-	if b, ok := f.cfg.Index.BackingOf(vpath); ok && len(b.Parts) == 1 {
-		p := b.Parts[0]
-		k.Key = p.ChunkKey
-		k.ETagHash = p.ChunkETagHash
-		if len(p.Frames) > 0 {
-			k.Cargo = &blockstore.CargoChunk{Frames: p.Frames, UncompTotal: p.ChunkUncompTotal}
-		}
+	k = blockstore.Key{Key: f.cfg.Index.Prefix() + rel, ETagHash: f.cfg.Index.ETagHashOf(vpath)}
+	b, ok := f.cfg.Index.BackingOf(vpath)
+	if !ok {
+		return k, 0, size, nil
 	}
-	return k
+	if len(b.Parts) != 1 {
+		// A SPLIT cargo file spans several chunks, which this read path has no way to
+		// express — one key, one origin. Fail closed naming it (#141), rather than falling
+		// through to an object key that does not exist in a packed archive and surfacing
+		// as a bare NoSuchKey.
+		return k, 0, 0, fmt.Errorf("%q is a CargoShip file split across %d chunks; the NFS gateway serves only single-chunk files (mount it with FUSE, which assembles parts)", vpath, len(b.Parts))
+	}
+	p := b.Parts[0]
+	k = blockstore.Key{Key: p.ChunkKey, ETagHash: p.ChunkETagHash}
+	if len(p.Frames) > 0 {
+		k.Cargo = &blockstore.CargoChunk{Frames: p.Frames, UncompTotal: p.ChunkUncompTotal}
+	}
+	return k, p.ArchiveOffset, p.ChunkUncompTotal, nil
 }
 
 func (f *roFS) Stat(filename string) (os.FileInfo, error) {
@@ -131,7 +152,12 @@ func (f *roFS) OpenFile(filename string, flag int, _ os.FileMode) (billy.File, e
 	if err != nil || fi.IsDir {
 		return nil, os.ErrNotExist
 	}
-	return &roFile{fs: f, vpath: vp, key: f.key(vp), size: fi.Size, st: f.stateFor(vp)}, nil
+	k, origin, space, err := f.backing(vp, fi.Size)
+	if err != nil {
+		return nil, err
+	}
+	return &roFile{fs: f, vpath: vp, key: k, size: fi.Size,
+		origin: origin, space: space, st: f.stateFor(vp)}, nil
 }
 
 func (f *roFS) ReadDir(p string) ([]os.FileInfo, error) {
@@ -180,9 +206,15 @@ type roFile struct {
 	fs    *roFS
 	vpath string
 	key   blockstore.Key
-	size  int64
-	st    *seqState
-	off   int64
+	size  int64 // the FILE's size, in file coordinates
+	// origin and space are the key's coordinate space: a file offset o is the key's
+	// origin+o, and the space bounds every block number and object size handed to the
+	// block store. Object-backed: 0 and size. CargoShip-backed: archive_offset and the
+	// chunk's uncompressed total.
+	origin int64
+	space  int64
+	st     *seqState
+	off    int64
 }
 
 func (r *roFile) Name() string { return r.vpath }
@@ -208,7 +240,9 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 		// s3_bytes/distinct_bytes reads as a *perfect* 0 for an unmeasured gateway
 		// (#253). mark() clamps length to the object size, so the requested len(p)
 		// is safe at EOF.
-		r.fs.cfg.Metrics.MarkDistinctRead(r.key.Key, off, int64(len(p)), r.size)
+		// In the KEY's coordinates: for a cargo file the distinct bytes fetched are chunk
+		// bytes, and the chunk is what the amplification ratio is against.
+		r.fs.cfg.Metrics.MarkDistinctRead(r.key.Key, r.origin+off, int64(len(p)), r.space)
 	}
 	bs := r.fs.cfg.Store
 	blk := bs.BlockSize()
@@ -218,7 +252,7 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 	r.st.lastEnd = off + int64(len(p))
 	var lo, hi int64 = 0, -1
 	if seq {
-		cur := off / blk
+		cur := (r.origin + off) / blk
 		target := cur + r.fs.srv.windowBlocks()
 		if r.st.frontier < cur+1 {
 			r.st.frontier = cur + 1
@@ -238,11 +272,11 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 		// prefetch semaphore bound in-flight depth, matching the FUSE prefetcher's
 		// concurrency.
 		for b := lo; b <= hi; b++ {
-			if b*blk >= r.size {
+			if b*blk >= r.space {
 				break
 			}
 			b := b
-			go r.fs.cfg.Store.Prefetch(r.fs.ctx, r.key, b, r.size)
+			go r.fs.cfg.Store.Prefetch(r.fs.ctx, r.key, b, r.space)
 		}
 	}
 
@@ -254,16 +288,18 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 	if end > r.size {
 		end = r.size
 	}
+	// Everything below is in the KEY's coordinate space, which for a cargo-backed file is
+	// the packed chunk's uncompressed tar stream and not the file at all.
 	n := 0
-	for pos := off; pos < end; {
+	for pos := r.origin + off; pos < r.origin+end; {
 		ci := pos / blockstore.ChunkSize
 		cstart := ci * blockstore.ChunkSize
 		lo := pos - cstart
-		hi := end - cstart
+		hi := r.origin + end - cstart
 		if hi > blockstore.ChunkSize {
 			hi = blockstore.ChunkSize
 		}
-		buf, err := bs.Chunk(r.fs.ctx, r.key, ci, r.size, lo, hi, seq)
+		buf, err := bs.Chunk(r.fs.ctx, r.key, ci, r.space, lo, hi, seq)
 		if err != nil {
 			if n > 0 {
 				break
@@ -275,7 +311,7 @@ func (r *roFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 		n += copy(p[n:], buf[lo:hi])
 		pos = cstart + hi
-		if hi < blockstore.ChunkSize && cstart+hi >= r.size {
+		if hi < blockstore.ChunkSize && cstart+hi >= r.space {
 			break
 		}
 	}

@@ -203,7 +203,26 @@ func (m *Manifest) Resolve() (*Archive, error) {
 				}
 				end += p.Length
 			}
+			// The parts are authoritative for a split, and deliberately so: whether
+			// `size` on a split entry means the whole file or just that part, the tiled
+			// total is the same number, so this is correct under either reading and the
+			// declared value cannot be cross-checked against it (lith#217 case 3).
 			vf.Size = end
+		} else if vf.Parts[0].Length != vf.Size {
+			// NON-SPLIT, and here the two records ARE comparable: one entry, `size` is
+			// the file's size and `length` (or `size` again, when length is 0) is the
+			// bytes mapped. A disagreement was previously unchecked — the tiling check
+			// above runs only for splits — and `size` won, so a file could declare more
+			// bytes than its mapping covers.
+			//
+			// That is a SERVES WRONG shape: the mount reports the declared size and
+			// readCargo returns only what the parts cover, so a reader gets a short read
+			// at an offset stat() says is inside the file, which looks exactly like EOF.
+			// Measured in fuse.TestCargoSizeExceedingItsPartsIsNotSilentlyTruncated.
+			// The reverse (a longer part under a smaller size) is not a wrong answer —
+			// the tail is unreachable — but it means the two records were built from
+			// different states, so nothing else about them can be trusted either.
+			return nil, fmt.Errorf("cargoship: file %q declares size %d but its mapping covers %d bytes — the manifest's size and length/archive_offset disagree (lith#217)", rel, vf.Size, vf.Parts[0].Length)
 		}
 		files = append(files, vf)
 	}
