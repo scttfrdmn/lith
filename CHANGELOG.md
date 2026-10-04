@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith-s3bench` reports FIRST-BYTE latency, not only full-request latency**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). Its `p50`/`p99` were timed to after
+  `io.ReadFull`, so at an 8 MiB part the transfer buried the first byte entirely — the tool
+  could not answer the question it was pointed at. TTFB is now recorded at the same seam
+  `BlockStore.recordTTFB` uses (immediately after the GET returns, before any body read), so
+  the two are the same quantity, and reported as p10/p50/p90/p99 plus the fractions at or
+  under 25 / 50 / 60 ms — the bounds the evidence policy's input is scored against externally.
+
 ## [1.6.0] - 2026-10-04
 
 ### Added
