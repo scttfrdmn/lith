@@ -629,7 +629,18 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	if !ok {
 		return fuse.ENOENT
 	}
-	fi, err := f.index().Stat("/" + n.path)
+	// ONE index load for the whole of Open (#219). It used to load three times -- Stat for the
+	// size, ETagHashOf for the cache key, BackingOf for the cargo parts -- and a concurrent
+	// SwapIndex landing between any two gave the handle a size from one version and a cache
+	// key from another. The handle then read bytes bounded by one version's length under the
+	// other version's ETag: a wrong-bytes failure that announces itself as nothing, and that
+	// -race cannot report because each atomic load is individually correct. Measured at 33%
+	// of opens under continuous swap.
+	//
+	// liveIndex is a struct behind one atomic pointer precisely so a single load yields a
+	// coherent view. Take it once.
+	ix := f.index()
+	fi, err := ix.Stat("/" + n.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -641,7 +652,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 		return fuse.Status(syscall.EROFS)
 	}
 	h := &fileHandle{
-		key:   blockstore.Key{Key: f.objectKey(n.path), ETagHash: f.index().ETagHashOf("/" + n.path)},
+		key:   blockstore.Key{Key: f.objectKey(n.path), ETagHash: ix.ETagHashOf("/" + n.path)},
 		size:  fi.Size,
 		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin()),
 		pfMet: f.met.PrefetchHandleFor(sizeClass(fi.Size)),
@@ -659,7 +670,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// CargoShip-backed file (#94): its bytes live in packed `.tar.zst` chunks.
 	// Resolve the read-mapping and stream the covering chunk region; a cargo
 	// handle uses none of the object-key readahead paths below.
-	if b, ok := f.index().BackingOf("/" + n.path); ok {
+	if b, ok := ix.BackingOf("/" + n.path); ok {
 		for _, p := range b.Parts {
 			h.cargo = append(h.cargo, cargoPart{
 				key: blockstore.Key{Key: p.ChunkKey, ETagHash: p.ChunkETagHash,
@@ -1154,12 +1165,18 @@ func (f *rawFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 }
 
 func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (status fuse.Status) {
+	// One index load for the whole listing (#219): two of these loads are inside the entry
+	// loop, so a swap mid-listing could return entries from one version with attributes from
+	// another -- and ReadDirPlus registers those attributes with the kernel, which caches
+	// them. Less dangerous than Open's torn handle (metadata, not file bytes) and the same
+	// latent pattern.
+	ix := f.index()
 	defer f.recoverToStatus(&status)
 	n, ok := f.resolve(input.NodeId)
 	if !ok || !n.isDir {
 		return fuse.ENOTDIR
 	}
-	self, err := f.index().Stat("/" + n.path)
+	self, err := ix.Stat("/" + n.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -1176,7 +1193,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 		if cursor == 1 {
 			parentIno := self.Ino
 			if pn, ok := f.resolve(n.parent); ok {
-				if pfi, e := f.index().Stat("/" + pn.path); e == nil {
+				if pfi, e := ix.Stat("/" + pn.path); e == nil {
 					parentIno = pfi.Ino
 				}
 			}
@@ -1195,7 +1212,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 
 	rc := cursor - 2
 	for {
-		ents, next, err := f.index().Readdir("/"+n.path, rc, 1)
+		ents, next, err := ix.Readdir("/"+n.path, rc, 1)
 		if err != nil {
 			return fuse.ENOENT
 		}
@@ -1215,7 +1232,7 @@ func (f *rawFS) readdir(input *fuse.ReadIn, out *fuse.DirEntryList, plus bool) (
 			}
 			childPath := joinPath(n.path, e.Name)
 			f.register(e.Ino, childPath, input.NodeId, e.IsDir)
-			if fi, e2 := f.index().Stat("/" + childPath); e2 == nil {
+			if fi, e2 := ix.Stat("/" + childPath); e2 == nil {
 				eo.NodeId = fi.Ino
 				eo.Generation = 1
 				eo.SetEntryTimeout(oneYear)
@@ -1238,14 +1255,16 @@ func (f *rawFS) ReleaseDir(input *fuse.ReleaseIn) {}
 // StatFs reports totals derived from the index; the filesystem has no free
 // space (it is read-only).
 func (f *rawFS) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
+	// One index load, so the reported totals agree with each other (#219).
+	ix := f.index()
 	const bsize = 4096
-	total := uint64(f.index().TotalSize())
+	total := uint64(ix.TotalSize())
 	out.Bsize = bsize
 	out.Frsize = bsize
 	out.Blocks = (total + bsize - 1) / bsize
 	out.Bfree = 0
 	out.Bavail = 0
-	out.Files = uint64(f.index().Len())
+	out.Files = uint64(ix.Len())
 	out.Ffree = 0
 	out.NameLen = 255
 	return fuse.OK
