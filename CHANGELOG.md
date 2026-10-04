@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since an 8-sample window over a serial demand prefix followed by a burst is always
   dominated by whichever phase just happened.
 
+  The minimum sample count is **10**, not the 32 first written: a single small read is only
+  ~24 fills, so 32 made the floor unobservable on #284's shape — the one workload whose
+  over-fetch the gate was built to decide about. 10 is the smallest window at which the p10
+  index is still ≥ 1, keeping the never-the-minimum property without costing the bootstrap;
+  the floor is now available partway through the serial demand prefix, before prefetch
+  commits, so the decision is made on demand latencies. The tolerance is also stated
+  explicitly now: a p10 is load-invariant while at least one fill in ten still gets an
+  unqueued first byte, and past that it rises rather than latching a figure no recent fill
+  supports.
+
 ## [1.5.0] - 2026-10-03
 
 ### Fixed
