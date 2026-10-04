@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-04
+
 ### Added
 
 - **`--timeline-csv` records handle opens, so the per-open cost is measurable**
@@ -2043,7 +2045,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/scttfrdmn/lith/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/scttfrdmn/lith/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/scttfrdmn/lith/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/scttfrdmn/lith/compare/v1.1.2...v1.1.3
