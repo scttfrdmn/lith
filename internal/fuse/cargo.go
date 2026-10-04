@@ -2,6 +2,8 @@
 
 package fuse
 
+import "fmt"
+
 // CargoShip virtual-file reads (#94). A cargo handle's bytes live in one or more
 // packed `.tar.zst` chunks; a read maps to the covering part(s), each translated
 // to its chunk's uncompressed tar-stream offset and served through the block
@@ -30,6 +32,20 @@ func (f *rawFS) readCargo(h *fileHandle, off, end int64) ([]byte, error) {
 		}
 		out = append(out, d...)
 		f.cargoReadahead(h, p, chunkOff+(e-s))
+	}
+	// FAIL CLOSED on a mapping that does not cover the range the handle's own size says is
+	// readable (lith#217 case 3). [off,end) is already clamped to h.size, so a short result
+	// means the parts do not tile [0,size) — a declared size its parts cannot cover, or a
+	// hole between parts. Returning the short buffer is a WRONG ANSWER rather than a
+	// failure: to the caller it is indistinguishable from EOF, while stat() still reports
+	// the larger size, so a truncated file looks intact.
+	//
+	// cargoship.Resolve now rejects that manifest, so this is the reader-side backstop for
+	// an index built by an older or different writer — the same belt-and-braces as the
+	// chunkless-manifest guard in resolvePointer.
+	if int64(len(out)) != end-off {
+		return nil, fmt.Errorf("cargoship backing for %q covers %d of the %d bytes at offset %d that its size declares readable — the index's size and its read mapping disagree (lith#217)",
+			h.key.Key, len(out), end-off, off)
 	}
 	return out, nil
 }

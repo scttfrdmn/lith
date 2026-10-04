@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The NFS gateway served WRONG BYTES for every CargoShip-backed file**
+  ([#346](https://github.com/scttfrdmn/lith/issues/346)). Found while running #217's case 3;
+  no adversarial input needed — the honest fixture archive is enough.
+
+  `roFS.key` resolved a cargo-backed path to its packed-chunk key and frame table and then
+  dropped the two numbers that make that key usable. `roFile` kept no origin, so `ReadAt`
+  passed the **file's** offset and the **file's** size against the **chunk's** key: a file at
+  `archive_offset: 512` — which is *every* file in a real archive, a tar header preceding the
+  data — was served from the chunk's uncompressed offset **0**, the frame lookup was bounded
+  to the first `size` bytes of a multi-megabyte chunk, and EOF was computed from the file's
+  length measured from the wrong origin.
+
+  `roFS.backing` now returns the key **plus** the origin and the size of that key's coordinate
+  space; every block number, prefetch bound, object-size argument and distinct-byte figure in
+  `ReadAt` is in the key's space, and only the EOF check and the read clamp stay in file
+  coordinates. Object-backed mounts are bit-for-bit unaffected: origin 0 and space = size
+  reproduce the old arithmetic exactly. A **split** cargo file cannot be expressed by one key
+  and one origin, so it now fails closed at open naming the reason, instead of falling through
+  to an object key that does not exist in a packed archive and surfacing as a bare
+  `NoSuchKey`; it stays visible to `stat`, since hiding it would be a different wrong answer.
+
+  **Why it survived:** the gateway had no CargoShip test. The FUSE path has had a byte-exact
+  one since #94, and the two read paths are separate implementations — the same shape as
+  #219's gateway findings, where a second consumer of the same index had its own read path and
+  the tests only covered the first. Affects any `lith serve nfs` export of a `--cargoship`
+  archive since v0.4.0.
+
+- **A CargoShip file could declare a size its parts cannot cover, and the mount truncated it
+  silently** ([#217](https://github.com/scttfrdmn/lith/issues/217)). M17-B case 3 — the index
+  and the manifest disagreeing about a file's size — and a third "serves wrong" verdict.
+
+  A file's size comes from the manifest's `size`; its read mapping comes from the same entry's
+  `length`/`archive_offset`. `Resolve` ran its parts-tile-`[0,size)` check **only for split
+  files**, so a single-entry file declaring `size: 1000` with `length: 500` resolved to a
+  1000-byte file with 500 bytes of mapping. `readCargo` returns only what the parts cover, so
+  a read of the declared range came back short with `fuse.OK` — indistinguishable from EOF to
+  the caller, while `stat` still agreed with the manifest. Measured: `stat` reporting 394096
+  bytes with reads stopping at 390000, no error and no padding.
+
+  Now rejected at resolve, where both records are in hand, and backstopped in `readCargo`
+  with an EIO when the mapping does not cover a range the handle's own size calls readable —
+  for an index built by an older or different writer. **The split case is deliberately
+  asymmetric and stays unchecked:** `size` on a split entry may mean the whole file or just
+  that part, so under the per-part reading a disagreement carries no information, while the
+  tiled total is the same number under either reading. The parts are therefore authoritative
+  for a split, and the mount stays self-consistent either way.
+
 - **A CargoShip frame table whose compressed spans OVERLAP served another file's bytes**
   ([#217](https://github.com/scttfrdmn/lith/issues/217)). M17-B case 2, and a second
   "serves wrong" verdict.
