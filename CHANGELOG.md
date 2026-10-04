@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CargoShip frame table whose compressed spans OVERLAP served another file's bytes**
+  ([#217](https://github.com/scttfrdmn/lith/issues/217)). M17-B case 2, and a second
+  "serves wrong" verdict.
+
+  A frame's compressed span is the GET; its uncompressed span is where the result lands. The
+  manifest validator has always been *documented* as requiring compressed spans to be
+  non-overlapping, but it only ever bounded each span against the object size — so two frames
+  could claim the same compressed bytes. Point frame B's span at frame A's and a read at B's
+  offset returns **A's content**: no error, exactly the declared length, and a **passing
+  per-frame checksum**, because that checksum covers the compressed bytes and they really are
+  the bytes fetched. Whoever writes the manifest computes it over what they point at.
+
+  The read path cannot catch this — by the time it holds the frame table, every cross-check
+  available to it is satisfied by construction — so the gate is at parse. Overlap is now
+  rejected by name, order-independently (the frame array is sorted by *uncompressed* offset,
+  and nothing in the format requires the compressed order to match). **Gaps stay legal**: zstd
+  skippable frames sit between data frames, a frame index being one of them, so a check that
+  demanded contiguity would reject real archives. The bytes are measured in
+  `TestOverlappingCompressedFramesServeAnotherFramesBytes`, on a fixture that stamps each
+  frame with a distinct byte — the existing framed-chunk helper varies its data on a 4 MiB
+  period, so at a 4 MiB frame size two frames hold *identical* bytes and a test that swapped
+  them would have passed.
+
+  Also recorded, as passing results rather than findings: overlapping *uncompressed* spans are
+  already detected by the contiguity check, and an `archive_offset` past its chunk is rejected
+  rather than clamped to a short read. An `archive_offset` pointing at the wrong place *inside*
+  its chunk is undetectable and not a defect — for a file in a chunk, that offset is the only
+  authority on where its bytes are, and there is no second record to check it against.
+
 - **v1.4.0's evidence-gate default never engaged: the bound was in the wrong unit**
   ([#340](https://github.com/scttfrdmn/lith/issues/340)). v1.4.0's release note says the gate
   is on by default in-region. **It was not.** An external deployment measured the default mount
