@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `CURRENT` could name an index built for a different bucket, and lith mounted it**
+  ([#217](https://github.com/scttfrdmn/lith/issues/217)). M17-B case 2, and the fourth
+  "serves wrong" verdict.
+
+  An index names keys; the bucket comes from the mount. The index *records* the bucket it was
+  built from, and nothing read it — so an index built against one bucket and loaded against
+  another resolved every key in the **wrong bucket**, serving whatever happened to live at
+  those keys under the dataset's name, with sizes and mtimes from the index so nothing looked
+  wrong until a checksum failed. A `CURRENT`'s `index_sha256` is no help: it binds the index's
+  *bytes*, not its meaning.
+
+  `checkIndexBucket` now refuses the mismatch, naming both buckets, from `resolvePointer` and
+  from every mount path — mirroring the check `--cargoship` already made on its manifest's
+  bucket. An index with **no** recorded bucket is still accepted: `index.Build` leaves the
+  field empty unless the builder sets it, so refusing those would break indexes built before
+  it was populated, and absence of provenance is not a mismatch.
+
 - **The NFS gateway served WRONG BYTES for every CargoShip-backed file**
   ([#346](https://github.com/scttfrdmn/lith/issues/346)). Found while running #217's case 3;
   no adversarial input needed — the honest fixture archive is enough.

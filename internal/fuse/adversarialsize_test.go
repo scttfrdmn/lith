@@ -19,6 +19,8 @@ import (
 	"github.com/scttfrdmn/lith/internal/s3client/fake"
 )
 
+// (fixture helpers above are shared by the case-3 and case-5 tests below)
+
 // mkLyingCargoFS builds the real fixture mount, then inflates ONE file's declared size
 // without touching its read mapping — the shape a manifest produces when its `size` and
 // `length` disagree (M17-B case 3, #217). Everything else is the genuine archive.
@@ -160,5 +162,65 @@ func TestCargoSizeExceedingItsPartsIsNotSilentlyTruncated(t *testing.T) {
 	if got, st := read(vf.Size, 16); st != fuse.EIO {
 		t.Errorf("a 16-byte read starting exactly where the mapping ends returned %d bytes "+
 			"and %v, want EIO", len(got), st)
+	}
+}
+
+// M17-B case 5 (#217), the read path: a PUBLISHED index naming a chunk object that does not
+// exist must fail closed, not serve zeros.
+//
+// Building an index from a manifest HEADs every chunk, so a dangling key is detected at mount
+// (index.TestBuildFromManifestDetectsAMissingChunkObject). A published index is a prebuilt
+// artifact and no HEAD happens, so the dangling key first appears on a read. The verdict to
+// confirm is FAIL-CLOSED: an EIO, not a zero-filled buffer and not a silent short read, both
+// of which would look like data.
+func TestCargoMissingChunkFailsClosed(t *testing.T) {
+	srv := fake.New()
+	dir := filepath.Join("..", "cargoship", "testdata", "fixture")
+	mb, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := cargoship.Parse(mb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch, err := m.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The archive is published, the index is built -- and the chunk object is NOT in the
+	// bucket. Its ETag hash is a plausible value, as a published index would carry.
+	ix, err := index.BuildFromCargoship(arch, []uint64{0xdeadbeef}, [32]byte{}, "u", "2.1", "frames", index.Options{Bucket: "b"})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	bs, _ := blockstore.New(srv, blockstore.Config{Bucket: "b", BlockSize: 1 << 20, MemCache: 256 << 20, MaxRange: 16 << 20})
+	raw := NewRawFileSystem(Config{
+		Index: ix, Store: bs, Metrics: metrics.New(),
+		SmallFile: 4 << 10, PartsMax: 4 << 10,
+		Limits: prefetch.NewPolicy(128<<20, prefetch.DeviceLimits{}, nil),
+	}).(*rawFS)
+
+	// The namespace still resolves -- it comes from the index, which is intact. That is
+	// correct and is also why the failure has to be at read: nothing before it knows.
+	h, fh := openHandle(t, raw, "alpha.txt")
+	if h.cargo == nil {
+		t.Fatal("not a cargo handle")
+	}
+
+	buf := make([]byte, 4096)
+	res, st := raw.Read(nil, &fuse.ReadIn{Fh: fh, Offset: 0, Size: 4096}, buf)
+	if st == fuse.OK {
+		got, _ := res.Bytes(buf)
+		if bytes.Equal(got, make([]byte, len(got))) {
+			t.Fatalf("verdict SERVES WRONG: a read of a missing chunk returned %d ZERO "+
+				"bytes and fuse.OK -- indistinguishable from a sparse file", len(got))
+		}
+		t.Fatalf("verdict SERVES WRONG: a read of a missing chunk returned %d bytes and "+
+			"fuse.OK", len(got))
+	}
+	if st != fuse.EIO {
+		t.Errorf("failed closed with %v; EIO is what the read path returns for an "+
+			"unfetchable chunk", st)
 	}
 }
