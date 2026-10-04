@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Open` built a file handle from a MIX of two index versions during a refresh**
+  ([#219](https://github.com/scttfrdmn/lith/issues/219)). `rawFS.Open` loaded the index three
+  separate times — `Stat` for the size, `ETagHashOf` for the cache key, `BackingOf` for the
+  cargo parts. Each load is individually safe (the index is an atomic pointer), but a
+  concurrent `SwapIndex` landing between two of them gave the handle **a size from one version
+  and a cache key from another**. The handle then read bytes bounded by one version's length
+  under the other version's ETag.
+
+  **Measured at 33% of opens** — 10,438 of 32,000 — under continuous swap. `-race` reports
+  nothing, because every load is correct in isolation; this is the class #219 was opened for,
+  where a race serves wrong bytes rather than crashing.
+
+  `liveIndex` is a struct behind one atomic pointer precisely so a single load yields a
+  coherent view. `Open` now takes it once, and so do `readdir` (which had four loads, two
+  inside the entry loop, so a swap mid-listing could return entries from one version with
+  attributes from another — and `ReadDirPlus` registers those with the kernel, which caches
+  them) and `StatFs` (two loads, so `df` could disagree with itself). Every FUSE op now takes
+  exactly one.
+
+### Added
+
+- **M17-D: a seam stress harness that verifies BYTES, not counts**
+  ([#219](https://github.com/scttfrdmn/lith/issues/219)). Every concurrency test in the
+  blockstore checked counts, states, or the absence of a panic; none checked that a concurrent
+  reader got the right bytes — which is the only way the failures #219 targets are visible.
+
+  The object's byte at offset *i* is a fixed function of *i*, so a read served from the wrong
+  offset, a zero-filled extent, or a boundary assembled from two fills is detectable, and the
+  failure message reports which offset the data actually came from and whether the shift is a
+  whole chunk, an extent, or neither.
+
+  The first seam — extent fills and whole-chunk fills racing on the same chunk, with a tier a
+  third of the object so eviction runs concurrently with the fills — is **clean**: 48 workers ×
+  400 iterations under `-race`, 1538 GETs, every byte verified. A clean run is a passing result.
+  The second seam found the `Open` tear above.
+
+
 ## [1.4.0] - 2026-10-04
 
 ### Added
