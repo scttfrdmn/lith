@@ -28,6 +28,7 @@ import (
 type serveFlags struct {
 	noRegionCheck    bool
 	prefetchPressure float64
+	wireTTFB         bool
 	listen           string
 	indexFile        string
 	cargoship        string
@@ -90,6 +91,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
+	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds, first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (diagnostic, #350)")
 	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment exceeds this fraction of --mem-cache; 0 disables (experimental, #313)")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region (#362)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between fill ranges merged into one GET; 0 = derive from NIC × TTFB (#124)")
@@ -121,9 +123,17 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		}
 	}
 
+	var wireMet **metrics.Metrics
+	var wireTrace s3client.WireTraceFunc
+	if f.wireTTFB {
+		holder := new(*metrics.Metrics)
+		wireMet = holder
+		wireTrace = func(wire, _ time.Duration) { (*holder).S3WireTTFB(wire) }
+	}
 	client, err := newS3Client(ctx, s3client.Config{
 		Bucket: bucket, Region: f.region, NoSignRequest: f.noSign, RequesterPays: f.reqPays,
 		Endpoint: f.endpoint, PathStyle: f.pathStyle, Concurrency: f.s3Concurrency,
+		WireTrace: wireTrace,
 	})
 	if err != nil {
 		return err
@@ -139,6 +149,9 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	// probing /readyz during a slow index load sees 503 (with a reason) and flips to
 	// 200 only once the gateway is actually serving.
 	ready := newReadiness("starting: loading index")
+	if wireMet != nil {
+		defer func() { *wireMet = met }()
+	}
 	if f.metrics != "" {
 		met = metrics.New()
 		msrv := &http.Server{Addr: f.metrics, Handler: newMetricsMux(met, ready), ReadHeaderTimeout: 5 * time.Second}

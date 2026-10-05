@@ -40,6 +40,11 @@ type Config struct {
 	// Used only by diagnostic tooling (e.g. lith-s3bench / bench instrumentation)
 	// to count HTTP attempts by status code; nil in production.
 	TransportWrap func(http.RoundTripper) http.RoundTripper
+	// WireTrace, when non-nil, reports per-attempt FIRST-BYTE latency as the transport
+	// sees it (lith#350). Like TransportWrap it routes through the plain-*http.Client
+	// path, because the SDK's BuildableClient exposes no RoundTripper hook -- so this is
+	// a diagnostic, not something to switch on by default.
+	WireTrace WireTraceFunc
 }
 
 // Client is the aws-sdk-go-v2 implementation of API with a transport tuned
@@ -116,13 +121,26 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 
+	// Compose the two wrappers so --metrics' wire split and the bench status wrapper can
+	// coexist; either alone selects the plain-client path.
+	wrap := cfg.TransportWrap
+	if cfg.WireTrace != nil {
+		inner := wrap
+		wrap = func(rt http.RoundTripper) http.RoundTripper {
+			if inner != nil {
+				rt = inner(rt)
+			}
+			return NewWireTracer(rt, cfg.WireTrace)
+		}
+	}
+
 	var httpClient config.HTTPClient
-	if cfg.TransportWrap != nil {
+	if wrap != nil {
 		// Diagnostic path: build the tuned transport, wrap its RoundTripper, and
 		// hand it over as a plain *http.Client so every HTTP attempt is observed.
 		t := &http.Transport{}
 		TuneTransport(t, cfg.Concurrency)
-		httpClient = &http.Client{Transport: cfg.TransportWrap(t)}
+		httpClient = &http.Client{Transport: wrap(t)}
 	} else {
 		httpClient = awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
 			TuneTransport(t, cfg.Concurrency)
