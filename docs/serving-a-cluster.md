@@ -59,6 +59,21 @@ with N and the working set. The gateway's own read path is concurrent and has
 **no FUSE hop** — a single stream reads *faster* than a FUSE mount (1,463 MB/s
 loopback) — but aggregate cold throughput is still bounded by the one NIC.
 
+### Several mounts on one host: `--mem-cache` is per-daemon
+
+`--mem-cache` defaults to **25 % of system RAM for each mount**, so mounts on one host add
+up rather than sharing. A node serving five prefix-scoped mounts — one per input collection,
+which is the normal shape for a model run — defaults to a **125 % cap on the box**. On a
+30 GB head node where the application itself wanted 27 GB, that forced the operator to bound
+every mount explicitly; on a 768 GB compute node the default would reserve 192 GB apiece
+([#242](https://github.com/scttfrdmn/lith/issues/242)).
+
+Nothing is wrong with 25 % for a single mount. **If you run more than one on a host, set
+`--mem-cache` explicitly so the mounts sum to a sane fraction** — and remember it bounds the
+*tier*, not the process: the footprint is the tier plus outstanding prefetch
+([#314](https://github.com/scttfrdmn/lith/issues/314)), so leave headroom for both. There is
+no cross-daemon awareness; each mount sizes itself in ignorance of the others.
+
 ### Concurrency under high GETATTR rate (fixed, [#244](https://github.com/scttfrdmn/lith/issues/244))
 
 Through v1.1.1 a shared gateway could return `NFS3ERR_STALE` on GETATTR under

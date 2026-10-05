@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"strings"
@@ -29,6 +30,42 @@ type roFS struct {
 	ctx    context.Context
 	mu     sync.Mutex
 	states map[string]*seqState
+
+	// Lookup-miss breadcrumb (#240), the gateway half. The FUSE path has logged this
+	// since the GCHP integration run; the gateway did not, and it is the other consumer
+	// of the same index -- the same "second reader with its own path" gap that produced
+	// #343 and #346. A prefix-scoped export can be silently short one key, and the
+	// gateway is the component that knows it.
+	missMu   sync.Mutex
+	missSeen map[string]struct{}
+}
+
+// gatewayMissLogCap bounds the distinct missing paths logged, so a probe-heavy client
+// cannot flood the log or grow the dedup map without bound. Matches the FUSE cap.
+const gatewayMissLogCap = 1024
+
+// logMiss records, at INFO and once per distinct path, that a lookup resolved to a path
+// this export's index does not have. "The client asked me for X and I do not have it" is
+// the single most useful thing a prefix-scoped read-only filesystem can say: on the
+// reporting workload one missing date-pinned file surfaced 9 s into init as a Fortran
+// "file not found" from deep in application code, with nothing in the lith log, and cost
+// a 20-minute hunt for a one-line cause.
+func (f *roFS) logMiss(vpath string) {
+	f.missMu.Lock()
+	if f.missSeen == nil {
+		f.missSeen = make(map[string]struct{})
+	}
+	if _, seen := f.missSeen[vpath]; seen || len(f.missSeen) >= gatewayMissLogCap {
+		f.missMu.Unlock()
+		return
+	}
+	f.missSeen[vpath] = struct{}{}
+	f.missMu.Unlock()
+	log := f.cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("nfs: lookup miss — path not under this export's index", "path", vpath)
 }
 
 // seqState tracks one file's sequential-read cursor and readahead frontier. It
@@ -134,6 +171,7 @@ func (f *roFS) Stat(filename string) (os.FileInfo, error) {
 	vp := norm(filename)
 	fi, err := f.cfg.Index.Stat(vp)
 	if err != nil {
+		f.logMiss(vp)
 		return nil, os.ErrNotExist
 	}
 	return &roInfo{name: path.Base(vp), fi: fi}, nil
@@ -150,6 +188,9 @@ func (f *roFS) OpenFile(filename string, flag int, _ os.FileMode) (billy.File, e
 	vp := norm(filename)
 	fi, err := f.cfg.Index.Stat(vp)
 	if err != nil || fi.IsDir {
+		if err != nil {
+			f.logMiss(vp)
+		}
 		return nil, os.ErrNotExist
 	}
 	k, origin, space, err := f.backing(vp, fi.Size)
