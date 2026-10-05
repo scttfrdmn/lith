@@ -7,54 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **The exported first-byte latency included lith's own metrics work.** `recordTTFB` was
-  called *after* the `S3Get`/`EndInflight` recorder callbacks, so the cost of resolving a
-  labelled child (`WithLabelValues` takes a lock and hashes the label set) sat inside the
-  timed interval. Almost certainly small — not the ~70 ms
-  [#350](https://github.com/scttfrdmn/lith/issues/350) is about — but it is a contaminant in
-  a quantity #340, #349 and #350 all turn on, and two issues' worth of external measurement
-  should not be compared against a figure with our own bookkeeping folded in. The project
-  learned this once already: #322 moved the per-read prefetch counters off `WithLabelValues`
-  onto atomic adds for the same reason.
-
-  Also fixed a flaky assertion of my own in the #313 pressure-gate test: it asserted the gate
-  *halves* peak pressure, which held in isolation (8.000 → 0.562) and failed in the full-tree
-  run at 8.000 → 4.750. How much the gate buys depends on how dispatches interleave with
-  consumption, and running the whole suite in parallel changes that. A reduction is the
-  property; its size is scheduling.
-
-### Changed
-
-- **The evidence gate now decides from the REGION PAIR, not from measured latency**
-  ([#349](https://github.com/scttfrdmn/lith/issues/349)). It engages when the bucket is in the
-  same region as the process, and not otherwise. One IMDS lookup, no extra S3 call — the
-  client resolves the bucket's region in order to sign at all — so the gate's state is a
-  function of **configuration**, identical on every read of a mount's life.
-
-  **First-byte latency was the wrong input, not a bound that was wrong by a factor.** The
-  8-sample median reads ~28 ms idle in-region and **~100 ms during the mount's own prefetch
-  burst**, above both the old 50 ms bound and the 58.6 ms cross-region round trip its far side
-  was anchored on. Worse, it is downstream of the decision: gate off → unbounded window →
-  deeper burst → higher latency → gate stays off. Measured externally, the same workload came
-  out at **9.1×, 5.1× and 1.05× over-fetch on three identical cells**, with the ratio gauge
-  reading on for 50–81% of ticks depending on the run. A load-invariant floor (p10 over 256
-  fills) was built to escape that and inherits it one burst later, rising 18 → 74 ms within
-  0.5 s of the gate turning off. Any statistic of lith's own fills has that shape.
-
-  **What the region pair encodes is a measured split.** In-region, forcing the gate on took
-  six concurrent slice readers from 3281 / 1827 / 375 MB to **358.6 MB in 3/3 (r = 1.00) with
-  no wall-clock cost**. Cross-region it cost **r = 1.96 with zero overlap** (min forced 15.80 s
-  > max off 12.07 s, n = 4, p = 1/70) on a fast whole-object reader — so it cannot simply
-  default on everywhere, and the split is real.
-
-  When neither region can be determined the gate is **off**: off-EC2, IMDS blocked, or a
-  custom `--endpoint`. That is correct in every case measured — off-EC2 is far, non-AWS
-  endpoints cost 1.6–2.8× at every ratio tested. An on-prem MinIO is near and loses the
-  saving; `--readahead-evidence-ratio 4` is for that. `--readahead-evidence-ratio` still wins
-  in both directions, and the TTFB series stay as **diagnostics**: they describe an endpoint
-  well and were not able to decide this.
+## [1.7.0] - 2026-10-05
 
 ### Added
 
@@ -91,7 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quantity, unbounded above by design) and `lith_prefetch_pressure_held_total` (whether the
   gate is actually firing — zero means "off" *or* "never needed", which are different states).
 
-### Added
 
 - **A cross-region mount now says so** ([#362](https://github.com/scttfrdmn/lith/issues/362)).
   lith had both regions in hand — the client resolves the bucket's region in order to sign
@@ -112,7 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the region it had already resolved, so the check costs one IMDS lookup and **no extra S3
   call**.
 
-### Added
 
 - **The NFS gateway logs a lookup miss, with the path**
   ([#240](https://github.com/scttfrdmn/lith/issues/240)). The FUSE path has logged this since
@@ -134,7 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the normal shape for a model run — default to a **125 % cap on the box**, and on a 768 GB
   compute node the default would reserve 192 GB apiece. There is no cross-daemon awareness.
 
-### Added
 
 - **`lith-s3bench` reports FIRST-BYTE latency, not only full-request latency**
   ([#350](https://github.com/scttfrdmn/lith/issues/350)). Its `p50`/`p99` were timed to after
@@ -143,6 +93,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlockStore.recordTTFB` uses (immediately after the GET returns, before any body read), so
   the two are the same quantity, and reported as p10/p50/p90/p99 plus the fractions at or
   under 25 / 50 / 60 ms — the bounds the evidence policy's input is scored against externally.
+
+### Changed
+
+- **The evidence gate now decides from the REGION PAIR, not from measured latency**
+  ([#349](https://github.com/scttfrdmn/lith/issues/349)). It engages when the bucket is in the
+  same region as the process, and not otherwise. One IMDS lookup, no extra S3 call — the
+  client resolves the bucket's region in order to sign at all — so the gate's state is a
+  function of **configuration**, identical on every read of a mount's life.
+
+  **First-byte latency was the wrong input, not a bound that was wrong by a factor.** The
+  8-sample median reads ~28 ms idle in-region and **~100 ms during the mount's own prefetch
+  burst**, above both the old 50 ms bound and the 58.6 ms cross-region round trip its far side
+  was anchored on. Worse, it is downstream of the decision: gate off → unbounded window →
+  deeper burst → higher latency → gate stays off. Measured externally, the same workload came
+  out at **9.1×, 5.1× and 1.05× over-fetch on three identical cells**, with the ratio gauge
+  reading on for 50–81% of ticks depending on the run. A load-invariant floor (p10 over 256
+  fills) was built to escape that and inherits it one burst later, rising 18 → 74 ms within
+  0.5 s of the gate turning off. Any statistic of lith's own fills has that shape.
+
+  **What the region pair encodes is a measured split.** In-region, forcing the gate on took
+  six concurrent slice readers from 3281 / 1827 / 375 MB to **358.6 MB in 3/3 (r = 1.00) with
+  no wall-clock cost**. Cross-region it cost **r = 1.96 with zero overlap** (min forced 15.80 s
+  > max off 12.07 s, n = 4, p = 1/70) on a fast whole-object reader — so it cannot simply
+  default on everywhere, and the split is real.
+
+  When neither region can be determined the gate is **off**: off-EC2, IMDS blocked, or a
+  custom `--endpoint`. That is correct in every case measured — off-EC2 is far, non-AWS
+  endpoints cost 1.6–2.8× at every ratio tested. An on-prem MinIO is near and loses the
+  saving; `--readahead-evidence-ratio 4` is for that. `--readahead-evidence-ratio` still wins
+  in both directions, and the TTFB series stay as **diagnostics**: they describe an endpoint
+  well and were not able to decide this.
+
+### Fixed
+
+- **The exported first-byte latency included lith's own metrics work.** `recordTTFB` was
+  called *after* the `S3Get`/`EndInflight` recorder callbacks, so the cost of resolving a
+  labelled child (`WithLabelValues` takes a lock and hashes the label set) sat inside the
+  timed interval. Almost certainly small — not the ~70 ms
+  [#350](https://github.com/scttfrdmn/lith/issues/350) is about — but it is a contaminant in
+  a quantity #340, #349 and #350 all turn on, and two issues' worth of external measurement
+  should not be compared against a figure with our own bookkeeping folded in. The project
+  learned this once already: #322 moved the per-read prefetch counters off `WithLabelValues`
+  onto atomic adds for the same reason.
+
+  Also fixed a flaky assertion of my own in the #313 pressure-gate test: it asserted the gate
+  *halves* peak pressure, which held in isolation (8.000 → 0.562) and failed in the full-tree
+  run at 8.000 → 4.750. How much the gate buys depends on how dispatches interleave with
+  consumption, and running the whole suite in parallel changes that. A reduction is the
+  property; its size is scheduling.
 
 ## [1.6.0] - 2026-10-04
 
@@ -2486,7 +2485,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/scttfrdmn/lith/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/scttfrdmn/lith/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/scttfrdmn/lith/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/scttfrdmn/lith/compare/v1.3.0...v1.4.0
