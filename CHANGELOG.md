@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-05
+
 ### Added
 
 - **Docs: a multi-TB object probed randomly at small record size is not a lith workload**
@@ -27,20 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   belongs to an application that can batch; a page fault exposes exactly one offset, which is
   why `kraken2 --memory-mapping` and the `bwa`/`samtools` mmap paths cannot use it.
 
-### Changed
-
-- **`docs/knobs.md`: what #368 was worth to the start transient, measured on a fat NIC.**
-  The evidence gate defaulting on in-region bounds each handle's window by *its own consumed
-  bytes* — the quantity the prefetch divisor lags — so the start transient is bounded before
-  the population count catches up. On a `c8gn.48xlarge` the two cells that used to collapse
-  went from **19.6k and 25.5k unread evictions to zero, and 5.4× and 6.3× faster** (430 s →
-  81.7 s, 265 s → 41.3 s). Forcing the gate off restores the collapse exactly (3033 evictions,
-  spread 3.94, committed 1.40 × tier), which is how the attribution was confirmed.
-
-  So `--prefetch-pressure-max` is for mounts where the gate is **off**: cross-region, or
-  region-unknown ([#313](https://github.com/scttfrdmn/lith/issues/313)).
-
-### Added
 
 - **`--wire-ttfb`: first-byte latency as the HTTP transport sees it**
   ([#350](https://github.com/scttfrdmn/lith/issues/350)). A diagnostic, exporting
@@ -61,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that would otherwise show up as one slow fill and nothing else. It forces the plain
   `*http.Client` path, because the SDK's `BuildableClient` exposes no `RoundTripper` hook, so
   it is opt-in rather than a default.
+
+### Changed
+
+- **`docs/knobs.md`: what #368 was worth to the start transient, measured on a fat NIC.**
+  The evidence gate defaulting on in-region bounds each handle's window by *its own consumed
+  bytes* — the quantity the prefetch divisor lags — so the start transient is bounded before
+  the population count catches up. On a `c8gn.48xlarge` the two cells that used to collapse
+  went from **19.6k and 25.5k unread evictions to zero, and 5.4× and 6.3× faster** (430 s →
+  81.7 s, 265 s → 41.3 s). Forcing the gate off restores the collapse exactly (3033 evictions,
+  spread 3.94, committed 1.40 × tier), which is how the attribution was confirmed.
+
+  So `--prefetch-pressure-max` is for mounts where the gate is **off**: cross-region, or
+  region-unknown ([#313](https://github.com/scttfrdmn/lith/issues/313)).
 
 ## [1.7.0] - 2026-10-05
 
@@ -2540,7 +2541,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/scttfrdmn/lith/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/scttfrdmn/lith/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/scttfrdmn/lith/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/scttfrdmn/lith/compare/v1.4.0...v1.5.0
