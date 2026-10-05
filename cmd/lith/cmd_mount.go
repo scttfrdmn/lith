@@ -103,7 +103,7 @@ func newMountCmd() *cobra.Command {
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.Int64Var(&f.maxReadahead, "max-readahead", 0, "max sequential readahead window in blocks (0 = 1.5x the bandwidth-delay product, inflight-bytes/block; the 1.5x is empirical, measured on c8gd.16xlarge). An UPPER BOUND, not the window: the mount divides --prefetch-budget/--block-size across the handles being read sequentially and caps the result by this, and it warns at startup when this is not what binds (#297). Idle open descriptors do not shrink it (#301); other concurrent READERS do")
 	fl.Float64Var(&f.coverageMin, "prefetch-coverage-min", 0, "EXPERIMENTAL (#316): override the #221 coverage threshold. A handle establishes readahead only when its trailing 16 reads cover at least this fraction of their own byte span; below it the handle is held provisional and prefetches NOTHING. The default 0.5 comes from one characterization (streams >= 0.89, scattered walks <= 0.07) and does not account for concurrent readers of ONE object: the shared kernel page cache serves each handle's siblings' reads, so a handle advancing in order sees coverage near 1/N and never establishes -- 243x slower at 16 readers, with byte amplification of 1.001. Lowering this admits those handles at the cost of also admitting genuinely scattered walks, which over-fetch (4.76x measured on a FITS cutout). 0 uses the default")
-	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (#256/#284). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that wants a slice of a large object never earns it, and stops fetching the whole thing. 0 (default) DECIDES FROM MEASURED first-byte latency: ratio 4 once the endpoint's rolling median TTFB is at or under 50 ms, off above that and off until a fill has measured it. That bound is a FIRST-BYTE latency, not a round trip -- in-region TTFB is ~28 ms against an RTT of ~2 ms, and v1.4.0 shipped the bound in the wrong unit so it never engaged (#340). Read lith_ttfb_median_seconds (with lith_ttfb_measured) to see which side a mount is on, and the lith_ttfb_seconds histogram for the spread. Negative forces it off. Measured: a single process reading one variable of a NetCDF-4 file goes from 54x over-fetch to 2.65x; the cost is a fixed ~0.07-0.18 s on a fast consumer reading most of an object (r = 1.05-1.21 in-region), and +135% at 58.6 ms, which is why it is latency-gated")
+	fl.Float64Var(&f.readaheadEvidence, "readahead-evidence-ratio", 0, "bound a committed readahead window to this multiple of the bytes a handle has actually read, so one block of contiguous evidence cannot buy the full NIC-sized window (#256/#284). A sequential copy earns the full window once it has consumed max-readahead*block-size/ratio; a reader that wants a slice of a large object never earns it, and stops fetching the whole thing. 0 (default) DECIDES FROM THE REGION PAIR: ratio 4 when the bucket is in this instance's region, off when it is not, and off when neither can be determined (off EC2, IMDS blocked, or a custom --endpoint). That is one IMDS lookup and no extra S3 call, and it makes the gate's state a function of configuration -- the earlier latency-derived policy was load-sensitive and produced 9.1x, 5.1x and 1.05x over-fetch on three identical cells (#349). Negative forces it off. Measured: one process reading one variable of a NetCDF-4 file goes from 54x over-fetch to 2.65x and six concurrently from 5-9x to 1.00x, both free in-region; cross-region it costs 1.96x wall on a fast whole-object reader, which is why it is region-gated")
 	fl.StringVar(&f.pfTrace, "pf-trace", "", "DIAGNOSTIC (#262): write one CSV row per read describing what the access-pattern detector saw and decided (fh,pid,key,off,len,blk,gap,path,state_before,state_after,window,dispatched,peak_window), with a header line recording the config that produced it. Group by `fh` — one prefetcher is built per open, so that is the unit that makes decisions. `path` says which read path served the row (window|parts|footer), so reads the prefetcher did not drive are marked rather than dropped. Unbounded, and serialized under one mutex. Measured cost at 48 MPI ranks over ~60k traced reads: +0.5-1.6% wall, so the lock is negligible below ~10^5 reads/run; size the trace file for one row per read")
 	fl.Float64Var(&f.nicGbps, "nic-gbps", 0, "override the detected NIC bandwidth in Gbps (sizes --inflight-bytes and the readahead window); 0 = detect via ethtool, then EC2 DescribeInstanceTypes baseline, then a fixed fallback")
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
@@ -242,6 +242,14 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// chasing a ~70-96x slowdown as a performance bug. Non-fatal: a cross-region mount is
 	// legitimate, it just must not be accidental.
 	warnCrossRegion(ctx, log, client, bucket, f.noRegionCheck)
+
+	// The evidence gate's input (#349): resolved once, here, and never from a measurement.
+	// It decides whether the #284 over-fetch gate engages -- in-region it took six
+	// concurrent slice readers from 5-9x over-fetch to 1.00x at no wall-clock cost, and
+	// cross-region it costs a measured 1.96x on a fast whole-object reader, so the two
+	// cases genuinely differ and the region pair is what distinguishes them.
+	nearRegion, regionKnown := regionPair(ctx, client)
+	log.Info("evidence gate input", "same_region", nearRegion, "region_known", regionKnown)
 
 	var (
 		ix       *index.Index
@@ -481,6 +489,8 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		DisableFooterTier2:     !f.footerTier2,
 		MaxReadahead:           f.maxReadahead,
 		ReadaheadEvidenceRatio: f.readaheadEvidence,
+		NearRegion:             nearRegion,
+		RegionKnown:            regionKnown,
 		CoverageMin:            f.coverageMin,
 		PFTracePath:            f.pfTrace,
 		SiblingWindow:          f.siblingWindow,

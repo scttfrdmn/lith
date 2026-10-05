@@ -82,3 +82,33 @@ type regionClient struct {
 }
 
 func (c regionClient) Region() string { return c.region }
+
+// #349: the evidence gate's input must be a function of configuration, and regionPair is
+// where that is established. known=false must never read as "near".
+func TestRegionPair(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		instance     string
+		clientRegion string
+		wantNear     bool
+		wantKnown    bool
+	}{
+		{"same region", "us-east-1", "us-east-1", true, true},
+		{"different region", "us-west-1", "us-west-2", false, true},
+		// A client with no region at all -- a custom --endpoint, or a fake. Must come back
+		// not-known, which the policy treats as not-near.
+		{"no bucket region", "us-east-1", "", false, false},
+	} {
+		near, known := regionPairFrom(tc.instance, tc.clientRegion)
+		if near != tc.wantNear || known != tc.wantKnown {
+			t.Errorf("%s: near=%v known=%v, want near=%v known=%v",
+				tc.name, near, known, tc.wantNear, tc.wantKnown)
+		}
+		// THE INVARIANT THAT MATTERS: not-known must never be near. A caller that forgot
+		// to check the second return would otherwise engage the gate at distance, which is
+		// the measured 1.96x.
+		if !known && near {
+			t.Errorf("%s: near=true with known=false", tc.name)
+		}
+	}
+}
