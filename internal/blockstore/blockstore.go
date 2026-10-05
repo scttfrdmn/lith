@@ -98,6 +98,14 @@ type Config struct {
 	// + fetched-unread), so aggregate readahead cannot thrash the memory tier
 	// (#55). <=0 defaults to 50% of MemCache.
 	PrefetchBudget int64
+	// PrefetchPressureMax gates prefetch ADMISSION on measured tier pressure: outstanding
+	// prefetch commitment as a fraction of the memory tier's capacity (#313). A dispatch
+	// arriving at or above this fraction is dropped rather than committed. 0 disables it.
+	//
+	// The rationale, the measurements and the two known risks are at the gate itself, in
+	// Prefetch -- including why this reads committed rather than resident-unread, which is
+	// the better detector and the wrong admission signal.
+	PrefetchPressureMax float64
 	// CoalesceGap, when > 0, is an explicit override of the largest gap (bytes)
 	// between two plan/demand fill ranges that FillBatch merges into one range GET
 	// (#124). When 0, the gap is derived from the device: NICBytesPerSec × TTFB,
@@ -190,8 +198,16 @@ type BlockStore struct {
 	// production at unmount, where the only cost is a panic on the way out.
 	zdecMu     sync.RWMutex
 	zdecClosed bool
-	frameCache *frameCache  // decoded CargoShip frame LRU (#137); nil when disabled
-	inflightN  atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
+
+	// Prefetch pressure gate (#313). memCap is the tier's realized capacity, resolved once
+	// at New: geometry() reports the per-shard capacity after newMemCache has reduced the
+	// shard count, so this is what the tier can actually hold rather than what was asked
+	// for. Zero when there is no tier, which disables the gate by construction -- with no
+	// tier there are no resident-unread bytes and nothing to evict before reading.
+	pfPressureMax float64
+	memCap        int64
+	frameCache    *frameCache  // decoded CargoShip frame LRU (#137); nil when disabled
+	inflightN     atomic.Int64 // chunk fetches currently in flight (maintained only when timeline != nil)
 
 	mu       sync.Mutex
 	inflight map[string]*chunkState
@@ -286,6 +302,7 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		prefetch:      make(chan struct{}, max(1, prefetchConc)),
 		budget:        newBytesBudget(cfg.InflightBytes),
 		pfBudgetBytes: pfBudgetCap,
+		pfPressureMax: cfg.PrefetchPressureMax,
 		gapOverride:   cfg.CoalesceGap,
 		nicBPS:        cfg.NICBytesPerSec,
 		prefetchConc:  prefetchConc,
@@ -294,6 +311,11 @@ func New(src Source, cfg Config) (*BlockStore, error) {
 		inflight:      make(map[string]*chunkState),
 		stale:         make(map[string]struct{}),
 		demand:        make(map[string]*demandGather),
+	}
+	// Resolve the tier's realized capacity once, for the pressure gate (#313).
+	if bs.mem != nil {
+		sh, per := bs.mem.geometry()
+		bs.memCap = int64(sh) * per
 	}
 	if r, ok := cfg.Recorder.(handleOpenRecorder); ok {
 		bs.openRec = r
@@ -866,6 +888,65 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	// So the aggregate start burst is the sum over DISTINCT streamed objects of
 	// min(window bytes, budget, objSize) -- not N x window. Measured: 8 readers on a fat NIC
 	// peaked at 29.81 GB against the 8 objects summed size of 29.95 GB, a 0.5% difference.
+	// PRESSURE GATE (#313). Drop this dispatch when outstanding prefetch commitment
+	// already exceeds what the memory tier can hold unread, because past that point a
+	// committed chunk must evict an unread one on arrival -- the eviction-before-read
+	// collapse, which externally presents as a FAIRNESS failure rather than a slowdown:
+	// 13 of 16 readers finished on schedule and 3 crawled to 106 s while their windows
+	// inflated 30 -> 32 -> 164 -> 223 behind them.
+	//
+	// WHY COMMITTED AND NOT RESIDENT-UNREAD. Resident-unread is the better DETECTOR --
+	// externally it separates clean (<= 0.838) from collapsed (>= 0.9996) with a 0.16
+	// margin where committed separated at 1.205 vs 1.207 -- and it is the wrong ADMISSION
+	// signal, which is a distinction the issue and I both missed. Two reasons, both
+	// measured locally on the ladder in pressuregate_test.go:
+	//
+	//   - It SATURATES. Resident-unread/capacity pins at 1.000 from 6 readers upward while
+	//     evictions go on rising 85 -> 135 -> 177 -> 404, so above the knee it cannot tell
+	//     a mild overcommit from a 12x one.
+	//   - It LAGS. Resident-unread only rises when a fill LANDS, so hundreds of concurrent
+	//     dispatches all read it low, all commit, and the tier overshoots regardless. A
+	//     gate reading it cut evictions 204 -> 186 (9%) and left peak pressure at 1.000 --
+	//     it did not bound the quantity it was reading. Gating on committed instead, same
+	//     fixture: 227 -> 18 evictions and peak 8.000 -> 0.562.
+	//
+	// Committed is sound for this now, and was not when the 1.205/1.207 figures were taken
+	// (#318, pre-#320). It counts from dispatch so it includes in-flight bytes, which is
+	// exactly what makes it available before the overshoot; #320's four credit-path fixes
+	// stopped it ratcheting, and it returns to EXACTLY zero at rest in all eight cells of
+	// the local ladder. The external separation figure predates those fixes and needs
+	// re-measuring before any threshold is defaulted on -- which is why this ships off.
+	//
+	// WHY NOT A STATIC WINDOW CAP, the obvious fix, which I proposed and then retracted:
+	// capping the derived max-readahead fixes the collapse in-region for free (+7.5%) and
+	// costs 2.56x on a cross-region cold read -- zero overlap, 64/64 pairs, p = 1.6e-4 --
+	// because fetchExtents issues a window's blocks in ONE call, so the window value at
+	// establishment IS the batch size and that single burst is the whole of the throughput
+	// advantage. This gate leaves the establishment burst untouched whenever the tier has
+	// room, which is the common case.
+	//
+	// Three properties this shape has and the reverted admission check (ceeb2b7 -> #309,
+	// 11x on concurrent readers) did not:
+	//
+	//   - UNIFORM ACROSS HANDLES, not prefix-shaped. The reverted check refused a handle
+	//     that could not fit a FULL window, so "2 x 223 + 14 x 0" committed the same total
+	//     as "16 x 30" and covered two readers instead of sixteen. This drops per BLOCK and
+	//     every handle's blocks meet the same condition, so the reduction lands
+	//     proportionally rather than on whoever asked last.
+	//   - SPECULATION ONLY. Demand reads do not come through Prefetch, so under pressure
+	//     lith stops guessing and keeps serving. No reader ever blocks on this.
+	//   - STABILIZING feedback, unlike the evidence gate's (#349): more prefetch raises
+	//     committed, which admits less prefetch; consumption drops it, which admits more.
+	//
+	// RISKS TO MEASURE, not resolved by argument. (1) An external cell at N=8 was CLEAN at
+	// committed/tier = 1.22, so a threshold at or below that throttles a workload that was
+	// fine -- and whether that costs wall clock is unmeasured. (2) #55's eviction preference
+	// protects unread chunks over read ones, so a reader that stalls holding unread bytes
+	// can keep committed high and suppress prefetch for everyone else.
+	if bs.pfPressureMax > 0 && bs.prefetchPressure() >= bs.pfPressureMax {
+		bs.recordPressureHeld()
+		return
+	}
 	hi := c0 - 1
 	for ci := c0; ci <= c1; ci++ {
 		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, maskForLen(chunkLenOf(ci, objSize))) {
@@ -1030,6 +1111,24 @@ func (bs *BlockStore) PrefetchUnreadResidentBytes() int64 {
 	return bs.mem.UnreadBytes()
 }
 
+// PrefetchPressure is outstanding prefetch commitment as a fraction of the memory tier's
+// realized capacity -- the quantity the pressure gate admits against (#313). 0 when there
+// is no tier.
+//
+// Unbounded above by design: a value of 8.0 means eight tiers' worth of prefetch has been
+// promised and most of it must evict something unread on arrival. That is the information
+// resident-unread cannot carry, because it saturates at 1.000. Pair the two -- this one says
+// how much was promised, PrefetchUnreadResidentBytes says how much of the tier is already
+// unreadable-and-unread.
+func (bs *BlockStore) PrefetchPressure() float64 { return bs.prefetchPressure() }
+
+func (bs *BlockStore) prefetchPressure() float64 {
+	if bs.memCap <= 0 {
+		return 0
+	}
+	return float64(bs.pfCommittedBytes.Load()) / float64(bs.memCap)
+}
+
 // creditPrefetch credits a prefetch consumed by a DEMAND read. It is a no-op on the prefetch
 // path, which is the point (#320).
 //
@@ -1179,6 +1278,24 @@ type prefetchEvictRecorder interface {
 func (bs *BlockStore) recordPrefetchEvicted() {
 	if r, ok := bs.rec.(prefetchEvictRecorder); ok {
 		r.PrefetchEvictedUnread()
+	}
+}
+
+// pressureRecorder is an optional Recorder extension: implementers are told each time the
+// pressure gate dropped a dispatch (#313).
+//
+// Load-bearing rather than hygiene. With the gate off this counter is zero and the gate is
+// also inert, so the two states look identical from outside -- and "the counter reads zero"
+// has meant "the feature is off", "the feature never fired" and "the counter was never
+// wired" at four separate points in this project's history. A deployment needs to tell a
+// mount that never came under pressure from one whose gate is suppressing every dispatch.
+type pressureRecorder interface {
+	PrefetchPressureHeld()
+}
+
+func (bs *BlockStore) recordPressureHeld() {
+	if r, ok := bs.rec.(pressureRecorder); ok {
+		r.PrefetchPressureHeld()
 	}
 }
 

@@ -30,6 +30,7 @@ type Metrics struct {
 	uncovered     prometheus.Counter
 	pfLowCoverage prometheus.Counter
 	pfCovHeld     prometheus.Counter
+	pfPressHeld   prometheus.Counter
 	ttfb          prometheus.Histogram
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
@@ -99,6 +100,10 @@ func New() *Metrics {
 		pfLowCoverage: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_low_coverage_total",
 			Help: "Reads the #221 coverage gate forced Random on a SEEK landing: a scattered walk, which is the gate working as designed. Incremented live, per read. Pair with lith_prefetch_coverage_held_total -- that one rising while this stays flat is the #316 shape (#221, #316).",
+		}),
+		pfPressHeld: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lith_prefetch_pressure_held_total",
+			Help: "Prefetch dispatches DROPPED by the pressure gate (#313). Zero means either the gate is off or it never had to fire, and those are different states -- read lith_prefetch_pressure to tell them apart. Dropping a dispatch costs nothing a reader waits on: demand reads do not go through the prefetch path, so under pressure lith stops guessing and keeps serving.",
 		}),
 		ttfb: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "lith_ttfb_seconds",
@@ -232,7 +237,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.ttfb, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -378,7 +383,7 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles,
 // Do not check these against the proxy. An estimator built from dispatch counts returns
 // the standing window by construction, so "resident ~= window x handles" is an identity
 // that will pass whether or not either number is right.
-func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident func() float64) {
+func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident, pressure func() float64) {
 	if m == nil {
 		return
 	}
@@ -394,6 +399,10 @@ func (m *Metrics) RegisterPrefetchBudget(resident, limit, unreadResident func() 
 		Name: "lith_prefetch_unread_resident_bytes",
 		Help: "Bytes HELD IN THE MEMORY TIER that nothing has read. This -- not lith_prefetch_committed_bytes -- is the quantity eviction-before-read is about: committed counts from dispatch and so includes bytes still in flight, which cannot evict anything. Compare against --mem-cache, not --prefetch-budget: the collapse condition is this approaching tier CAPACITY, at which point every arriving chunk must evict an unread one (#313).",
 	}, unreadResident))
+	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "lith_prefetch_pressure",
+		Help: "Outstanding prefetch commitment as a fraction of the MEMORY TIER's realized capacity -- the quantity --prefetch-pressure-max admits against (#313). Unbounded above by design: 8.0 means eight tiers' worth has been promised and most of it must evict something unread on arrival. Read it with lith_prefetch_unread_resident_bytes, which saturates at the tier and so cannot tell a mild overcommit from a 12x one, and with lith_prefetch_pressure_held_total, which says whether the gate is actually doing anything.",
+	}, pressure))
 }
 
 // Handler returns the Prometheus HTTP handler for this registry.
@@ -409,6 +418,14 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) PrefetchWait(d time.Duration) {
 	if m != nil {
 		m.prefetchWait.Observe(d.Seconds())
+	}
+}
+
+// PrefetchPressureHeld records one dispatch dropped by the pressure gate (#313).
+// Nil-safe; blockstore's optional pressureRecorder extension.
+func (m *Metrics) PrefetchPressureHeld() {
+	if m != nil {
+		m.pfPressHeld.Inc()
 	}
 }
 

@@ -26,30 +26,31 @@ import (
 )
 
 type serveFlags struct {
-	noRegionCheck  bool
-	listen         string
-	indexFile      string
-	cargoship      string
-	region         string
-	memCache       string
-	diskCache      string
-	diskPath       string
-	blockSize      string
-	maxRange       string
-	prefetchBudget string
-	inflightBytes  string
-	coalesceGap    string
-	s3Concurrency  int
-	prefetchConc   int
-	nicGbps        float64
-	autoIndexLimit int
-	endpoint       string
-	pathStyle      bool
-	metrics        string
-	clientIdle     time.Duration
-	noSign         bool
-	reqPays        bool
-	logLevel       string
+	noRegionCheck    bool
+	prefetchPressure float64
+	listen           string
+	indexFile        string
+	cargoship        string
+	region           string
+	memCache         string
+	diskCache        string
+	diskPath         string
+	blockSize        string
+	maxRange         string
+	prefetchBudget   string
+	inflightBytes    string
+	coalesceGap      string
+	s3Concurrency    int
+	prefetchConc     int
+	nicGbps          float64
+	autoIndexLimit   int
+	endpoint         string
+	pathStyle        bool
+	metrics          string
+	clientIdle       time.Duration
+	noSign           bool
+	reqPays          bool
+	logLevel         string
 }
 
 func newServeCmd() *cobra.Command {
@@ -89,6 +90,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
+	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment exceeds this fraction of --mem-cache; 0 disables (experimental, #313)")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region (#362)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between fill ranges merged into one GET; 0 = derive from NIC × TTFB (#124)")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
@@ -233,7 +235,8 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		DiskCache: diskCache, DiskPath: diskPath, DiskWriters: 8,
 		S3Concurrency: f.s3Concurrency, PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget: prefetchBudget, InflightBytes: inflight,
-		CoalesceGap: coalesceGap, NICBytesPerSec: nicBytesPerSec,
+		PrefetchPressureMax: f.prefetchPressure,
+		CoalesceGap:         coalesceGap, NICBytesPerSec: nicBytesPerSec,
 		Recorder: met,
 	})
 	if err != nil {

@@ -51,6 +51,7 @@ type mountFlags struct {
 	diskWriters       int
 	inflightBytes     string
 	noRegionCheck     bool
+	prefetchPressure  float64
 	metrics           string
 	pprof             string
 	timelineCSV       string
@@ -108,6 +109,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of --mem-cache (#313). 0 (default) disables it. EXPERIMENTAL and off because its threshold is not yet measured on real S3: an external cell was CLEAN at 1.22, so a value at or below that throttles a workload that was fine, and the wall-clock cost of doing so is unmeasured. What it fixes: N readers starting together each size their window for an empty mount, because the divisor counts ESTABLISHED streams and a stream is only established after several reads — 16 readers committed 12.944 GB within 6 s against a 4.128 GB budget and an 8.256 GB tier, and the cost was a FAIRNESS collapse (13 of 16 on schedule, 3 crawling to 106 s) rather than a uniform slowdown. Try ~1.0 on a fat-NIC box streaming many distinct multi-GB objects; read lith_prefetch_pressure and lith_prefetch_pressure_held_total to see whether it binds")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region. The warning is advisory and costs one IMDS lookup; silence it for a deliberately cross-region mount, or where IMDS is blocked and you do not want the attempt (#362)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101); serves only /metrics (no pprof)")
@@ -381,6 +383,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		S3Concurrency:       f.s3Concurrency,
 		PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget:      prefetchBudget,
+		PrefetchPressureMax: f.prefetchPressure,
 		CoalesceGap:         coalesceGap, // 0 → device-derived
 		NICBytesPerSec:      nicBytesPerSec,
 		TTFB:                ttfbSeed,
