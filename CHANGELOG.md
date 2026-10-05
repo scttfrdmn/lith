@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--prefetch-pressure-max`: a prefetch admission gate on measured tier pressure**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). **Experimental, off by default.**
+
+  The window divisor counts *established* streams, and a stream is only established after
+  several reads — so N readers starting together each size for an empty mount. Measured
+  externally: 16 readers committed **12.944 GB within 6 s** against a 4.128 GB budget and an
+  8.256 GB tier, and the cost was a **fairness collapse** (13 of 16 readers on schedule,
+  3 crawling to 106 s with their windows inflating 30 → 32 → 164 → 223 behind them) rather
+  than a uniform slowdown. Six other issues are blocked behind bounding this burst.
+
+  The gate drops a *dispatch* when outstanding prefetch commitment already exceeds the given
+  fraction of the tier. Three properties the reverted admission check
+  ([#309](https://github.com/scttfrdmn/lith/issues/309), 11× on concurrent readers) did not
+  have: it is **uniform across handles** rather than prefix-shaped, so the reduction lands
+  proportionally instead of on whoever asked last; it gates **speculation only**, since demand
+  reads do not pass through `Prefetch`; and its feedback is **stabilizing** rather than
+  bistable — more prefetch raises pressure, which admits less.
+
+  **It admits against committed, not resident-unread, and that was a measurement.**
+  Resident-unread is the better *detector* (it separates clean from collapsed with a 0.16
+  margin externally) and the wrong *admission* signal: it saturates at 1.000 from six readers
+  upward while evictions go on rising 85 → 135 → 177 → 404, and it only moves when a fill
+  *lands*, so concurrent dispatches all read it low and commit anyway. A gate reading it cut
+  evictions 204 → 186 and left peak pressure at 1.000 — it did not bound its own quantity.
+  Gating on committed, same fixture: **227 → 18** evictions with peak pressure **8.000 →
+  0.562**.
+
+  Off by default because the threshold is unmeasured on real S3: an external cell was **clean
+  at 1.22**, so a value at or below that throttles a workload that was fine, and the
+  wall-clock cost of doing so is unknown. New observability: `lith_prefetch_pressure` (the
+  quantity, unbounded above by design) and `lith_prefetch_pressure_held_total` (whether the
+  gate is actually firing — zero means "off" *or* "never needed", which are different states).
+
+### Added
+
 - **A cross-region mount now says so** ([#362](https://github.com/scttfrdmn/lith/issues/362)).
   lith had both regions in hand — the client resolves the bucket's region in order to sign
   requests at all — and said nothing. Reported after it cost two instances: the same TB-scale

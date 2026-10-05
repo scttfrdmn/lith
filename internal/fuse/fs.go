@@ -364,6 +364,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		func() float64 { return float64(f.store.PrefetchCommittedBytes()) },
 		func() float64 { return float64(f.store.PrefetchBudgetBytes()) },
 		func() float64 { return float64(f.store.PrefetchUnreadResidentBytes()) },
+		f.store.PrefetchPressure,
 	)
 	return f
 }

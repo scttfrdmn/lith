@@ -156,10 +156,15 @@ func TestReadaheadWindowGaugesExposeTheDivisor(t *testing.T) {
 func TestPrefetchBudgetGaugesSeparateResidentFromInFlight(t *testing.T) {
 	m := New()
 	committed, limit, unread := 13.078e9, 4.128e9, 8.0e9
+	// 13.078 GB committed against an 8.256 GB tier is the reported collapse arm: 1.58x,
+	// which is the information resident-unread cannot carry because it saturates at the
+	// tier (#313).
+	pressure := committed / 8.256e9
 	m.RegisterPrefetchBudget(
 		func() float64 { return committed },
 		func() float64 { return limit },
 		func() float64 { return unread },
+		func() float64 { return pressure },
 	)
 
 	rec := httptest.NewRecorder()
@@ -170,6 +175,9 @@ func TestPrefetchBudgetGaugesSeparateResidentFromInFlight(t *testing.T) {
 		"lith_prefetch_committed_bytes 1.3078e+10",
 		"lith_prefetch_budget_bytes 4.128e+09",
 		"lith_prefetch_unread_resident_bytes 8e+09",
+		// Unbounded above by design: the gate's threshold is set against this, and a
+		// value over 1 is the overcommit the tier cannot absorb.
+		"lith_prefetch_pressure 1.58",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("scrape missing %q", want)
