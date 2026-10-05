@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The exported first-byte latency included lith's own metrics work.** `recordTTFB` was
+  called *after* the `S3Get`/`EndInflight` recorder callbacks, so the cost of resolving a
+  labelled child (`WithLabelValues` takes a lock and hashes the label set) sat inside the
+  timed interval. Almost certainly small — not the ~70 ms
+  [#350](https://github.com/scttfrdmn/lith/issues/350) is about — but it is a contaminant in
+  a quantity #340, #349 and #350 all turn on, and two issues' worth of external measurement
+  should not be compared against a figure with our own bookkeeping folded in. The project
+  learned this once already: #322 moved the per-read prefetch counters off `WithLabelValues`
+  onto atomic adds for the same reason.
+
+  Also fixed a flaky assertion of my own in the #313 pressure-gate test: it asserted the gate
+  *halves* peak pressure, which held in isolation (8.000 → 0.562) and failed in the full-tree
+  run at 8.000 → 4.750. How much the gate buys depends on how dispatches interleave with
+  consumption, and running the whole suite in parallel changes that. A reduction is the
+  property; its size is scheduling.
+
 ### Changed
 
 - **The evidence gate now decides from the REGION PAIR, not from measured latency**

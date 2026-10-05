@@ -5,6 +5,7 @@ package blockstore
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,4 +147,58 @@ func TestEveryFillsFirstByteLatencyReachesTheRecorder(t *testing.T) {
 		t.Error("a Recorder without the extension suppressed the median too; the optional " +
 			"interface is not optional")
 	}
+}
+
+// The timed first-byte interval must not include lith's own recorder work (#350).
+//
+// recordTTFB used to be called AFTER the S3Get/EndInflight callbacks, so a Recorder's cost
+// landed inside the exported latency -- S3Get resolves a labelled child, which takes a lock
+// and hashes the label set. Small, but #340, #349 and #350 all turn on this number, and
+// external measurements should not be compared against a figure with our own bookkeeping
+// folded in.
+//
+// A slow Recorder makes the contamination unmissable: if S3Get were still inside the
+// interval, every sample would carry its delay.
+func TestTTFBExcludesRecorderWork(t *testing.T) {
+	srv := fake.New()
+	const objSize = 4 << 20
+	srv.Put("obj", make([]byte, objSize), time.Unix(1_700_000_000, 0))
+
+	const recorderCost = 25 * time.Millisecond
+	rec := &slowRec{delay: recorderCost}
+	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, Recorder: rec})
+	k := keyFor(t, srv, "obj")
+
+	if _, err := bs.GetRange(context.Background(), k, 0, 4096, objSize); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	samples, _ := rec.got()
+	if len(samples) == 0 {
+		t.Fatal("no TTFB sample recorded")
+	}
+	// The fake server answers in microseconds, so a sample at or above the recorder's
+	// delay can only mean the callback is inside the timed interval.
+	for _, d := range samples {
+		if d >= recorderCost {
+			t.Errorf("TTFB sample %v is at or above the Recorder's own %v cost: the "+
+				"callbacks are inside the timed interval", d, recorderCost)
+		}
+	}
+	// And the Recorder must still have been called -- moving the stop must not have
+	// dropped the accounting it sits next to.
+	if rec.gets.Load() == 0 {
+		t.Error("S3Get was never called; moving the TTFB stop dropped the GET accounting")
+	}
+}
+
+// slowRec is a ttfbRecorder whose S3Get is deliberately expensive.
+type slowRec struct {
+	ttfbRec
+	delay time.Duration
+	gets  atomic.Int64
+}
+
+func (r *slowRec) S3Get(n int64, isErr bool) {
+	r.gets.Add(1)
+	time.Sleep(r.delay)
 }

@@ -118,13 +118,19 @@ func TestPressureGateCutsEvictionBeforeRead(t *testing.T) {
 	}
 
 	// IT MUST BOUND THE QUANTITY IT READS. This is the assertion the resident-unread
-	// version failed, and failing it is what sent the gate to committed: a gate whose
-	// own signal keeps climbing is not admitting against anything.
+	// version failed, and failing it is what sent the gate to committed: a gate whose own
+	// signal keeps climbing is not admitting against anything.
 	//
-	// Not asserted against the threshold itself: dispatches race between the read and the
-	// commit, so the realized peak sits a little above it. Asserted as a large reduction,
-	// which a check-then-act gate on a saturating signal cannot produce.
-	if onPeak > offPeak/2 {
+	// DIRECTION, NOT MAGNITUDE, and the first version of this got that wrong. It asserted
+	// a halving, which held in isolation (8.000 -> 0.562/0.938) and FLAKED in the full-tree
+	// run at 8.000 -> 4.750, because how much the gate buys depends on how dispatches
+	// interleave with consumption and the whole suite running in parallel changes that.
+	// A reduction is the property; its size is scheduling. The magnitudes in the table
+	// above come from isolated runs and are not asserted anywhere.
+	//
+	// Still non-vacuous against the variant that sent the gate here: resident-unread gives
+	// 1.000 against 1.000, which is not a reduction.
+	if onPeak >= offPeak {
 		t.Errorf("peak pressure %.3f with the gate on against %.3f off: it is not "+
 			"bounding the quantity it admits against", onPeak, offPeak)
 	}

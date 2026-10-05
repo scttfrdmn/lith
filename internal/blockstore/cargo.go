@@ -79,10 +79,19 @@ func (bs *BlockStore) fetchReader(ctx context.Context, k Key, off, length int64)
 		bs.record(func(r Recorder) { r.StartInflight() })
 		t0 := time.Now()
 		body, etag, err := bs.src.GetRangeReader(ctx, k.Key, off, length)
-		bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
+		// TTFB IS STOPPED HERE, BEFORE THE RECORDER CALLBACKS. S3Get resolves a labelled
+		// child (WithLabelValues takes a lock and hashes the label set) and EndInflight
+		// touches a gauge; both ran INSIDE the timed interval, so the exported first-byte
+		// latency included lith's own metrics work. Almost certainly small -- not the ~70 ms
+		// that #350 is about -- but it is a contaminant in a quantity #340, #349 and #350 all
+		// turn on, and two issues' worth of external measurement should not be compared
+		// against a number with our own bookkeeping folded in. The project already learned
+		// this once: #322 moved the per-read prefetch counters off WithLabelValues onto
+		// atomic adds for the same reason.
 		if err == nil {
 			bs.recordTTFB(time.Since(t0))
 		}
+		bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
 		return body, etag, err
 	}
 	return bs.cargoFetch(ctx, k, off, length)
@@ -228,11 +237,15 @@ func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargosh
 	bs.record(func(r Recorder) { r.StartInflight() })
 	t0 := time.Now()
 	body, et, gerr := bs.src.GetRangeReader(ctx, k.Key, compStart, compLen)
+	// Stopped before the recorder callbacks, same as the plain path above: their cost is
+	// lith's, not the endpoint's.
+	if gerr == nil {
+		bs.recordTTFB(time.Since(t0))
+	}
 	bs.record(func(r Recorder) { r.S3Get(compLen, gerr != nil); r.EndInflight() })
 	if gerr != nil {
 		return "", 0, gerr
 	}
-	bs.recordTTFB(time.Since(t0))
 	comp, rerr := io.ReadAll(body)
 	_ = body.Close()
 	if rerr != nil {
