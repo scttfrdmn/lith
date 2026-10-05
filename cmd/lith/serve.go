@@ -26,6 +26,7 @@ import (
 )
 
 type serveFlags struct {
+	noRegionCheck  bool
 	listen         string
 	indexFile      string
 	cargoship      string
@@ -88,6 +89,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
+	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region (#362)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between fill ranges merged into one GET; 0 = derive from NIC × TTFB (#124)")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
 	fl.IntVar(&f.prefetchConc, "prefetch-concurrency", 0, "max concurrent prefetch fills (0 = --s3-concurrency)")
@@ -124,6 +126,11 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if err != nil {
 		return err
 	}
+
+	// Cross-region warning (#362), on the gateway too. The export reads S3 exactly as a
+	// mount does, and a gateway is MORE exposed: every client's bytes cross the same link,
+	// so an accidental cross-region export multiplies the cost for all of them at once.
+	warnCrossRegion(ctx, log, client, bucket, f.noRegionCheck)
 
 	var met *metrics.Metrics
 	// Start the metrics + health server BEFORE loading the index, so an orchestrator

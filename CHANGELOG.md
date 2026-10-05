@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A cross-region mount now says so** ([#362](https://github.com/scttfrdmn/lith/issues/362)).
+  lith had both regions in hand — the client resolves the bucket's region in order to sign
+  requests at all — and said nothing. Reported after it cost two instances: the same TB-scale
+  sequential read ran at **1.52 MiB/s cross-region against 107–146 MB/s in-region** (~70–96×),
+  and the only symptom was slowness, which is indistinguishable from every other cause.
+
+  It compounds with lith's worst case rather than its average one: a scattered random-fault
+  stream already pays one round trip per miss ([#232](https://github.com/scttfrdmn/lith/issues/232),
+  where lith has no lever), so crossing regions multiplies the cost of exactly the pattern
+  lith is already weakest at.
+
+  Warned at mount **and on `serve nfs`** — a gateway is more exposed, not less, since every
+  client's bytes cross the same link. Non-fatal: a cross-region mount is legitimate, it just
+  must not be accidental. `--no-region-check` silences it. Silent when either region is
+  unknown (IMDS blocked, or a custom `--endpoint` with no AWS region), because a warning that
+  fires on "could not determine" is noise. `s3client.Client` grew a `Region()` accessor for
+  the region it had already resolved, so the check costs one IMDS lookup and **no extra S3
+  call**.
+
+### Added
+
 - **The NFS gateway logs a lookup miss, with the path**
   ([#240](https://github.com/scttfrdmn/lith/issues/240)). The FUSE path has logged this since
   the GCHP integration run; the gateway reads the same index through its own code path and

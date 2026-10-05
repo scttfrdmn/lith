@@ -50,6 +50,7 @@ type mountFlags struct {
 	siblingRead       int
 	diskWriters       int
 	inflightBytes     string
+	noRegionCheck     bool
 	metrics           string
 	pprof             string
 	timelineCSV       string
@@ -107,6 +108,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region. The warning is advisory and costs one IMDS lookup; silence it for a deliberately cross-region mount, or where IMDS is blocked and you do not want the attempt (#362)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101); serves only /metrics (no pprof)")
 	fl.StringVar(&f.pprof, "pprof", "", "serve net/http/pprof debug handlers on this address (e.g. 127.0.0.1:6060); off by default. SECURITY: exposes argv and an on-demand CPU/goroutine profiling DoS — bind to localhost and never expose to untrusted networks")
@@ -232,6 +234,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if err != nil {
 		return err
 	}
+
+	// Cross-region mount warning (#362). lith has both regions in hand -- the client
+	// resolved the bucket's to sign at all -- and said nothing, so two instances went into
+	// chasing a ~70-96x slowdown as a performance bug. Non-fatal: a cross-region mount is
+	// legitimate, it just must not be accidental.
+	warnCrossRegion(ctx, log, client, bucket, f.noRegionCheck)
 
 	var (
 		ix       *index.Index
