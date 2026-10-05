@@ -48,9 +48,20 @@ type Client struct {
 	s3            *s3.Client
 	bucket        string
 	requesterPays bool
+	// region is the region this client signs for: either the configured one or the
+	// bucket's, resolved in New. Kept so callers can read it WITHOUT a second
+	// GetBucketRegion -- New already paid for that lookup (lith#362).
+	region string
 }
 
 var _ API = (*Client)(nil)
+
+// Region returns the region this client signs for -- the bucket's region, unless a region
+// or a custom endpoint was configured. Empty only if neither was determined.
+//
+// Exposed as an optional method rather than on the API interface so the test fakes and any
+// other implementer need not change; callers type-assert for it.
+func (c *Client) Region() string { return c.region }
 
 // TuneTransport configures t for many concurrent range GETs against S3: a
 // large connection pool, keep-alives, and HTTP/1.1 (S3 does not benefit from
@@ -175,6 +186,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		s3:            s3.NewFromConfig(awsCfg, s3Opts),
 		bucket:        cfg.Bucket,
 		requesterPays: cfg.RequesterPays,
+		region:        awsCfg.Region,
 	}, nil
 }
 
