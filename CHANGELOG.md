@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docs: a multi-TB object probed randomly at small record size is not a lith workload**
+  ([#366](https://github.com/scttfrdmn/lith/issues/366),
+  [#362](https://github.com/scttfrdmn/lith/issues/362)). The missing row at the TB end of
+  `copy-or-mount.md`, and a boundary entry in `scope.md`.
+
+  The trap is built out of lith's best property: `lith index build` covered a **1.206 TB**
+  kraken2 database in **~1 second** into a **728-byte** index, and that object reads
+  sequentially at **146 MB/s** — 62–86% of raw `aws s3 cp`. The same object probed at random
+  4 KiB manages **7.1 probes/s, 141 ms each**. Nothing about mounting distinguishes the two
+  until you measure throughput.
+
+  Recorded with the numbers that make it actionable rather than just a warning: the mount adds
+  **no overhead** doing it (7.9 probes/s against raw S3's 6.9/s at depth 1), and of the 685×
+  gap to local NVMe, **~100× is concurrency and only ~6.9× is genuine storage advantage** —
+  the same offsets at queue depth 64 ran 68× faster with per-request latency flat. That lever
+  belongs to an application that can batch; a page fault exposes exactly one offset, which is
+  why `kraken2 --memory-mapping` and the `bwa`/`samtools` mmap paths cannot use it.
+
+### Changed
+
+- **`docs/knobs.md`: what #368 was worth to the start transient, measured on a fat NIC.**
+  The evidence gate defaulting on in-region bounds each handle's window by *its own consumed
+  bytes* — the quantity the prefetch divisor lags — so the start transient is bounded before
+  the population count catches up. On a `c8gn.48xlarge` the two cells that used to collapse
+  went from **19.6k and 25.5k unread evictions to zero, and 5.4× and 6.3× faster** (430 s →
+  81.7 s, 265 s → 41.3 s). Forcing the gate off restores the collapse exactly (3033 evictions,
+  spread 3.94, committed 1.40 × tier), which is how the attribution was confirmed.
+
+  So `--prefetch-pressure-max` is for mounts where the gate is **off**: cross-region, or
+  region-unknown ([#313](https://github.com/scttfrdmn/lith/issues/313)).
+
+### Added
+
 - **`--wire-ttfb`: first-byte latency as the HTTP transport sees it**
   ([#350](https://github.com/scttfrdmn/lith/issues/350)). A diagnostic, exporting
   `lith_s3_wire_ttfb_seconds` from `httptrace.GotFirstResponseByte` alongside

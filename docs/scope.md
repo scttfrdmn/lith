@@ -84,6 +84,16 @@ Better to read this here than discover it mid-project.
   lith gives you an error, never silently stale bytes — and you rebuild or
   `lith index refresh`. lith does not expose S3 object versions or mount a
   bucket as of a past time.
+- **A multi-TB object probed randomly at small record size.** An mmap'd hash
+  table or large reference index pays one S3 round trip per page fault, and lith
+  has no lever on that — a page fault exposes exactly one offset, so there is
+  nothing to batch from underneath ([#232](https://github.com/scttfrdmn/lith/issues/232),
+  [#366](https://github.com/scttfrdmn/lith/issues/366)). Measured in-region on a
+  1.206 TB database: **146 MB/s sequential, 7.1 random 4 KiB probes per second.**
+  The mount adds no overhead doing it — raw S3 at depth 1 manages 6.9/s — but
+  7 probes/s is not a workload. The index is still ~1 second and 728 bytes,
+  which is the trap: **nothing about mounting distinguishes this from the cases
+  lith is excellent at.** See [copy or mount?](copy-or-mount.md).
 - **Linux only**, for releases. lith relies on FUSE; there are no macOS or
   Windows builds.
 - **The gateway is a funnel.** [`lith serve nfs`](serving-a-cluster.md) shares
