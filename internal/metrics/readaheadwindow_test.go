@@ -323,3 +323,52 @@ func TestTTFBHistogramExposesTheDistributionNotJustTheMedian(t *testing.T) {
 		t.Error("a zero or negative latency was observed as a sample")
 	}
 }
+
+// #350: the wire histogram must be LABELLED by connection reuse, because that label is the
+// hypothesis under test — a fresh mount's burst opens up to one connection per concurrent
+// fill where a steady s3bench window reuses almost all of its.
+func TestWireTTFBIsSplitByConnectionReuse(t *testing.T) {
+	m := New()
+	scrape := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	// A new connection paying dial + TLS, and a reused one that is not.
+	m.S3WireTTFB(95*time.Millisecond, 62*time.Millisecond, false)
+	m.S3WireTTFB(28*time.Millisecond, 20*time.Microsecond, true)
+
+	got := scrape()
+	for _, want := range []string{
+		`lith_s3_wire_ttfb_seconds_count{conn="new"} 1`,
+		`lith_s3_wire_ttfb_seconds_count{conn="reused"} 1`,
+		`lith_s3_conn_acquire_seconds_count{conn="new"} 1`,
+		`lith_s3_conn_acquire_seconds_count{conn="reused"} 1`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape missing %q", want)
+		}
+	}
+	// THE COMPARISON THE LABEL EXISTS FOR: the new-connection sample above the 50 ms bound
+	// and the reused one below it. If both landed in one series there would be nothing to
+	// compare, which is the state before this change.
+	if !strings.Contains(got, `lith_s3_wire_ttfb_seconds_bucket{conn="new",le="0.05"} 0`) {
+		t.Error("the 95ms new-connection sample is not above the 50ms bucket")
+	}
+	if !strings.Contains(got, `lith_s3_wire_ttfb_seconds_bucket{conn="reused",le="0.05"} 1`) {
+		t.Error("the 28ms reused sample is not inside the 50ms bucket")
+	}
+
+	// A sub-microsecond acquisition must still be OBSERVED, not dropped. A pooled
+	// connection legitimately acquires in well under a microsecond, and discarding those
+	// would make the reused arm look slower than it is -- the exact comparison at issue.
+	m.S3WireTTFB(27*time.Millisecond, 0, true)
+	if !strings.Contains(scrape(), `lith_s3_conn_acquire_seconds_count{conn="reused"} 2`) {
+		t.Error("a zero-duration acquisition was dropped; the reused arm would read slow")
+	}
+
+	var nilM *Metrics
+	nilM.S3WireTTFB(time.Millisecond, time.Millisecond, true)
+}

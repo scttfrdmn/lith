@@ -3,6 +3,7 @@
 package s3client
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -27,10 +28,10 @@ func TestWireTracerReportsFirstByteFromTheWire(t *testing.T) {
 	defer srv.Close()
 
 	var mu sync.Mutex
-	var wire, rt time.Duration
-	cl := &http.Client{Transport: NewWireTracer(http.DefaultTransport, func(w, r time.Duration) {
+	var got WireSample
+	cl := &http.Client{Transport: NewWireTracer(http.DefaultTransport, func(s WireSample) {
 		mu.Lock()
-		wire, rt = w, r
+		got = s
 		mu.Unlock()
 	})}
 
@@ -41,7 +42,7 @@ func TestWireTracerReportsFirstByteFromTheWire(t *testing.T) {
 	_ = resp.Body.Close()
 
 	mu.Lock()
-	gotWire, gotRT := wire, rt
+	gotWire, gotRT := got.Wire, got.RoundTrip
 	mu.Unlock()
 
 	if gotWire < serverDelay {
@@ -89,9 +90,7 @@ func TestWireTracerIsFreeWithNoCallback(t *testing.T) {
 // latency, and counting one would drag the distribution the policy-adjacent gauges read.
 func TestWireTracerDoesNotReportOnError(t *testing.T) {
 	var calls int
-	cl := &http.Client{Transport: NewWireTracer(errRT{}, func(time.Duration, time.Duration) {
-		calls++
-	})}
+	cl := &http.Client{Transport: NewWireTracer(errRT{}, func(WireSample) { calls++ })}
 	if _, err := cl.Get("http://example.invalid/x"); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -111,4 +110,70 @@ func (errRT) RoundTrip(*http.Request) (*http.Response, error) {
 func httptraceAttached(r *http.Request) bool {
 	t := httptrace.ContextClientTrace(r.Context())
 	return t != nil && t.GotFirstResponseByte != nil
+}
+
+// #350: the connection split is the point of the instrument, so a reused connection must be
+// reported as reused and must show a near-zero acquisition time.
+//
+// The external cell that motivated this showed the wire histogram matching the fill
+// histogram to within one sample in every bucket, with equal counts -- so no retries, and
+// the delay is not above the wire. What is left is that lith's requests differ from
+// lith-s3bench's AS REQUESTS, and the leading candidate is connection reuse: a fresh mount's
+// burst opens up to one connection per concurrent fill (66 for a 153-GET burst) where a
+// 3-second s3bench window over the same 128-connection pool is almost entirely reused.
+func TestWireTracerSplitsReusedFromNewConnections(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	var mu sync.Mutex
+	var samples []WireSample
+	tr := &http.Transport{MaxIdleConnsPerHost: 4}
+	cl := &http.Client{Transport: NewWireTracer(tr, func(s WireSample) {
+		mu.Lock()
+		samples = append(samples, s)
+		mu.Unlock()
+	})}
+
+	// Three sequential requests on a pool that keeps the connection: the first opens one,
+	// the rest reuse it.
+	for range 3 {
+		resp, err := cl.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	mu.Lock()
+	got := append([]WireSample(nil), samples...)
+	mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("got %d samples, want 3", len(got))
+	}
+	if got[0].Reused {
+		t.Error("the first request on a fresh pool was reported as reusing a connection")
+	}
+	// FIXTURE PRECONDITION: without reuse the split has nothing to compare, and a
+	// transport that closed the connection each time would make this test vacuous.
+	if !got[1].Reused || !got[2].Reused {
+		t.Fatalf("fixture: requests 2 and 3 did not reuse the connection (reused=%v,%v); "+
+			"the split cannot be tested without both cases", got[1].Reused, got[2].Reused)
+	}
+	// A reused connection is acquired from the pool, so acquisition must be far below the
+	// first request's dial. This is the quantity that would show a fresh mount paying for
+	// connections its burst opened.
+	if got[1].ConnAcquire > got[0].ConnAcquire {
+		t.Errorf("a reused connection took longer to acquire (%v) than a new one (%v)",
+			got[1].ConnAcquire, got[0].ConnAcquire)
+	}
+	// Every sample must carry a wire time, reused or not -- otherwise the labelled
+	// histogram has a hole on exactly the arm being compared.
+	for i, s := range got {
+		if s.Wire <= 0 {
+			t.Errorf("sample %d (reused=%v) has no wire time", i, s.Reused)
+		}
+	}
 }

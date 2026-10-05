@@ -41,6 +41,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   S3: peak pressure landed within +0.01 of the threshold in all eight arms, so the per-block
   shape is sufficient there.
 
+- **`--wire-ttfb` now splits by connection reuse**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). `lith_s3_wire_ttfb_seconds` is
+  labelled `conn="new"` / `conn="reused"`, and a new `lith_s3_conn_acquire_seconds` reports
+  the time spent getting a connection.
+
+  **The previous instrument answered its question and the answer eliminated my hypothesis.**
+  The wire histogram matched `lith_ttfb_seconds` to within **one sample in every bucket**,
+  with **equal counts in 9/9 arms** so no retries — so the delay is *not* above the wire: not
+  SDK middleware, not deserialization, not the fill goroutine waiting to be rescheduled. The
+  plain-`*http.Client` path is not the cause either; the default `BuildableClient` arm was as
+  slow or slower.
+
+  That leaves the fact that `lith-s3bench` gets ~30 ms on the same box, endpoint and part size
+  **at the same moment** — so lith's requests differ from its *as requests*. `GotFirstResponseByte`
+  is measured from request start, so it includes **connection acquisition**, and a fresh
+  mount's 153-GET burst at depth 29–66 opens up to one connection per concurrent fill where a
+  3-second, ~600-request s3bench window over the same 128-connection pool is almost entirely
+  reused. That asymmetry is the leading candidate, and it also explains an anomaly the depth
+  hypotheses could not: a window-bounded mount at `s3_inflight` 3–7 still had a third of its
+  fills over 50 ms, because the cost is per **new connection** rather than per unit of depth.
+
 ## [1.8.0] - 2026-10-05
 
 ### Added

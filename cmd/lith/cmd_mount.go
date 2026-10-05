@@ -233,7 +233,9 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	if f.wireTTFB {
 		holder := new(*metrics.Metrics)
 		wireMet = holder
-		wireTrace = func(wire, _ time.Duration) { (*holder).S3WireTTFB(wire) }
+		wireTrace = func(s s3client.WireSample) {
+			(*holder).S3WireTTFB(s.Wire, s.ConnAcquire, s.Reused)
+		}
 	}
 	client, err := newS3Client(ctx, s3client.Config{
 		Bucket:        bucket,
