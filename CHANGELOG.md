@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The NFS gateway logs a lookup miss, with the path**
+  ([#240](https://github.com/scttfrdmn/lith/issues/240)). The FUSE path has logged this since
+  the GCHP integration run; the gateway reads the same index through its own code path and
+  said nothing — the third instance of that gap after [#343](https://github.com/scttfrdmn/lith/issues/343)
+  and [#346](https://github.com/scttfrdmn/lith/issues/346).
+
+  "The client asked me for X and I do not have it" is the most useful thing a prefix-scoped
+  read-only filesystem can say. On the reporting workload one missing date-pinned file
+  surfaced 9 s into init as a Fortran *file not found* from deep in application code, with
+  nothing in the lith log, and cost a 20-minute hunt for a one-line cause. Logged at INFO,
+  deduped per distinct path (`Stat` serves GETATTR, LOOKUP and ACCESS alike, so one absent
+  file is probed repeatedly) and capped at 1024 distinct paths so a probing client cannot
+  flood the log or grow the map.
+
+- **`serving-a-cluster.md`: `--mem-cache` is per-daemon**
+  ([#242](https://github.com/scttfrdmn/lith/issues/242)). `knobs.md` already said so; the
+  cluster doc is where the case actually arises. Five prefix-scoped mounts on one host —
+  the normal shape for a model run — default to a **125 % cap on the box**, and on a 768 GB
+  compute node the default would reserve 192 GB apiece. There is no cross-daemon awareness.
+
+### Added
+
 - **`lith-s3bench` reports FIRST-BYTE latency, not only full-request latency**
   ([#350](https://github.com/scttfrdmn/lith/issues/350)). Its `p50`/`p99` were timed to after
   `io.ReadFull`, so at an 8 MiB part the transfer buried the first byte entirely — the tool
