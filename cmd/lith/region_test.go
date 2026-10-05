@@ -112,3 +112,57 @@ func TestRegionPair(t *testing.T) {
 		}
 	}
 }
+
+// #313: a --prefetch-pressure-max above 1.0 cannot do what it is asked to do, and the mount
+// must say so rather than letting the operator believe they are protected.
+//
+// It is arithmetic, not a measurement: a threshold of 1.3 admits 1.3 tiers' worth of unread
+// bytes, so the tier fills and must evict one to take another. Measured on real S3 at 1.3 the
+// gate fired 94-100 times and held peak pressure at exactly 1.300 as designed -- and still
+// evicted 2051-2235 unread chunks. I picked 1.3 by fitting between a clean 1.22 observation
+// and a collapsed 1.40 one, which is the mistake this warning exists to stop someone else
+// repeating.
+func TestPressureMaxWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		v    float64
+		want bool
+	}{
+		{"off is silent", 0, false},
+		{"negative is silent", -1, false},
+		// The measured band.
+		{"1.0 is usable", 1.0, false},
+		{"0.85 is usable", 0.85, false},
+		{"0.5 is the floor measured", 0.5, false},
+		// Above 1.0 cannot work.
+		{"1.3 warns", 1.3, true},
+		{"just above 1 warns", 1.01, true},
+		// Below the measured floor, warn about cost rather than correctness.
+		{"0.2 warns about over-throttling", 0.2, true},
+	} {
+		got := pressureMaxWarning(tc.v)
+		if (got != "") != tc.want {
+			t.Errorf("%s: pressureMaxWarning(%v) = %q, want warning=%v",
+				tc.name, tc.v, got, tc.want)
+		}
+	}
+
+	// The above-1.0 warning must say it CANNOT work, not that it is merely suboptimal --
+	// those are different claims and only one of them is true here.
+	w := pressureMaxWarning(1.3)
+	if !strings.Contains(w, "cannot work") {
+		t.Errorf("the above-1.0 warning does not say it cannot work: %q", w)
+	}
+	// And it must carry the measured evidence, so an operator can tell this apart from a
+	// style preference.
+	for _, want := range []string{"0.85-1.0", "2100"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("the warning omits %q: %q", want, w)
+		}
+	}
+	// The below-band warning must NOT claim it cannot work, because 0.5 does work -- it
+	// just costs wall clock. Conflating the two would make both less believable.
+	if lo := pressureMaxWarning(0.2); strings.Contains(lo, "cannot work") {
+		t.Errorf("the below-band warning claims it cannot work: %q", lo)
+	}
+}

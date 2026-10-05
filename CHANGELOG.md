@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--prefetch-pressure-max`'s threshold is measured, and a value above 1.0 now warns**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). The flag shipped off with an
+  unmeasured threshold; it now carries the band and refuses to let a useless value pass
+  silently.
+
+  Measured on real S3, 16 readers with the evidence gate forced off — the only population
+  this flag is for, since in-region #368 already bounds the transient:
+
+  | threshold | evicted | wall | spread |
+  |---|---|---|---|
+  | off | 2853–2983 | 112–116 s | 3.9–4.1 |
+  | 1.3 | 2051–2235 | 100–107 s | 4.1–4.3 |
+  | 1.0 | 71–119 | **40–42 s** | 2.6 |
+  | 0.85 | **0–4** | 44–47 s | 2.3–3.1 |
+  | 0.5 | 0 | 63 s | 2.3 |
+  | *(evidence gate on)* | *0* | *34 s* | *1.05* |
+
+  **Above 1.0 it cannot work, and that is arithmetic I should have derived instead of
+  measuring.** A threshold of 1.3 admits 1.3 tiers' worth of unread bytes, so the tier fills
+  and must evict one to take another. At 1.3 the gate fired 94–100 times and held peak
+  pressure at exactly 1.300 as asked — and evictions only fell from ~2900 to ~2100. I picked
+  1.3 because it sat between a cell observed *clean* at 1.22 and one observed *collapsed* at
+  1.40, which is fitting a constant to two data points rather than reading the mechanism. A
+  value above 1.0 now warns; it is not clamped, because silently substituting an operator's
+  number is how a knob stops meaning anything.
+
+  **It bounds bytes, not fairness.** Reader spread stays 2.3–3.1 at every threshold against
+  ~1.05 with the evidence gate on, so this limits the collapse rather than fixing it, and the
+  flag's help says so rather than implying parity. The admission check itself holds on real
+  S3: peak pressure landed within +0.01 of the threshold in all eight arms, so the per-block
+  shape is sufficient there.
+
 ## [1.8.0] - 2026-10-05
 
 ### Added

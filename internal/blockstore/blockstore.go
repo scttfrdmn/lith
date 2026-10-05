@@ -938,11 +938,35 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	//   - STABILIZING feedback, unlike the evidence gate's (#349): more prefetch raises
 	//     committed, which admits less prefetch; consumption drops it, which admits more.
 	//
-	// RISKS TO MEASURE, not resolved by argument. (1) An external cell at N=8 was CLEAN at
-	// committed/tier = 1.22, so a threshold at or below that throttles a workload that was
-	// fine -- and whether that costs wall clock is unmeasured. (2) #55's eviction preference
-	// protects unread chunks over read ones, so a reader that stalls holding unread bytes
-	// can keep committed high and suppress prefetch for everyone else.
+	// THE THRESHOLD IS NOW MEASURED, on real S3, 16 readers with the evidence gate forced
+	// off (the only population this gate is for -- in-region the gate bounds the transient
+	// already, #368). All arms held peak pressure within +0.01 of their threshold, so the
+	// per-block admission shape is sufficient there and is not merely advisory:
+	//
+	//	threshold   evicted     wall      spread   peak committed / tier
+	//	off          2853-2983  112-116s  3.9-4.1  1.402
+	//	1.3          2051-2235  100-107s  4.1-4.3  1.300   <- REFUTED
+	//	1.0            71-119    40-42s   2.6      1.004
+	//	0.85             0-4     44-47s   2.3-3.1  0.855
+	//	0.5              0-0     63s      2.3      0.510
+	//	(region gate)      0       34s     1.05    0.500
+	//
+	// ANY THRESHOLD ABOVE 1.0 IS USELESS BY ARITHMETIC, and I should have derived that
+	// rather than measuring it: a threshold of 1.3 admits 1.3 tiers' worth of unread
+	// bytes, so the tier fills (resident/capacity reads 1.000) and must evict. I picked
+	// 1.3 because it sat between a cell observed CLEAN at 1.22 and one observed COLLAPSED
+	// at 1.40, which is fitting a constant to two data points instead of reading the
+	// mechanism. The useful band is 0.85-1.0: 1.0 is fastest, 0.85 is the first value that
+	// reaches zero evictions, 0.5 over-throttles by 55%.
+	//
+	// AND IT DOES NOT RESTORE FAIRNESS. Spread stays 2.3-3.1 at every threshold against
+	// ~1.05 with the region gate. This bounds bytes and evictions; it does not stop some
+	// readers finishing early while others wait. So it is a bound for the gate-off
+	// population, not parity with #368, and the flag's help says so.
+	//
+	// REMAINING RISK, not resolved by argument: #55's eviction preference protects unread
+	// chunks over read ones, so a reader that stalls holding unread bytes can keep
+	// committed high and suppress prefetch for everyone else.
 	if bs.pfPressureMax > 0 && bs.prefetchPressure() >= bs.pfPressureMax {
 		bs.recordPressureHeld()
 		return
