@@ -141,3 +141,27 @@ func windowCoverage(effW, budgetBlocks int64) (full, floorAt int64) {
 	}
 	return full, budgetBlocks/3 + 1
 }
+
+// pressureMaxWarning returns a warning for a --prefetch-pressure-max that cannot do what it
+// is being asked to do, and "" for a usable one (#313).
+//
+// Above 1.0 the flag is useless BY ARITHMETIC, not by measurement: it admits more unread
+// bytes than the tier can hold, so the tier fills and must evict one to take another --
+// which is the exact condition the gate exists to prevent. Measured at 1.3 on real S3: the
+// gate fired 94-100 times, held peak pressure at 1.300 as designed, and still evicted
+// 2051-2235 unread chunks.
+//
+// A warning rather than a clamp: an operator who typed a number gets to keep it, and
+// silently substituting a different one is how a knob stops meaning anything. The measured
+// band is 0.85-1.0.
+func pressureMaxWarning(v float64) string {
+	switch {
+	case v <= 0:
+		return ""
+	case v > 1.0:
+		return fmt.Sprintf("--prefetch-pressure-max %g admits %.0f%% more unread bytes than the memory tier can hold, so the tier still fills and still evicts unread chunks — measured at 1.3, the gate fired and bounded pressure exactly as asked and evictions only fell from ~2900 to ~2100. Any value above 1.0 cannot work; the measured band is 0.85-1.0 (#313)", v, (v-1)*100)
+	case v < 0.5:
+		return fmt.Sprintf("--prefetch-pressure-max %g is below the lowest value measured. At 0.5 the gate over-throttled by 55%% against 1.0 (63 s vs 41 s) while buying nothing over 0.85, so lower values are likely to cost wall clock for no further reduction in evictions (#313)", v)
+	}
+	return ""
+}
