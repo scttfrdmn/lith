@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-10-05
+
+> **If you scrape `lith_s3_wire_ttfb_seconds`, its shape changed.** It is now labelled
+> `conn="new"` / `conn="reused"`, so an unlabelled v1.8.0 query like
+> `lith_s3_wire_ttfb_seconds_bucket{le="0.05"}` no longer matches. The metric is four hours
+> old, opt-in behind `--wire-ttfb`, and documented as a diagnostic not for production, which
+> is why this is a minor rather than a major — but it is a breaking change for a scraper and
+> is called out here rather than buried in the entry below.
+
 ### Changed
 
 - **`--prefetch-pressure-max`'s threshold is measured, and a value above 1.0 now warns**
@@ -2596,7 +2605,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/scttfrdmn/lith/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/scttfrdmn/lith/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/scttfrdmn/lith/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/scttfrdmn/lith/compare/v1.5.0...v1.6.0
