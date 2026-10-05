@@ -74,6 +74,26 @@ func crossRegionWarning(instance, bucket, bucketName string) string {
 		", or pass --no-region-check to silence this"
 }
 
+// regionPair resolves the two regions once and reports whether the bucket is in this
+// instance's region, and whether that could be determined at all (#349, #362).
+//
+// known=false means off-EC2, IMDS blocked, or a custom --endpoint with no AWS region. The
+// evidence policy treats that as "not near", which is correct in every case measured: off-EC2
+// is far, and R2 and other non-AWS endpoints cost 1.6-2.8x at every ratio tested. An on-prem
+// MinIO is near and loses the saving, which is what --readahead-evidence-ratio 4 is for.
+func regionPair(ctx context.Context, cl s3client.API) (near, known bool) {
+	return regionPairFrom(instanceRegion(ctx), regionOf(cl))
+}
+
+// regionPairFrom is the decision, separated from the two lookups so it is testable without
+// IMDS. Either region missing means NOT KNOWN, and the policy treats not-known as not-near.
+func regionPairFrom(instance, bucket string) (near, known bool) {
+	if instance == "" || bucket == "" {
+		return false, false
+	}
+	return instance == bucket, true
+}
+
 // warnCrossRegion logs the warning at mount, if there is one to log. Separated from
 // crossRegionWarning (which is pure) so the message is testable without IMDS.
 func warnCrossRegion(ctx context.Context, log *slog.Logger, cl s3client.API, bucket string, skip bool) {

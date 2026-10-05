@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The evidence gate now decides from the REGION PAIR, not from measured latency**
+  ([#349](https://github.com/scttfrdmn/lith/issues/349)). It engages when the bucket is in the
+  same region as the process, and not otherwise. One IMDS lookup, no extra S3 call — the
+  client resolves the bucket's region in order to sign at all — so the gate's state is a
+  function of **configuration**, identical on every read of a mount's life.
+
+  **First-byte latency was the wrong input, not a bound that was wrong by a factor.** The
+  8-sample median reads ~28 ms idle in-region and **~100 ms during the mount's own prefetch
+  burst**, above both the old 50 ms bound and the 58.6 ms cross-region round trip its far side
+  was anchored on. Worse, it is downstream of the decision: gate off → unbounded window →
+  deeper burst → higher latency → gate stays off. Measured externally, the same workload came
+  out at **9.1×, 5.1× and 1.05× over-fetch on three identical cells**, with the ratio gauge
+  reading on for 50–81% of ticks depending on the run. A load-invariant floor (p10 over 256
+  fills) was built to escape that and inherits it one burst later, rising 18 → 74 ms within
+  0.5 s of the gate turning off. Any statistic of lith's own fills has that shape.
+
+  **What the region pair encodes is a measured split.** In-region, forcing the gate on took
+  six concurrent slice readers from 3281 / 1827 / 375 MB to **358.6 MB in 3/3 (r = 1.00) with
+  no wall-clock cost**. Cross-region it cost **r = 1.96 with zero overlap** (min forced 15.80 s
+  > max off 12.07 s, n = 4, p = 1/70) on a fast whole-object reader — so it cannot simply
+  default on everywhere, and the split is real.
+
+  When neither region can be determined the gate is **off**: off-EC2, IMDS blocked, or a
+  custom `--endpoint`. That is correct in every case measured — off-EC2 is far, non-AWS
+  endpoints cost 1.6–2.8× at every ratio tested. An on-prem MinIO is near and loses the
+  saving; `--readahead-evidence-ratio 4` is for that. `--readahead-evidence-ratio` still wins
+  in both directions, and the TTFB series stay as **diagnostics**: they describe an endpoint
+  well and were not able to decide this.
+
 ### Added
 
 - **`--prefetch-pressure-max`: a prefetch admission gate on measured tier pressure**

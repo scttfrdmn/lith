@@ -2,100 +2,91 @@
 
 package fuse
 
-import "time"
-
 // evidenceRatioFor decides the #256 evidence-gate ratio in force for a read: the bound on a
 // committed readahead window as a multiple of the bytes the handle has actually consumed.
 //
-// WHY THIS IS A FUNCTION OF LATENCY. The gate exists because the window is sized by
-// concurrency and by the NIC, never by how much of the object a handle is going to want. A
-// single process reading one variable of a multi-variable NetCDF-4 file was measured fetching
-// the WHOLE object -- 54.03x over-fetch, equal to 1/coverage to within 0.4% on two different
-// objects (#284). The access is perfectly sequential within the variable, which is the point:
-// sequential is what earns the full window, so the most sequential low-coverage reader pays
-// most. `--readahead-evidence-ratio 4` fixes it.
+// WHY THE GATE EXISTS. The window is sized by concurrency and by the NIC, never by how much
+// of the object a handle is going to want. One process reading one variable of a
+// multi-variable NetCDF-4 file was measured fetching the WHOLE object -- 54.03x over-fetch,
+// equal to 1/coverage to within 0.4% on two objects (#284). The access is perfectly
+// sequential WITHIN the variable, which is the point: sequential earns the full window, so
+// the most sequential low-coverage reader pays most. Ratio 4 fixes it.
 //
-// It is off by default because its cost is RTT-scaled, and sharply:
+// WHY IT IS A FUNCTION OF THE REGION PAIR AND NOT OF LATENCY (#349). The gate's cost is
+// RTT-scaled and falls on one shape -- a fast consumer reading most of an object at distance:
 //
-//	in-region, ~2.2 ms : byte-identical, wall indistinguishable, over-fetch cut 56-95%
-//	cross-region, 58.6 ms : 2.56x the wall, zero overlap, 64/64 pairs, p = 1.6e-4
+//	in-region, 6 concurrent slice readers : forced 358.6 MB in 3/3 (r = 1.00) against a
+//	                                        default of 3281 / 1827 / 375 MB on three
+//	                                        IDENTICAL cells, and no wall-clock cost
+//	cross-region, 58.6 ms, dd whole-object: r = 1.96, zero overlap (min forced 15.80 s >
+//	                                        max off 12.07 s, n = 4, p = 1/70)
 //
-// (bench/evidence-ratio/ and bench/evidence-ratio/high-rtt/.) fetchExtents issues a window's
-// blocks in ONE call, so the window at establishment is the batch size; capping it at distance
-// costs a round trip per batch that nothing later recovers.
+// So the policy needs to know "near or far", and three rounds of measurement established that
+// first-byte latency CANNOT tell it:
 //
-// So the quantity that decides whether the gate is free is one lith already samples. Rules, in
-// order:
+//   - The 8-sample median reads ~28 ms idle in-region and ~100 ms during the mount's own
+//     prefetch burst -- above the old 50 ms bound AND above the 58.6 ms cross-region round
+//     trip the bound's far side was anchored on. A busy near endpoint and an idle far one are
+//     not separable on it.
+//   - It is DOWNSTREAM OF THE DECISION, so the policy was bistable: gate off -> unbounded
+//     window -> deeper burst -> higher latency -> gate stays off. The same workload came out
+//     at 9.1x, 5.1x and 1.05x over-fetch on three IDENTICAL cells, and the gauge read on for
+//     50-81% of ticks depending on the run. Amplification was not reproducible from
+//     configuration, which is the one property a default has to have.
+//   - A load-invariant floor (p10 over 256 fills) was built to escape that, and inherits it
+//     one burst later: measured rising 18 -> 74 ms within 0.5 s of the gate turning off,
+//     because the gate's own off-state removes the unqueued fills that make a floor a floor.
+//     ANY statistic of our own fills has this shape.
 //
-//  1. A POSITIVE --readahead-evidence-ratio wins, always. An operator who set it has said what
-//     they want and is not second-guessed by a latency heuristic.
-//  2. A NEGATIVE one forces the gate off. 0 now means "decide for me", so there has to be a
-//     way to say "off" and mean it.
-//  3. No measurement yet -> 0, the pre-#284 behaviour. NEVER derive from the seed: that is
-//     #292, where a 40 ms constant masquerades as a device measurement on every endpoint. A
-//     mount engages the gate only once it has measured that the endpoint is near.
-//  4. Otherwise the latency-derived ratio.
-func evidenceRatioFor(configured float64, ttfb time.Duration, measured bool) float64 {
+// THE REGION PAIR HAS NONE OF IT. Fixed at mount, one IMDS lookup and no extra S3 call (the
+// client resolved the bucket's region in order to sign at all), cannot be corrupted by load,
+// and it makes the gate's state a function of CONFIGURATION rather than of timing. It also
+// PREVENTS the regime rather than surviving it: in-region the gate is always on, so windows
+// stay bounded and the burst never reaches the depth that corrupted the old signal.
+//
+// Rules, in order:
+//
+//  1. A POSITIVE --readahead-evidence-ratio wins, always. An operator who set it has said
+//     what they want and is not second-guessed.
+//  2. A NEGATIVE one forces the gate off. 0 means "decide for me", so there has to be a way
+//     to say "off" and mean it.
+//  3. REGION UNKNOWN -> off. IMDS is blocked on plenty of hardened images and a custom
+//     --endpoint has no AWS region at all. Off is correct in every case measured: off-EC2 is
+//     far, and R2 and other non-AWS endpoints cost 1.6-2.8x at every ratio tested. An on-prem
+//     MinIO is near and loses the saving, which is what --readahead-evidence-ratio 4 is for.
+//     Erring off costs only the saving; erring on is the measured ~2x at distance.
+//  4. Same region -> ratio 4. Different region -> off.
+func evidenceRatioFor(configured float64, nearRegion, regionKnown bool) float64 {
 	if configured > 0 {
 		return configured
 	}
 	if configured < 0 {
 		return 0
 	}
-	if !measured {
+	if !regionKnown || !nearRegion {
 		return 0
 	}
-	return latencyDerivedEvidenceRatio(ttfb)
+	return defaultEvidenceRatio
 }
 
-// defaultEvidenceRatio and nearEndpointTTFB are the measured policy (#284, corrected in #340).
+// defaultEvidenceRatio is 4 because every cell that decided this used 4; no other value has
+// been measured on any shape.
 //
-// The ratio is 4 because every cell that decided this used 4; no other value has been
-// measured on any shape.
+// THE LATENCY BOUND IS GONE, and its history is worth keeping because it cost three releases.
+// v1.4.0 shipped it as 5 ms, derived from a 2.2 ms network ROUND TRIP, against a quantity that
+// is a FIRST-BYTE latency -- in-region 28.2 ms median (p10 22.6, p90 42.7) -- so the default
+// sat 4.5x below p10 and NO in-region mount ever engaged (#340). v1.5.0 corrected it to 50 ms,
+// anchored on both measured sides. Then the quantity itself turned out to be load-sensitive
+// and self-confirming (#349), so this is not a bound that was wrong by a factor: first-byte
+// latency is the wrong INPUT, and the region pair replaced it.
 //
-// THE BOUND IS IN TTFB, AND v1.4.0 SHIPPED IT IN RTT. That is the whole of #340. The policy
-// reads BlockStore.MeasuredTTFB, which is the rolling median of S3 FIRST-BYTE latency per
-// fill. The original 5 ms was justified as "a little over twice the measured-good point" where
-// that point was 2.2 ms -- the network ROUND TRIP. In-region first-byte latency is 28.2 ms
-// median (p10 22.6, p90 42.7, n=84), so the bound sat 4.5x below p10 and NO in-region mount
-// ever engaged: an external deployment measured the default reproducing #284's 54.02x
-// over-fetch byte for byte, with the gauge reading 0 after 162 completed fills.
+// In one line: the unit error was caught by an external measurement, and the wrong-quantity
+// error by a different external measurement two releases later. Neither was visible from the
+// code, and both defaults looked reasonable when they shipped.
 //
-// It is the same unit mix-up as #329, where 2.2 ms was used as a 1 MiB GET's unit price. That
-// one was caught in an argument; this one shipped as a constant.
-//
-// 50 ms IS ANCHORED ON BOTH SIDES, so it is not a guess in an unmeasured gap:
-//
-//	lower bound, MEASURED: in-region TTFB p90 is 42.7 ms, so 50 clears the whole
-//	                       in-region distribution and the median of eight samples
-//	                       the policy actually reads is nowhere near it.
-//	upper bound, BY CONSTRUCTION: TTFB includes at least one round trip, so a
-//	                       cross-region endpoint at 58.6 ms RTT cannot report a TTFB
-//	                       below 58.6 ms. No measurement is needed to exclude it.
-//
-// Erring low is also the safe direction: too low and the gate never engages, which is the
-// pre-#330 behaviour and costs only the saving. Too high and it engages at distance, which is
-// the measured 2.35x regression on a whole-object fast consumer.
-const (
-	defaultEvidenceRatio = 4.0
-	// nearEndpointTTFB is a FIRST-BYTE latency, not a round trip. See above.
-	nearEndpointTTFB = 50 * time.Millisecond
-)
-
-// latencyDerivedEvidenceRatio is the policy proper: the gate ratio for an endpoint whose
-// first-byte latency has been MEASURED at ttfb.
-//
-// Kept as its own function so the policy has one place to live and one place to be tested.
-//
-// WHAT THE GATE BUYS where it engages, all measured on real S3: a single process reading one
+// What the gate buys where it engages, all measured on real S3: a single process reading one
 // variable of a multi-variable NetCDF-4 file goes from fetching the WHOLE object to 2.65x of
-// what it wanted -- 54x over-fetch down to 2.65x, and 20.4x fewer bytes cross-region where it
-// also wins wall clock (r = 0.84). What it costs is a fixed ~0.07-0.18 s on the one shape that
-// pays, a fast consumer reading most of an object: r = 1.047 to 1.206 in-region across a 14.5x
-// size range and two boxes, bounded because the baseline carries its own fixed cost.
-func latencyDerivedEvidenceRatio(ttfb time.Duration) float64 {
-	if ttfb > 0 && ttfb <= nearEndpointTTFB {
-		return defaultEvidenceRatio
-	}
-	return 0
-}
+// what it wanted, and six such readers concurrently go from 5-9x to 1.00x. What it costs is a
+// fixed ~0.07-0.18 s on the one shape that pays, a fast consumer reading most of an object:
+// r = 1.047 to 1.206 in-region across a 14.5x size range and two boxes.
+const defaultEvidenceRatio = 4.0
