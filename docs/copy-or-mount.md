@@ -42,6 +42,37 @@ object's fetch with the previous object's compute; the copy path serializes
 staging in front of compute, and its compute then reads back from a
 throughput-capped volume.
 
+**A multi-TB object probed randomly at small record size** — an mmap'd hash
+table, a large reference index. **Neither.** Copy is not an option at this size
+and the mount is not viable either, so the honest answer is to restructure the
+access or put the data on local disk.
+
+This is the one row where **the mount looks identical to the good cases right up
+until you measure throughput**, which is why it needs saying out loud. Measured
+on a 1.206 TB RODA kraken2 database, in-region
+([#362](https://github.com/scttfrdmn/lith/issues/362)):
+
+| | |
+|---|---|
+| `lith index build` over all 1.206 TB | **~1 second**, producing a **728-byte** index |
+| sequential read of the 1.1 TiB `hash.k2d` | **146 MB/s** — 62–86% of raw `aws s3 cp` |
+| **random 4 KiB `pread`** | **7.1 probes/s — 141 ms each** |
+
+The index and the namespace are *excellent* at this size, and that is exactly
+the trap: nothing about mounting distinguishes a sequential TB-scale read from a
+random one. A serial fault stream pays **one round trip per miss** and lith has
+no lever on it ([#232](https://github.com/scttfrdmn/lith/issues/232)) — measured
+at 7.9 probes/s through the mount against **6.9/s for raw S3 at depth 1**, so
+the mount adds no overhead; one synchronous fault at a time is simply slow.
+
+What *is* recoverable belongs to the application: the same offsets at queue
+depth 64 ran **68× faster with per-request latency flat** (145 → 137 ms). Of the
+685× gap to local NVMe on that box, **~100× is concurrency and only ~6.9× is
+genuine storage advantage**. An application that can batch its lookups and issue
+them asynchronously gets most of it back; `kraken2 --memory-mapping` and the
+`bwa`/`samtools` mmap paths cannot, because a page fault exposes exactly one
+offset.
+
 **Many-small-object stores** — Zarr, sharded datasets read in key order. **The
 one shape where the answer is nuanced.** Reading these cold pays a serial S3
 round-trip per object. v0.2 shipped sibling readahead
