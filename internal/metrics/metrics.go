@@ -32,7 +32,8 @@ type Metrics struct {
 	pfCovHeld     prometheus.Counter
 	pfPressHeld   prometheus.Counter
 	ttfb          prometheus.Histogram
-	wireTTFB      prometheus.Histogram
+	wireTTFB      *prometheus.HistogramVec
+	connAcquire   *prometheus.HistogramVec
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -106,14 +107,22 @@ func New() *Metrics {
 			Name: "lith_prefetch_pressure_held_total",
 			Help: "Prefetch dispatches DROPPED by the pressure gate (#313). Zero means either the gate is off or it never had to fire, and those are different states -- read lith_prefetch_pressure to tell them apart. Dropping a dispatch costs nothing a reader waits on: demand reads do not go through the prefetch path, so under pressure lith stops guessing and keeps serving.",
 		}),
-		wireTTFB: prometheus.NewHistogram(prometheus.HistogramOpts{
+		wireTTFB: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "lith_s3_wire_ttfb_seconds",
-			Help: "First-byte latency AS THE TRANSPORT SEES IT, from httptrace.GotFirstResponseByte -- one sample per HTTP attempt, retries included (#350). Compare against lith_ttfb_seconds, which is measured in the fill path: if this is low while that is high, the delay is ABOVE the wire (SDK middleware, response deserialization, or the fill goroutine waiting to be rescheduled) and not at the endpoint. An external differential probe put a mount and lith-s3bench on the same box, bucket, endpoint and part size at the same moment and measured 30 ms against >50 ms, with the box at 20-34% CPU, so the gap is inside lith -- this is the seam that says where. Only populated when --wire-ttfb is set, because it requires the plain-HTTP-client path.",
+			Help: "First-byte latency AS THE TRANSPORT SEES IT (httptrace GotFirstResponseByte), one sample per HTTP attempt, LABELLED BY WHETHER THE CONNECTION WAS REUSED (#350). It is measured from request start, so it includes connection acquisition -- which is why the label matters. An external cell showed this histogram matching lith_ttfb_seconds to within one sample in every bucket, with equal counts so no retries, while lith-s3bench on the same box, endpoint and part size at the same moment got ~30 ms: so the delay is not above the wire, and the remaining difference between the two clients is how they use connections. A fresh mount's burst opens up to one connection per concurrent fill (66 for a 153-GET burst) where a 3-second s3bench window over the same 128-connection pool is almost entirely reused. conn=\"new\" slow and conn=\"reused\" fast is that hypothesis confirmed.",
 			Buckets: []float64{
 				0.001, 0.005, 0.010, 0.020, 0.025, 0.030, 0.040, 0.050,
 				0.060, 0.080, 0.100, 0.200, 0.500, 1.0,
 			},
-		}),
+		}, []string{"conn"}),
+		connAcquire: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "lith_s3_conn_acquire_seconds",
+			Help: "Time from an HTTP request starting to having a connection in hand (httptrace GetConn -> GotConn), labelled by whether it was reused (#350). Near zero for a pooled connection; dial plus TLS for a new one. This is the part of lith_s3_wire_ttfb_seconds that is not the endpoint answering.",
+			Buckets: []float64{
+				0.0001, 0.001, 0.005, 0.010, 0.020, 0.030, 0.050,
+				0.080, 0.100, 0.200, 0.500, 1.0,
+			},
+		}, []string{"conn"}),
 		ttfb: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "lith_ttfb_seconds",
 			Help: "S3 first-byte latency per fill. The DISTRIBUTION, not the rolling median the evidence policy reads -- #340's latency bound was placed from in-region p90 (42.7 ms) against a median of 28.2 ms, and that spread had to be recovered from a --timeline-csv because nothing exported it (#341). Buckets span in-region (~28 ms) through cross-region (>58 ms) first-byte latencies.",
@@ -246,7 +255,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.connAcquire, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -438,11 +447,24 @@ func (m *Metrics) PrefetchPressureHeld() {
 	}
 }
 
-// S3WireTTFB observes one HTTP attempt's first-byte latency as measured by the transport
-// (#350). Nil-safe.
-func (m *Metrics) S3WireTTFB(d time.Duration) {
-	if m != nil && d > 0 {
-		m.wireTTFB.Observe(d.Seconds())
+// S3WireTTFB observes one HTTP attempt as the transport saw it (#350), split by whether the
+// connection was reused. Nil-safe.
+func (m *Metrics) S3WireTTFB(wire, connAcquire time.Duration, reused bool) {
+	if m == nil {
+		return
+	}
+	conn := "new"
+	if reused {
+		conn = "reused"
+	}
+	if wire > 0 {
+		m.wireTTFB.WithLabelValues(conn).Observe(wire.Seconds())
+	}
+	// A reused connection can legitimately acquire in under a microsecond, so this
+	// observes at >= 0 rather than > 0: dropping the fast ones would make the reused
+	// distribution look slower than it is, which is the comparison that matters.
+	if connAcquire >= 0 {
+		m.connAcquire.WithLabelValues(conn).Observe(connAcquire.Seconds())
 	}
 }
 

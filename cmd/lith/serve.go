@@ -128,7 +128,9 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if f.wireTTFB {
 		holder := new(*metrics.Metrics)
 		wireMet = holder
-		wireTrace = func(wire, _ time.Duration) { (*holder).S3WireTTFB(wire) }
+		wireTrace = func(s s3client.WireSample) {
+			(*holder).S3WireTTFB(s.Wire, s.ConnAcquire, s.Reused)
+		}
 	}
 	client, err := newS3Client(ctx, s3client.Config{
 		Bucket: bucket, Region: f.region, NoSignRequest: f.noSign, RequesterPays: f.reqPays,
