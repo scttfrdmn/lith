@@ -32,6 +32,7 @@ type Metrics struct {
 	pfCovHeld     prometheus.Counter
 	pfPressHeld   prometheus.Counter
 	ttfb          prometheus.Histogram
+	wireTTFB      prometheus.Histogram
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -104,6 +105,14 @@ func New() *Metrics {
 		pfPressHeld: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_pressure_held_total",
 			Help: "Prefetch dispatches DROPPED by the pressure gate (#313). Zero means either the gate is off or it never had to fire, and those are different states -- read lith_prefetch_pressure to tell them apart. Dropping a dispatch costs nothing a reader waits on: demand reads do not go through the prefetch path, so under pressure lith stops guessing and keeps serving.",
+		}),
+		wireTTFB: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "lith_s3_wire_ttfb_seconds",
+			Help: "First-byte latency AS THE TRANSPORT SEES IT, from httptrace.GotFirstResponseByte -- one sample per HTTP attempt, retries included (#350). Compare against lith_ttfb_seconds, which is measured in the fill path: if this is low while that is high, the delay is ABOVE the wire (SDK middleware, response deserialization, or the fill goroutine waiting to be rescheduled) and not at the endpoint. An external differential probe put a mount and lith-s3bench on the same box, bucket, endpoint and part size at the same moment and measured 30 ms against >50 ms, with the box at 20-34% CPU, so the gap is inside lith -- this is the seam that says where. Only populated when --wire-ttfb is set, because it requires the plain-HTTP-client path.",
+			Buckets: []float64{
+				0.001, 0.005, 0.010, 0.020, 0.025, 0.030, 0.040, 0.050,
+				0.060, 0.080, 0.100, 0.200, 0.500, 1.0,
+			},
 		}),
 		ttfb: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "lith_ttfb_seconds",
@@ -237,7 +246,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -426,6 +435,14 @@ func (m *Metrics) PrefetchWait(d time.Duration) {
 func (m *Metrics) PrefetchPressureHeld() {
 	if m != nil {
 		m.pfPressHeld.Inc()
+	}
+}
+
+// S3WireTTFB observes one HTTP attempt's first-byte latency as measured by the transport
+// (#350). Nil-safe.
+func (m *Metrics) S3WireTTFB(d time.Duration) {
+	if m != nil && d > 0 {
+		m.wireTTFB.Observe(d.Seconds())
 	}
 }
 

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--wire-ttfb`: first-byte latency as the HTTP transport sees it**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). A diagnostic, exporting
+  `lith_s3_wire_ttfb_seconds` from `httptrace.GotFirstResponseByte` alongside
+  `lith_ttfb_seconds` from the fill path.
+
+  An external differential probe put a mount and `lith-s3bench` against the **same bucket,
+  box, endpoint and part size at the same moment**: s3bench's first bytes came in at ~30 ms
+  (p50) while that mount's fills were mostly over 50 ms, with the box at only **20–34% CPU**.
+  Same SDK call, same tuned transport — so the gap is above the wire and inside lith, and both
+  mechanisms proposed for it (request concurrency, then bytes in flight) had already been
+  refuted by measurement. `GotFirstResponseByte` is the only seam that separates "the endpoint
+  was slow" from "we were slow to notice": it fires on the transport's own goroutine the
+  moment the first byte comes off the connection, so it is unaffected by whether the caller is
+  scheduled.
+
+  One sample per HTTP attempt, retries included — a silent retry is exactly the kind of thing
+  that would otherwise show up as one slow fill and nothing else. It forces the plain
+  `*http.Client` path, because the SDK's `BuildableClient` exposes no `RoundTripper` hook, so
+  it is opt-in rather than a default.
+
 ## [1.7.0] - 2026-10-05
 
 ### Added

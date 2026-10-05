@@ -52,6 +52,7 @@ type mountFlags struct {
 	inflightBytes     string
 	noRegionCheck     bool
 	prefetchPressure  float64
+	wireTTFB          bool
 	metrics           string
 	pprof             string
 	timelineCSV       string
@@ -109,6 +110,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds: first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (#350). A DIAGNOSTIC, not a tuning knob -- if the wire figure is low while the fill figure is high, the delay is above the wire (SDK middleware, deserialization, or the fill goroutine waiting to be rescheduled) rather than at the endpoint. It forces the plain-*http.Client path instead of the AWS SDK's BuildableClient, because that one exposes no RoundTripper hook, so do not leave it on in production")
 	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of --mem-cache (#313). 0 (default) disables it. EXPERIMENTAL and off because its threshold is not yet measured on real S3: an external cell was CLEAN at 1.22, so a value at or below that throttles a workload that was fine, and the wall-clock cost of doing so is unmeasured. What it fixes: N readers starting together each size their window for an empty mount, because the divisor counts ESTABLISHED streams and a stream is only established after several reads — 16 readers committed 12.944 GB within 6 s against a 4.128 GB budget and an 8.256 GB tier, and the cost was a FAIRNESS collapse (13 of 16 on schedule, 3 crawling to 106 s) rather than a uniform slowdown. Try ~1.0 on a fat-NIC box streaming many distinct multi-GB objects; read lith_prefetch_pressure and lith_prefetch_pressure_held_total to see whether it binds")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region. The warning is advisory and costs one IMDS lookup; silence it for a deliberately cross-region mount, or where IMDS is blocked and you do not want the attempt (#362)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
@@ -224,9 +226,19 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		}
 	}
 
+	// --wire-ttfb needs the metrics registry, which is built below; the closure defers the
+	// nil check to call time so the two can be constructed in either order.
+	var wireMet **metrics.Metrics
+	var wireTrace s3client.WireTraceFunc
+	if f.wireTTFB {
+		holder := new(*metrics.Metrics)
+		wireMet = holder
+		wireTrace = func(wire, _ time.Duration) { (*holder).S3WireTTFB(wire) }
+	}
 	client, err := newS3Client(ctx, s3client.Config{
 		Bucket:        bucket,
 		Region:        f.region,
+		WireTrace:     wireTrace,
 		NoSignRequest: f.noSignRequest,
 		RequesterPays: f.requesterPays,
 		Endpoint:      f.endpoint,
@@ -323,6 +335,9 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	var met *metrics.Metrics
 	if f.metrics != "" {
 		met = metrics.New()
+	}
+	if wireMet != nil {
+		*wireMet = met // nil-safe: S3WireTTFB is a no-op without --metrics
 	}
 	// Diagnostic (#70): when --timeline-csv is set, the per-chunk timeline
 	// recorder is the block-store Recorder (it also tallies the basic counters).
