@@ -177,3 +177,55 @@ func TestWireTracerSplitsReusedFromNewConnections(t *testing.T) {
 		}
 	}
 }
+
+// #350: the wire interval must be split at WroteRequest, because it is the last unmeasured
+// part of a first-byte latency and the only split that separates "we were slow to get the
+// request out" from "the endpoint was slow to answer".
+//
+// Six mechanisms above the wire have been refuted by measurement and the Go runtime shows
+// ~1 ms of STW per burst against a 60-100 ms delay, so what remains is inside this interval.
+func TestWireTracerSplitsWriteFromEndpoint(t *testing.T) {
+	const serverDelay = 60 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverDelay)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	var mu sync.Mutex
+	var got WireSample
+	cl := &http.Client{Transport: NewWireTracer(http.DefaultTransport, func(s WireSample) {
+		mu.Lock()
+		got = s
+		mu.Unlock()
+	})}
+	resp, err := cl.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	mu.Lock()
+	s := got
+	mu.Unlock()
+	t.Logf("wire=%v acquire=%v write=%v endpoint=%v", s.Wire, s.ConnAcquire, s.Write, s.Endpoint)
+
+	// The server is the only slow thing here, so the ENDPOINT interval must carry the
+	// delay and the write must not. This is the discrimination the split exists for: a
+	// wire figure alone cannot tell these apart.
+	if s.Endpoint < serverDelay {
+		t.Errorf("endpoint %v is below the server's %v delay", s.Endpoint, serverDelay)
+	}
+	if s.Write > 10*time.Millisecond {
+		t.Errorf("write %v for a GET with no body; the split is attributing endpoint time "+
+			"to the write", s.Write)
+	}
+	// And the parts must account for the whole, or the split is measuring intervals that
+	// do not compose and the numbers cannot be reasoned about together.
+	sum := s.ConnAcquire + s.Write + s.Endpoint
+	if d := s.Wire - sum; d < -2*time.Millisecond || d > 2*time.Millisecond {
+		t.Errorf("acquire+write+endpoint = %v against a wire time of %v (off by %v): the "+
+			"intervals do not compose", sum, s.Wire, d)
+	}
+}

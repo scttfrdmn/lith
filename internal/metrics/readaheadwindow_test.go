@@ -337,8 +337,13 @@ func TestWireTTFBIsSplitByConnectionReuse(t *testing.T) {
 	}
 
 	// A new connection paying dial + TLS, and a reused one that is not.
-	m.S3WireTTFB(95*time.Millisecond, 62*time.Millisecond, false)
-	m.S3WireTTFB(28*time.Millisecond, 20*time.Microsecond, true)
+	// A new connection paying dial + TLS, and a reused one that is not. The split fields
+	// carry the #350 question: a 95 ms wire time that is 62 ms acquisition + 1 ms write +
+	// 32 ms endpoint says something very different from one that is all endpoint.
+	m.S3WireTTFB(WireSplit{Wire: 95 * time.Millisecond, ConnAcquire: 62 * time.Millisecond,
+		Write: time.Millisecond, Endpoint: 32 * time.Millisecond, Reused: false})
+	m.S3WireTTFB(WireSplit{Wire: 28 * time.Millisecond, ConnAcquire: 20 * time.Microsecond,
+		Write: 15 * time.Microsecond, Endpoint: 28 * time.Millisecond, Reused: true})
 
 	got := scrape()
 	for _, want := range []string{
@@ -364,13 +369,38 @@ func TestWireTTFBIsSplitByConnectionReuse(t *testing.T) {
 	// A sub-microsecond acquisition must still be OBSERVED, not dropped. A pooled
 	// connection legitimately acquires in well under a microsecond, and discarding those
 	// would make the reused arm look slower than it is -- the exact comparison at issue.
-	m.S3WireTTFB(27*time.Millisecond, 0, true)
+	m.S3WireTTFB(WireSplit{Wire: 27 * time.Millisecond, ConnAcquire: 0, Write: 0,
+		Endpoint: 27 * time.Millisecond, Reused: true})
 	if !strings.Contains(scrape(), `lith_s3_conn_acquire_seconds_count{conn="reused"} 2`) {
 		t.Error("a zero-duration acquisition was dropped; the reused arm would read slow")
 	}
 
+	// The three intervals must each be exported, since the whole point is that the wire
+	// total hides which of them is large.
+	got = scrape()
+	for _, want := range []string{
+		`lith_s3_request_write_seconds_count{conn="new"} 1`,
+		`lith_s3_endpoint_ttfb_seconds_count{conn="new"} 1`,
+		`lith_s3_endpoint_ttfb_seconds_count{conn="reused"} 2`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape missing %q", want)
+		}
+	}
+	// THE DISCRIMINATION THE SPLIT EXISTS FOR: the new-connection sample's 95 ms wire time
+	// is mostly acquisition, and its ENDPOINT interval is inside the 50 ms bound. Reading
+	// only the wire figure would call that endpoint latency.
+	if !strings.Contains(got, `lith_s3_endpoint_ttfb_seconds_bucket{conn="new",le="0.05"} 1`) {
+		t.Error("the new-connection sample's 32ms endpoint interval is not inside the 50ms " +
+			"bucket; the split is not separating acquisition from the endpoint")
+	}
+	if !strings.Contains(got, `lith_s3_wire_ttfb_seconds_bucket{conn="new",le="0.05"} 0`) {
+		t.Error("fixture: that sample's 95ms WIRE time must be outside the 50ms bucket, " +
+			"or there is no discrimination to demonstrate")
+	}
+
 	var nilM *Metrics
-	nilM.S3WireTTFB(time.Millisecond, time.Millisecond, true)
+	nilM.S3WireTTFB(WireSplit{Wire: time.Millisecond, Endpoint: time.Millisecond, Reused: true})
 }
 
 // #350: the Go runtime must be visible on a lith scrape.

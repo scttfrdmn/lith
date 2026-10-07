@@ -35,6 +35,8 @@ type Metrics struct {
 	ttfb          prometheus.Histogram
 	wireTTFB      *prometheus.HistogramVec
 	connAcquire   *prometheus.HistogramVec
+	reqWrite      *prometheus.HistogramVec
+	endpointTTFB  *prometheus.HistogramVec
 	straddle      prometheus.Counter
 	staleTotal    prometheus.Counter
 	fuseLatency   *prometheus.HistogramVec // op
@@ -151,6 +153,22 @@ func New() *Metrics {
 			Buckets: []float64{
 				0.0001, 0.001, 0.005, 0.010, 0.020, 0.030, 0.050,
 				0.080, 0.100, 0.200, 0.500, 1.0,
+			},
+		}, []string{"conn"}),
+		reqWrite: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "lith_s3_request_write_seconds",
+			Help: "Time from having a connection in hand to the request being fully written (httptrace GotConn -> WroteRequest), labelled by connection reuse (#350). A GET is a few hundred bytes, so this should be microseconds; it is not if the connection is not actually ready to carry the request. Together with lith_s3_endpoint_ttfb_seconds this splits the last unmeasured part of lith_s3_wire_ttfb_seconds.",
+			Buckets: []float64{
+				0.00001, 0.0001, 0.001, 0.005, 0.010, 0.020, 0.030,
+				0.050, 0.080, 0.100, 0.200, 0.500, 1.0,
+			},
+		}, []string{"conn"}),
+		endpointTTFB: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "lith_s3_endpoint_ttfb_seconds",
+			Help: "Time from the request being written to the first response byte arriving (httptrace WroteRequest -> GotFirstResponseByte), labelled by connection reuse (#350). THE ONLY PART OF A FIRST-BYTE LATENCY THAT IS GENUINELY THE ENDPOINT ANSWERING -- connection acquisition and request writing are excluded. If this reads ~28 ms while lith_s3_wire_ttfb_seconds reads ~130 ms, the delay is lith's and lith_s3_request_write_seconds says where; if this reads ~130 ms too, S3 answers these requests slower than it answers an equivalent client's and the question is what differs about the requests.",
+			Buckets: []float64{
+				0.001, 0.005, 0.010, 0.020, 0.025, 0.030, 0.040, 0.050,
+				0.060, 0.080, 0.100, 0.200, 0.500, 1.0,
 			},
 		}, []string{"conn"}),
 		ttfb: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -285,7 +303,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.cacheHits, m.cacheMiss, m.s3Bytes, m.s3Requests,
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
-		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.connAcquire, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
+		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.connAcquire, m.reqWrite, m.endpointTTFB, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
 		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
@@ -477,24 +495,44 @@ func (m *Metrics) PrefetchPressureHeld() {
 	}
 }
 
+// WireSplit is one HTTP attempt's first-byte latency broken into its intervals. It mirrors
+// s3client.WireSample's timing fields so this package does not import that one.
+type WireSplit struct {
+	Wire        time.Duration
+	ConnAcquire time.Duration
+	Write       time.Duration
+	Endpoint    time.Duration
+	Reused      bool
+}
+
 // S3WireTTFB observes one HTTP attempt as the transport saw it (#350), split by whether the
-// connection was reused. Nil-safe.
-func (m *Metrics) S3WireTTFB(wire, connAcquire time.Duration, reused bool) {
+// connection was reused and broken into its three intervals. Nil-safe.
+//
+// The three must sum to the wire figure, and exporting them separately rather than as one
+// number is the whole point: six mechanisms above the wire have been refuted by measurement,
+// so what is left is inside it.
+func (m *Metrics) S3WireTTFB(s WireSplit) {
 	if m == nil {
 		return
 	}
 	conn := "new"
-	if reused {
+	if s.Reused {
 		conn = "reused"
 	}
-	if wire > 0 {
-		m.wireTTFB.WithLabelValues(conn).Observe(wire.Seconds())
+	if s.Wire > 0 {
+		m.wireTTFB.WithLabelValues(conn).Observe(s.Wire.Seconds())
 	}
-	// A reused connection can legitimately acquire in under a microsecond, so this
-	// observes at >= 0 rather than > 0: dropping the fast ones would make the reused
-	// distribution look slower than it is, which is the comparison that matters.
-	if connAcquire >= 0 {
-		m.connAcquire.WithLabelValues(conn).Observe(connAcquire.Seconds())
+	// Observed at >= 0, not > 0: a pooled connection acquires and a GET writes in well
+	// under a microsecond, and dropping those would make the reused arm read slower than
+	// it is -- the exact comparison these exist to make.
+	if s.ConnAcquire >= 0 {
+		m.connAcquire.WithLabelValues(conn).Observe(s.ConnAcquire.Seconds())
+	}
+	if s.Write >= 0 {
+		m.reqWrite.WithLabelValues(conn).Observe(s.Write.Seconds())
+	}
+	if s.Endpoint > 0 {
+		m.endpointTTFB.WithLabelValues(conn).Observe(s.Endpoint.Seconds())
 	}
 }
 

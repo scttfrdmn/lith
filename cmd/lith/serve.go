@@ -129,7 +129,10 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		holder := new(*metrics.Metrics)
 		wireMet = holder
 		wireTrace = func(s s3client.WireSample) {
-			(*holder).S3WireTTFB(s.Wire, s.ConnAcquire, s.Reused)
+			(*holder).S3WireTTFB(metrics.WireSplit{
+				Wire: s.Wire, ConnAcquire: s.ConnAcquire,
+				Write: s.Write, Endpoint: s.Endpoint, Reused: s.Reused,
+			})
 		}
 	}
 	client, err := newS3Client(ctx, s3client.Config{

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--wire-ttfb` splits the wire interval at `WroteRequest`, the last unmeasured part of a
+  first-byte latency** ([#350](https://github.com/scttfrdmn/lith/issues/350)). Two new
+  series, both labelled by connection reuse: `lith_s3_request_write_seconds` (`GotConn` →
+  `WroteRequest`) and `lith_s3_endpoint_ttfb_seconds` (`WroteRequest` →
+  `GotFirstResponseByte`) — **the only part of a first-byte latency that is genuinely the
+  endpoint answering**.
+
+  **Seven mechanisms are now refuted by measurement**: request concurrency (twice,
+  independently), bytes in flight, box CPU, above-the-wire, connection setup, and allocation —
+  the last of these causally, by making `lith-s3bench` allocate the way a mount does and
+  finding it stayed fast. The Go runtime metrics added in the same cycle show ~**1 ms of STW
+  per burst** and **not one of ~31k scheduler waits over 0.9 ms**, against a 60–100 ms delay.
+
+  So the delay is inside the wire interval, which has three parts. Acquisition was measured
+  (~1 ms reused, 3–5 ms new). The other two had never been looked at, and they answer very
+  different questions: if the endpoint interval reads ~28 ms while the wire total reads
+  ~130 ms, the delay is lith's and the write interval says where; if the endpoint interval
+  reads ~130 ms too, then S3 answers these requests slower than an equivalent client's and the
+  question becomes what differs about the *requests*.
+
+  The test asserts the three intervals **sum to the wire figure**, because intervals that do
+  not compose cannot be reasoned about together — verified by reverting, which both
+  misattributes the delay and breaks the sum by exactly the endpoint wait.
+
 ## [1.10.0] - 2026-10-07
 
 ### Added
