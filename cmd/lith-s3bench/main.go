@@ -63,6 +63,7 @@ func main() {
 		noSign     = flag.Bool("no-sign-request", true, "anonymous requests")
 		useHTTP    = flag.Bool("http", false, "use http:// (isolates TLS cost; public buckets only)")
 		readBuffer = flag.Int("read-buffer", 0, "http.Transport.ReadBufferSize in bytes (0 = default)")
+		freshBuf   = flag.Bool("fresh-buffers", false, "allocate a new read buffer PER REQUEST instead of reusing one per worker, and retain them for the run (lith#350). This is the CAUSAL test for whether allocation pressure is what slows a lith mount's first bytes: a mount moves 1.21 GB through ~1200 fresh 1 MiB chunk buffers in a 153-fill burst, while this tool normally reuses one buffer per worker and allocates essentially nothing. If -fresh-buffers makes this tool slow at the same shape and depth, allocation is the cause, measured directly and with no lith code involved")
 	)
 	flag.Parse()
 
@@ -147,9 +148,10 @@ func main() {
 	}()
 
 	var (
-		cursor    atomic.Int64
-		bytesRead atomic.Int64
-		lat       = make([][]time.Duration, *workers)
+		cursor      atomic.Int64
+		retainedAll sync.Map
+		bytesRead   atomic.Int64
+		lat         = make([][]time.Duration, *workers)
 		// FIRST-BYTE latency, kept separately from lat. lat is timed to after
 		// io.ReadFull, so at an 8 MiB part the transfer buries the first byte entirely --
 		// which is why this tool could not answer #350 until now. Recorded at the same
@@ -167,10 +169,22 @@ func main() {
 		go func(w int) {
 			defer wg.Done()
 			buf := make([]byte, *partStr)
+			// -fresh-buffers RETAINS every buffer for the run, which is the point: a
+			// mount's chunk buffers go into the memory tier and stay reachable, so they
+			// are promoted rather than collected cheaply. Allocating and dropping would
+			// test a different and much kinder thing.
+			var retained [][]byte
 			var mine, mineTTFB []time.Duration
 			for time.Now().Before(deadline) {
 				idx := int(cursor.Add(1)-1) % len(reqs)
 				r := reqs[idx]
+				if *freshBuf {
+					// Allocated BEFORE the request, as a fill does: the buffer exists
+					// to receive the body, so the allocation is on the same side of
+					// the timer as it is in lith.
+					buf = make([]byte, *partStr)
+					retained = append(retained, buf)
+				}
 				t0 := time.Now()
 				out, err := cl.GetObject(ctx, &s3.GetObjectInput{
 					Bucket: bucket,
@@ -195,6 +209,12 @@ func main() {
 			}
 			lat[w] = mine
 			ttfb[w] = mineTTFB
+			// Keep the retained buffers reachable past the measurement so they cannot be
+			// collected during it; this is what makes the arm comparable to a tier that
+			// holds its chunks.
+			if len(retained) > 0 {
+				retainedAll.Store(w, retained)
+			}
 		}(w)
 	}
 	wg.Wait()
@@ -247,8 +267,8 @@ func main() {
 	ncpu := float64(runtime.NumCPU())
 	// TTFB line first: #350 is about whether depth buys throughput with LATENCY, so the
 	// first-byte distribution and the aggregate belong side by side at every width.
-	fmt.Printf("TTFB   workers=%d part=%dMiB  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
-		*workers, *partStr>>20, len(allTTFB),
+	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
+		*workers, *partStr>>20, *freshBuf, len(allTTFB),
 		float64(tpct(10).Microseconds())/1000, float64(tpct(50).Microseconds())/1000,
 		float64(tpct(90).Microseconds())/1000, float64(tpct(99).Microseconds())/1000,
 		fracUnder(allTTFB, 25*time.Millisecond), fracUnder(allTTFB, 50*time.Millisecond),
