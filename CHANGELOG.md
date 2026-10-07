@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Go runtime is on the scrape** ([#350](https://github.com/scttfrdmn/lith/issues/350)).
+  `go_gc_duration_seconds`, `go_sched_latencies_seconds`, `go_memstats_alloc_bytes_total`,
+  `go_goroutines` and `process_cpu_seconds_total`, alongside lith's own series.
+
+  lith's registry was a bare `prometheus.NewRegistry()` for its whole life, so GC pause time,
+  scheduling latency, allocation rate and goroutine count were **absent from every scrape ever
+  taken from a mount**. That is the sixth time in this project that the counter which would
+  have shown a defect was not exported — the pattern behind #318, #319 and #341 — and it bit
+  at the worst moment: five hypotheses for an in-mount first-byte latency were refuted one at
+  a time (request concurrency twice, bytes in flight, box CPU, above-the-wire, connection
+  setup) and the runtime was never on the list, because it could not be looked at.
+
+  It is specifically **not** ruled out by the wire measurement. `httptrace`'s
+  `GotFirstResponseByte` fires on the **transport's** read goroutine, so it is immune to the
+  *fill* goroutine's scheduling and not immune to a runtime-wide pause or assist: the byte can
+  arrive on time and the callback still be late. And the two programs under comparison differ
+  sharply in allocation — a 153-fill lith burst moves 1.21 GB through ~1200 fresh 1 MiB chunk
+  buffers, where `lith-s3bench` reuses one buffer per worker and allocates essentially nothing
+  after startup.
+
+  Registered as **instruments, not as a claim**: a sub-millisecond STW pause does not explain
+  a 60–100 ms first byte, so if the runtime is involved it is assists and memory bandwidth
+  rather than pauses — and that is a measurement, not an argument.
+
 ## [1.9.0] - 2026-10-05
 
 > **If you scrape `lith_s3_wire_ttfb_seconds`, its shape changed.** It is now labelled
