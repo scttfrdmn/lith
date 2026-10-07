@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith-s3bench` reports the same wire split as the mount, and labels its auth mode**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). A `SPLIT` line per connection
+  class: `acquire`, `write`, `endpoint` and their `wire` sum, from the *same*
+  `internal/s3client` tracer the mount uses.
+
+  The comparison that issue has come down to is whether S3 answers a mount's requests slower
+  than an equivalent client's — and that cannot be settled while the two programs measure
+  through different code. Means rather than percentiles, because the question is which
+  *interval* carries the time and the three means must sum to the wire mean, which
+  percentiles do not.
+
+  **Auth is now in the output line**, because an external comparison ran for several cells
+  with the mount **signing** and this tool **anonymous** — identical request fields, identical
+  ranges, identical SDK, different credentials — and nothing in either program's output said
+  so. It turned out to be worth only 6–21 points rather than the gap under investigation, but
+  it cost cells to establish that, and a confound visible in the output cannot persist
+  silently. `-fresh-buffers` self-labels for the same reason.
+
 ## [1.11.0] - 2026-10-07
 
 ### Added
