@@ -62,6 +62,7 @@ func main() {
 		noSign     = flag.Bool("no-sign-request", true, "anonymous requests")
 		useHTTP    = flag.Bool("http", false, "use http:// (isolates TLS cost; public buckets only)")
 		readBuffer = flag.Int("read-buffer", 0, "http.Transport.ReadBufferSize in bytes (0 = default)")
+		warmup     = flag.Duration("warmup", 0, "run a DISCARDED window of this length before the measured one, in the same process (lith#381). The first s3bench process of a run has been measured with a 3-10x worse first-byte tail in 7 of 7 runs, and at one point a first process read endpoint 97.7 ms while a lith mount on the same box, same key and same instant read 41.2 ms -- which rules out the endpoint, the path and box-wide state, and leaves something in or keyed to the process's FIRST CONTACT. This flag is therefore both the mitigation and a diagnostic: if an in-process warm-up removes the effect, it is first-contact-in-process rather than anything run-level, and no amount of warming from a separate process would have fixed it")
 		freshBuf   = flag.Bool("fresh-buffers", false, "allocate a new read buffer PER REQUEST instead of reusing one per worker, and retain them for the run (lith#350). This is the CAUSAL test for whether allocation pressure is what slows a lith mount's first bytes: a mount moves 1.21 GB through ~1200 fresh 1 MiB chunk buffers in a 153-fill burst, while this tool normally reuses one buffer per worker and allocates essentially nothing. If -fresh-buffers makes this tool slow at the same shape and depth, allocation is the cause, measured directly and with no lith code involved")
 	)
 	flag.Parse()
@@ -76,6 +77,7 @@ func main() {
 		poolSize = *workers
 	}
 
+	procStart := time.Now()
 	ctx := context.Background()
 
 	// THE WIRE SPLIT, shared with the mount (lith#350). An external comparison needs both
@@ -175,6 +177,46 @@ func main() {
 		ttfb = make([][]time.Duration, *workers)
 		wg   sync.WaitGroup
 	)
+	// The discarded warm-up window (lith#381). Same workers, same parts, same request walk;
+	// its samples are thrown away, and the cursor it advances is deliberately NOT reset, so
+	// the measured window reads different ranges than the warm-up did and cannot be
+	// measuring a self-warmed object.
+	if *warmup > 0 {
+		warmDeadline := time.Now().Add(*warmup)
+		var ww sync.WaitGroup
+		for w := 0; w < *workers; w++ {
+			ww.Add(1)
+			go func() {
+				defer ww.Done()
+				wbuf := make([]byte, *partStr)
+				for time.Now().Before(warmDeadline) {
+					idx := int(cursor.Add(1)-1) % len(reqs)
+					r := reqs[idx]
+					out, err := cl.GetObject(ctx, &s3.GetObjectInput{
+						Bucket: bucket,
+						Key:    aws.String(keys[r.keyIdx]),
+						Range:  aws.String(fmt.Sprintf("bytes=%d-%d", r.off, r.off+r.length-1)),
+					})
+					if err != nil {
+						continue
+					}
+					_, _ = io.ReadFull(out.Body, wbuf[:r.length])
+					_ = out.Body.Close()
+				}
+			}()
+		}
+		ww.Wait()
+		// Discard the warm-up's wire samples so the SPLIT line describes the measured
+		// window only. This is the whole point of the flag and getting it wrong would
+		// silently fold the effect being removed back into the result.
+		wireMu.Lock()
+		wireSamples = nil
+		wireMu.Unlock()
+	}
+
+	// How far into the process the measured window starts. A cold first arm is then
+	// self-identifying in a log rather than something to reconstruct from timestamps.
+	sinceStart := time.Since(procStart)
 	deadline := time.Now().Add(*dur)
 	rusStart := getCPU()
 	wallStart := time.Now()
@@ -319,8 +361,9 @@ func main() {
 
 	// TTFB line first: #350 is about whether depth buys throughput with LATENCY, so the
 	// first-byte distribution and the aggregate belong side by side at every width.
-	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v auth=%s  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
-		*workers, *partStr>>20, *freshBuf, authLabel(*noSign), len(allTTFB),
+	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v auth=%s warmup=%v start+%dms  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
+		*workers, *partStr>>20, *freshBuf, authLabel(*noSign), *warmup,
+		sinceStart.Milliseconds(), len(allTTFB),
 		float64(tpct(10).Microseconds())/1000, float64(tpct(50).Microseconds())/1000,
 		float64(tpct(90).Microseconds())/1000, float64(tpct(99).Microseconds())/1000,
 		fracUnder(allTTFB, 25*time.Millisecond), fracUnder(allTTFB, 50*time.Millisecond),

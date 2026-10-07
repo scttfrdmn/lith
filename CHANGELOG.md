@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-s3bench -warmup`, and the measured window's offset from process start**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A discarded window of the given
+  length before the measured one, in the same process, and a `start+NNNms` field in the output
+  so a cold first arm is self-identifying in a log.
+
+  The first s3bench process of a run has been measured with a 3–10× worse first-byte tail in
+  **7 of 7 runs**, with the idle gap beforehand ranging from seconds to ~8 h — which rules out
+  a simply-cold endpoint. The decisive datum: a first s3bench process read **endpoint 97.7 ms
+  while a lith mount on the same box, same key, same instant read 41.2 ms**. That rules out
+  the endpoint, the network path, and box-wide state like DNS or the NIC, and leaves something
+  in or keyed to the process's **first contact**.
+
+  So this is both the mitigation and a diagnostic: **if an in-process warm-up removes the
+  effect, it is first-contact-in-process** rather than anything run-level, and no amount of
+  warming from a separate process would have fixed it. Observed immediately: with a warm-up
+  the `conn="new"` arm disappears entirely and acquisition drops from 0.65–149 ms to 0.01 ms.
+
+  The warm-up does **not** reset the request cursor, so the measured window reads different
+  ranges than the warm-up did and cannot be measuring a self-warmed object; and its wire
+  samples are discarded, which matters because folding them in would silently return the
+  effect being removed.
+
+### Added
+
 - **`lith-s3bench` reports the same wire split as the mount, and labels its auth mode**
   ([#350](https://github.com/scttfrdmn/lith/issues/350)). A `SPLIT` line per connection
   class: `acquire`, `write`, `endpoint` and their `wire` sum, from the *same*
