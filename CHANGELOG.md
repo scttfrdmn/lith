@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-07
+
 ### Added
 
 - **`lith-s3bench -fresh-buffers`: the causal test for allocation pressure**
@@ -27,7 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocated *before* the request, as a fill does, so the allocation sits on the same side of
   the timer as it does in lith.
 
-### Added
 
 - **The Go runtime is on the scrape** ([#350](https://github.com/scttfrdmn/lith/issues/350)).
   `go_gc_duration_seconds`, `go_sched_latencies_seconds`, `go_memstats_alloc_bytes_total`,
@@ -2651,7 +2652,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/scttfrdmn/lith/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/scttfrdmn/lith/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/scttfrdmn/lith/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/scttfrdmn/lith/compare/v1.6.0...v1.7.0
