@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -76,6 +77,35 @@ type Metrics struct {
 // New creates and registers the metric collectors on a fresh registry.
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
+	// THE GO RUNTIME COLLECTORS, and their absence is why they are being added now (#350).
+	//
+	// lith's registry has always been a bare prometheus.NewRegistry(), so GC pause time,
+	// assist time, allocation rate and goroutine count have been invisible in every scrape
+	// ever taken from a lith mount. That is the sixth time in this project that the counter
+	// which would have shown a defect was not exported -- the pattern behind #318, #319 and
+	// #341 -- and it bit at the worst moment: five hypotheses for an in-mount first-byte
+	// latency were refuted one at a time, and the runtime was never on the list because it
+	// could not be looked at.
+	//
+	// It is specifically NOT ruled out by the wire measurement. httptrace's
+	// GotFirstResponseByte fires on the TRANSPORT's read goroutine, so it is immune to the
+	// fill goroutine's scheduling and NOT immune to a runtime-wide pause or assist: the
+	// byte can arrive on time and the callback still be late. And the two programs being
+	// compared differ sharply in allocation -- a 153-fill lith burst moves 1.21 GB through
+	// ~1200 fresh 1 MiB cloneChunk buffers, where lith-s3bench reuses one buffer per worker
+	// and allocates essentially nothing after startup.
+	//
+	// Registered as instruments, not as a claim. A sub-millisecond STW pause does not
+	// explain a 60-100 ms first byte, so if the runtime is involved it is assists and
+	// memory bandwidth rather than pauses, and that is a measurement and not an argument.
+	reg.MustRegister(collectors.NewGoCollector(
+		collectors.WithGoCollectorRuntimeMetrics(
+			// GC, scheduling latency and allocation, which is what the question is about.
+			collectors.MetricsGC,
+			collectors.MetricsScheduler,
+		),
+	))
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := &Metrics{
 		reg: reg,
 		cacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{

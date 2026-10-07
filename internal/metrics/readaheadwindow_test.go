@@ -372,3 +372,48 @@ func TestWireTTFBIsSplitByConnectionReuse(t *testing.T) {
 	var nilM *Metrics
 	nilM.S3WireTTFB(time.Millisecond, time.Millisecond, true)
 }
+
+// #350: the Go runtime must be visible on a lith scrape.
+//
+// lith's registry was a bare prometheus.NewRegistry() for its whole life, so GC pause time,
+// scheduling latency, allocation rate and goroutine count were absent from every scrape ever
+// taken from a mount. Five hypotheses for an in-mount first-byte latency were refuted one at
+// a time and the runtime was never among them, because it could not be looked at.
+//
+// Asserted by SERIES NAME rather than by "the collector is registered", because a registry
+// with a collector that exports nothing useful looks identical from outside to one without.
+func TestGoRuntimeIsVisibleOnAScrape(t *testing.T) {
+	m := New()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	got := rec.Body.String()
+
+	for _, want := range []string{
+		// GC: the quantity that could delay an httptrace callback on the transport's
+		// goroutine without the endpoint being slow.
+		"go_gc_duration_seconds",
+		// Allocation: the sharpest measurable difference between a lith burst (~1200
+		// fresh 1 MiB chunk buffers for 1.21 GB) and lith-s3bench (one reused buffer
+		// per worker).
+		"go_memstats_alloc_bytes_total",
+		// Scheduling latency, so "a goroutine waited to run" is a number rather than a
+		// hypothesis.
+		"go_sched_latencies_seconds",
+		// Goroutines, since a burst creates one per in-flight fill.
+		"go_goroutines",
+		// Process CPU, so a box-wide figure can be compared against lith's own share --
+		// an external cell measured 20-34% box CPU and correctly noted that cannot rule
+		// out per-process effects.
+		"process_cpu_seconds_total",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scrape is missing %q", want)
+		}
+	}
+
+	// lith's own series must still be there: adding the runtime collectors must not have
+	// replaced the registry or shadowed anything.
+	if !strings.Contains(got, "lith_cache_misses_total") {
+		t.Error("lith's own metrics disappeared when the runtime collectors were added")
+	}
+}
