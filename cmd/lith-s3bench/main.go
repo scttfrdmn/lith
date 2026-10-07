@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/scttfrdmn/lith/internal/s3client"
@@ -79,10 +78,26 @@ func main() {
 
 	ctx := context.Background()
 
-	// Build the client exactly like internal/s3client, plus the harness knobs.
-	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-		tuneTransport(t, poolSize, *readBuffer)
-	})
+	// THE WIRE SPLIT, shared with the mount (lith#350). An external comparison needs both
+	// programs reporting the SAME intervals through the SAME code, because the question is
+	// which of them the endpoint answers slower -- and a difference in how the two measure
+	// would be indistinguishable from a difference in what they measure.
+	//
+	// It is always on here. This is a diagnostic tool, so there is nothing to protect: the
+	// mount keeps it behind --wire-ttfb because that flag forces the plain-*http.Client
+	// path, and that is a real cost in production. Here the plain path is the only path.
+	var wireMu sync.Mutex
+	var wireSamples []s3client.WireSample
+	collect := func(w s3client.WireSample) {
+		wireMu.Lock()
+		wireSamples = append(wireSamples, w)
+		wireMu.Unlock()
+	}
+	// Built the way internal/s3client builds it on its TransportWrap path, so the transport
+	// tuning is identical and only the RoundTripper wrapper differs.
+	baseTransport := &http.Transport{}
+	tuneTransport(baseTransport, poolSize, *readBuffer)
+	httpClient := &http.Client{Transport: s3client.NewWireTracer(baseTransport, collect)}
 	loadOpts := []func(*config.LoadOptions) error{
 		config.WithHTTPClient(httpClient),
 		config.WithRegion(*region),
@@ -265,10 +280,47 @@ func main() {
 	mbps := float64(bytesRead.Load()) / (1 << 20) / wall.Seconds()
 	cpuSec := rusEnd - rusStart
 	ncpu := float64(runtime.NumCPU())
+	// The three intervals a first-byte latency is made of, split by connection reuse and
+	// reported exactly as the mount reports them (#350).
+	wireMu.Lock()
+	ws := append([]s3client.WireSample(nil), wireSamples...)
+	wireMu.Unlock()
+	for _, reused := range []bool{false, true} {
+		var wire, acq, wr, ep []time.Duration
+		for _, w := range ws {
+			if w.Reused != reused {
+				continue
+			}
+			wire = append(wire, w.Wire)
+			acq = append(acq, w.ConnAcquire)
+			wr = append(wr, w.Write)
+			ep = append(ep, w.Endpoint)
+		}
+		if len(wire) == 0 {
+			continue
+		}
+		label := "new"
+		if reused {
+			label = "reused"
+		}
+		mean := func(d []time.Duration) float64 {
+			var t time.Duration
+			for _, x := range d {
+				t += x
+			}
+			return float64(t.Microseconds()) / float64(len(d)) / 1000
+		}
+		// Means, not percentiles, because the question is which INTERVAL carries the
+		// time and the three means must sum to the wire mean -- a property percentiles
+		// do not have.
+		fmt.Printf("SPLIT  conn=%-6s n=%4d  acquire=%7.2fms write=%7.3fms endpoint=%7.2fms  wire=%7.2fms\n",
+			label, len(wire), mean(acq), mean(wr), mean(ep), mean(wire))
+	}
+
 	// TTFB line first: #350 is about whether depth buys throughput with LATENCY, so the
 	// first-byte distribution and the aggregate belong side by side at every width.
-	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
-		*workers, *partStr>>20, *freshBuf, len(allTTFB),
+	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v auth=%s  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
+		*workers, *partStr>>20, *freshBuf, authLabel(*noSign), len(allTTFB),
 		float64(tpct(10).Microseconds())/1000, float64(tpct(50).Microseconds())/1000,
 		float64(tpct(90).Microseconds())/1000, float64(tpct(99).Microseconds())/1000,
 		fracUnder(allTTFB, 25*time.Millisecond), fracUnder(allTTFB, 50*time.Millisecond),
@@ -299,4 +351,17 @@ func getCPU() float64 {
 	u := time.Duration(ru.Utime.Sec)*time.Second + time.Duration(ru.Utime.Usec)*time.Microsecond
 	s := time.Duration(ru.Stime.Sec)*time.Second + time.Duration(ru.Stime.Usec)*time.Microsecond
 	return (u + s).Seconds()
+}
+
+// authLabel names the credential mode in the output line. Self-labelling because an
+// external comparison ran for several cells with the mount SIGNING and this tool ANONYMOUS
+// -- identical request fields, identical ranges, identical SDK, different credentials --
+// and nothing in either program's output said so. Auth turned out to be worth only 6-21
+// points rather than the gap under investigation, but it cost cells to find that out, and a
+// confound that is visible in the output cannot persist silently.
+func authLabel(noSign bool) string {
+	if noSign {
+		return "anon"
+	}
+	return "signed"
 }
