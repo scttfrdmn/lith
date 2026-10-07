@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-s3bench -fresh-buffers`: the causal test for allocation pressure**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). Allocates a new read buffer per
+  request and **retains** them for the run, instead of reusing one per worker.
+
+  Six mechanisms for the in-mount first-byte latency have now been refuted by measurement,
+  and the remaining asymmetry between a lith mount and this tool at the same shape, depth,
+  part size, transport and SDK is allocation: a 153-fill burst moves 1.21 GB through ~1200
+  fresh 1 MiB chunk buffers, where this tool normally allocates essentially nothing after
+  startup. The Go runtime metrics added alongside (#377) can only show *correlation* — lith's
+  GC numbers during a slow burst. **This arm is causal**: if `-fresh-buffers` makes this tool
+  slow at the same shape, allocation is the cause, measured with no lith code involved.
+
+  The buffers are retained rather than dropped, which is the point: a mount's chunk buffers go
+  into the memory tier and stay reachable, so they are promoted rather than collected cheaply.
+  Allocating and discarding would test a different and much kinder thing. They are also
+  allocated *before* the request, as a fill does, so the allocation sits on the same side of
+  the timer as it does in lith.
+
+### Added
+
 - **The Go runtime is on the scrape** ([#350](https://github.com/scttfrdmn/lith/issues/350)).
   `go_gc_duration_seconds`, `go_sched_latencies_seconds`, `go_memstats_alloc_bytes_total`,
   `go_goroutines` and `process_cpu_seconds_total`, alongside lith's own series.
