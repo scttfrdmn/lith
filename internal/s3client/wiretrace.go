@@ -40,6 +40,26 @@ type WireSample struct {
 	Reused bool
 	// TLS is the TLS handshake alone, zero when the connection was reused or plaintext.
 	TLS time.Duration
+	// Write is GotConn -> WroteRequest: how long it took to get the request onto a
+	// connection we already held. For a GET this is a few hundred bytes, so it should be
+	// microseconds -- unless the connection is not actually ready to carry it.
+	//
+	// THE LAST UNSPLIT INTERVAL (lith#350). Wire is request start -> first response byte,
+	// and it contains three things: acquiring a connection (measured: ~1 ms reused, 3-5 ms
+	// new), writing the request, and the endpoint answering. Six mechanisms for an
+	// in-mount 60-100 ms first byte have been refuted by measurement -- request
+	// concurrency twice, bytes in flight, box CPU, above-the-wire, connection setup,
+	// allocation -- and the Go runtime shows ~1 ms of STW per burst with not one of ~31k
+	// scheduler waits over 0.9 ms. So the delay is inside the wire interval and is not
+	// explained by anything above it, which leaves these two intervals, neither of which
+	// has ever been looked at.
+	Write time.Duration
+	// Endpoint is WroteRequest -> GotFirstResponseByte: the only part of Wire that is
+	// genuinely S3 answering. If this is ~28 ms while Wire is ~130 ms, the delay is ours
+	// and Write says where. If this IS ~130 ms, then S3 answers lith's requests slower
+	// than it answers an equivalent client's, and the question becomes what differs about
+	// the requests rather than about the program issuing them.
+	Endpoint time.Duration
 	// RoundTrip is the whole RoundTrip call, for reference.
 	RoundTrip time.Duration
 }
@@ -78,13 +98,16 @@ func (w *WireTracer) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	// All written on the transport's goroutine(s) and read here only after RoundTrip has
 	// returned. The atomics make that edge explicit rather than relying on it.
-	var firstByte, gotConn, tlsStart, tlsDone atomic.Int64
+	var firstByte, gotConn, wrote, tlsStart, tlsDone atomic.Int64
 	var reused atomic.Bool
 	trace := &httptrace.ClientTrace{
 		GotFirstResponseByte: func() { firstByte.Store(time.Now().UnixNano()) },
 		GotConn: func(info httptrace.GotConnInfo) {
 			gotConn.Store(time.Now().UnixNano())
 			reused.Store(info.Reused)
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			wrote.Store(time.Now().UnixNano())
 		},
 		TLSHandshakeStart: func() { tlsStart.Store(time.Now().UnixNano()) },
 		TLSHandshakeDone:  func(tls.ConnectionState, error) { tlsDone.Store(time.Now().UnixNano()) },
@@ -107,8 +130,18 @@ func (w *WireTracer) RoundTrip(req *http.Request) (*http.Response, error) {
 		Reused:    reused.Load(),
 		RoundTrip: rt,
 	}
-	if gc := gotConn.Load(); gc > 0 {
+	gc := gotConn.Load()
+	if gc > 0 {
 		s.ConnAcquire = time.Duration(gc - start.UnixNano())
+	}
+	// The two halves of what remains after acquisition. Both only when their endpoints
+	// fired, so a partial trace reports zero rather than a number derived from a missing
+	// timestamp -- which is how a 100 ms figure could be manufactured out of nothing.
+	if w := wrote.Load(); w > 0 {
+		if gc > 0 {
+			s.Write = time.Duration(w - gc)
+		}
+		s.Endpoint = time.Duration(fb - w)
 	}
 	if ts, td := tlsStart.Load(), tlsDone.Load(); ts > 0 && td > ts {
 		s.TLS = time.Duration(td - ts)
