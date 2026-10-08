@@ -52,18 +52,19 @@ type rangeReq struct {
 
 func main() {
 	var (
-		bucket     = flag.String("bucket", "1000genomes", "S3 bucket")
-		region     = flag.String("region", "us-east-1", "bucket region")
-		keysCSV    = flag.String("keys", "", "comma-separated keys (required)")
-		workers    = flag.Int("workers", 64, "concurrent workers")
-		pool       = flag.Int("pool", 0, "transport idle-conn pool size (0 = workers)")
-		partStr    = flag.Int64("part", 8<<20, "range GET size in bytes")
-		dur        = flag.Duration("duration", 20*time.Second, "measurement window")
-		noSign     = flag.Bool("no-sign-request", true, "anonymous requests")
-		useHTTP    = flag.Bool("http", false, "use http:// (isolates TLS cost; public buckets only)")
-		readBuffer = flag.Int("read-buffer", 0, "http.Transport.ReadBufferSize in bytes (0 = default)")
-		warmup     = flag.Duration("warmup", 0, "run a DISCARDED window of this length before the measured one, in the same process (lith#381). The first s3bench process of a run has been measured with a 3-10x worse first-byte tail in 7 of 7 runs, and at one point a first process read endpoint 97.7 ms while a lith mount on the same box, same key and same instant read 41.2 ms -- which rules out the endpoint, the path and box-wide state, and leaves something in or keyed to the process's FIRST CONTACT. This flag is therefore both the mitigation and a diagnostic: if an in-process warm-up removes the effect, it is first-contact-in-process rather than anything run-level, and no amount of warming from a separate process would have fixed it")
-		freshBuf   = flag.Bool("fresh-buffers", false, "allocate a new read buffer PER REQUEST instead of reusing one per worker, and retain them for the run (lith#350). This is the CAUSAL test for whether allocation pressure is what slows a lith mount's first bytes: a mount moves 1.21 GB through ~1200 fresh 1 MiB chunk buffers in a 153-fill burst, while this tool normally reuses one buffer per worker and allocates essentially nothing. If -fresh-buffers makes this tool slow at the same shape and depth, allocation is the cause, measured directly and with no lith code involved")
+		bucket      = flag.String("bucket", "1000genomes", "S3 bucket")
+		region      = flag.String("region", "us-east-1", "bucket region")
+		keysCSV     = flag.String("keys", "", "comma-separated keys (required)")
+		workers     = flag.Int("workers", 64, "concurrent workers")
+		pool        = flag.Int("pool", 0, "transport idle-conn pool size (0 = workers)")
+		partStr     = flag.Int64("part", 8<<20, "range GET size in bytes")
+		dur         = flag.Duration("duration", 20*time.Second, "measurement window")
+		noSign      = flag.Bool("no-sign-request", true, "anonymous requests")
+		useHTTP     = flag.Bool("http", false, "use http:// (isolates TLS cost; public buckets only)")
+		readBuffer  = flag.Int("read-buffer", 0, "http.Transport.ReadBufferSize in bytes (0 = default)")
+		warmup      = flag.Duration("warmup", 0, "run a DISCARDED window of this length before the measured one, in the same process (lith#381). The first s3bench process of a run has been measured with a 3-10x worse first-byte tail in 7 of 7 runs, and at one point a first process read endpoint 97.7 ms while a lith mount on the same box, same key and same instant read 41.2 ms -- which rules out the endpoint, the path and box-wide state, and leaves something in or keyed to the process's FIRST CONTACT. This flag is therefore both the mitigation and a diagnostic: if an in-process warm-up removes the effect, it is first-contact-in-process rather than anything run-level, and no amount of warming from a separate process would have fixed it")
+		warmWorkers = flag.Int("warmup-workers", 0, "worker count for the -warmup window (0 = same as -workers). Lets the warm-up be SMALLER than the measured burst, which is the variable the #381 asymmetry turns on: a fresh lith mount is fast while a fresh s3bench process at the same instant is slow, and the difference is that a mount does region resolution and an index read BEFORE its burst. The ladder showed a tiny separate request (head-object, or one worker for 0.2 s) does not warm the effect, so the question is how much traffic does -- and answering it needs the warm-up and the measurement sized independently in ONE process")
+		freshBuf    = flag.Bool("fresh-buffers", false, "allocate a new read buffer PER REQUEST instead of reusing one per worker, and retain them for the run (lith#350). This is the CAUSAL test for whether allocation pressure is what slows a lith mount's first bytes: a mount moves 1.21 GB through ~1200 fresh 1 MiB chunk buffers in a 153-fill burst, while this tool normally reuses one buffer per worker and allocates essentially nothing. If -fresh-buffers makes this tool slow at the same shape and depth, allocation is the cause, measured directly and with no lith code involved")
 	)
 	flag.Parse()
 
@@ -183,8 +184,12 @@ func main() {
 	// measuring a self-warmed object.
 	if *warmup > 0 {
 		warmDeadline := time.Now().Add(*warmup)
+		nWarm := *warmWorkers
+		if nWarm <= 0 {
+			nWarm = *workers
+		}
 		var ww sync.WaitGroup
-		for w := 0; w < *workers; w++ {
+		for w := 0; w < nWarm; w++ {
 			ww.Add(1)
 			go func() {
 				defer ww.Done()
@@ -361,9 +366,9 @@ func main() {
 
 	// TTFB line first: #350 is about whether depth buys throughput with LATENCY, so the
 	// first-byte distribution and the aggregate belong side by side at every width.
-	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v auth=%s warmup=%v start+%dms  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
+	fmt.Printf("TTFB   workers=%d part=%dMiB fresh=%v auth=%s warmup=%v/%dw start+%dms  n=%d  p10=%.1fms p50=%.1fms p90=%.1fms p99=%.1fms  <=25ms=%.1f%% <=50ms=%.1f%% <=60ms=%.1f%%\n",
 		*workers, *partStr>>20, *freshBuf, authLabel(*noSign), *warmup,
-		sinceStart.Milliseconds(), len(allTTFB),
+		warmupWorkers(*warmWorkers, *workers), sinceStart.Milliseconds(), len(allTTFB),
 		float64(tpct(10).Microseconds())/1000, float64(tpct(50).Microseconds())/1000,
 		float64(tpct(90).Microseconds())/1000, float64(tpct(99).Microseconds())/1000,
 		fracUnder(allTTFB, 25*time.Millisecond), fracUnder(allTTFB, 50*time.Millisecond),
@@ -407,4 +412,14 @@ func authLabel(noSign bool) string {
 		return "anon"
 	}
 	return "signed"
+}
+
+// warmupWorkers resolves the warm-up's worker count for the output line, so an arm that
+// warmed at a different scale than it measured says so rather than looking like one that
+// did not.
+func warmupWorkers(warm, workers int) int {
+	if warm > 0 {
+		return warm
+	}
+	return workers
 }
