@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`lith-s3bench -warmup-workers`: size the warm-up independently of the measured burst**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). The output line now reports
+  `warmup=<dur>/<n>w`, so an arm that warmed at a different scale than it measured says so.
+
+  This is the variable the remaining #381 asymmetry turns on. A **fresh lith mount is fast
+  while a fresh `lith-s3bench` process at the same instant is slow** — 17 of 18 simultaneous
+  pairs — and the structural difference is that a mount does region resolution and an index
+  read *before* its burst. The ladder established that a *tiny* separate request does not warm
+  the effect (`head-object` and one worker for 0.2 s both left it present), so the open
+  question is **how much traffic does**, and answering it needs the warm-up and the
+  measurement sized independently *within one process* — which `-warmup` alone could not
+  express.
+
+### Added
+
 - **`lith-s3bench -warmup`, and the measured window's offset from process start**
   ([#381](https://github.com/scttfrdmn/lith/issues/381)). A discarded window of the given
   length before the measured one, in the same process, and a `start+NNNms` field in the output
