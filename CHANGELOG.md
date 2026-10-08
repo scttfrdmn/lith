@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--prefetch-sibling-coverage`: concurrent readers of one object can establish again**
+  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Experimental, off by default.
+
+  lith opens with `FOPEN_KEEP_CACHE`, so every descriptor on an inode shares the kernel page
+  cache: a sibling's reads are served by the kernel and never reach lith, each handle's own
+  stream is punctate with coverage ≈ 1/N, and from **four** concurrent readers of one object
+  the [#221](https://github.com/scttfrdmn/lith/issues/221) coverage gate holds every handle
+  provisional so **nothing prefetches**. Measured **243× slower** than one reader alone with
+  byte amplification of **1.001** — the cleanest byte count of any cell and the slowest run,
+  so no byte or request counter can see it.
+
+  A hole now counts as covered when another descriptor is open on the same object **and** the
+  bytes in it were already *demanded* through lith. Both conditions are load-bearing, and the
+  first was added after a test caught the fix being wrong: lith fetches a whole 1 MiB chunk to
+  serve a 128 KiB read, so for holes **smaller than a chunk** a *lone strided* reader's own
+  demand fetches make its own holes look demanded — which is
+  [#222](https://github.com/scttfrdmn/lith/issues/222)'s shape and exactly what must not
+  establish. At chunk granularity the two cases are indistinguishable; what differs is *who*
+  demanded the bytes, and "someone else has this file open" is the cheapest sound proxy.
+
+  The demanded condition holds the band **between a chunk and a block**, which nothing else
+  covers. Holes wider than `--block-size` never reach either condition — the byte-gap gate
+  forces `Random` first, which is also why a 16 MiB-stride fixture tests nothing here and the
+  first version of that test was vacuous for passing on the wrong gate.
+
+  "Already demanded" rather than "resident" is deliberate twice over: a random walk's holes
+  are not resident at all ([#232](https://github.com/scttfrdmn/lith/issues/232) — no lever
+  there, and prefetching for one adds bytes without moving the wall clock), and lith's own
+  unread over-fetch *is* resident but undemanded, which must not count or a strided reader
+  would establish on regions its own window swept.
+
+### Added
+
 - **Docs: the per-connection cold first-traffic cost, and the evidence gate's second job**
   ([#381](https://github.com/scttfrdmn/lith/issues/381)). A fourth rule in CONTRIBUTING's
   measurement section, and the product consequence in `knobs.md`.

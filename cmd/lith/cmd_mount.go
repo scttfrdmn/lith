@@ -53,6 +53,7 @@ type mountFlags struct {
 	noRegionCheck     bool
 	prefetchPressure  float64
 	wireTTFB          bool
+	siblingCoverage   bool
 	metrics           string
 	pprof             string
 	timelineCSV       string
@@ -110,6 +111,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.siblingWindow, "sibling-window", 4, "max index-position gap between successive opens in a directory that still counts as walking it in key order (#63)")
 	fl.IntVar(&f.siblingRead, "sibling-readahead", 16, "how many following siblings a detected directory walk prefetches whole (0 disables)")
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
+	fl.BoolVar(&f.siblingCoverage, "prefetch-sibling-coverage", false, "count a hole in a handle's read stream as covered when the bytes in it were already DEMANDED through lith (#316). EXPERIMENTAL, off by default. The case: lith opens with FOPEN_KEEP_CACHE so every descriptor on an inode shares the kernel page cache, a sibling's reads are served by the kernel and never reach lith, and each handle's own stream is punctate with coverage about 1/N -- so from four concurrent readers of one object the #221 coverage gate holds every handle provisional and NOTHING prefetches. Measured at 243x slower than one reader alone, with byte amplification of 1.001, so no byte or request counter can see it. The predicate is 'already demanded' and not 'resident' on purpose: a random walk's holes are not resident at all and must not be discounted (#232 -- no lever there), and lith's own unread over-fetch is resident but undemanded and must not count either, or a strided reader would establish on regions its own window swept (#222). Hole alignment cannot tell those apart; all three are 128 KiB-aligned")
 	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds: first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (#350). A DIAGNOSTIC, not a tuning knob -- if the wire figure is low while the fill figure is high, the delay is above the wire (SDK middleware, deserialization, or the fill goroutine waiting to be rescheduled) rather than at the endpoint. It forces the plain-*http.Client path instead of the AWS SDK's BuildableClient, because that one exposes no RoundTripper hook, so do not leave it on in production")
 	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of --mem-cache (#313). 0 (default) disables it. ONLY FOR MOUNTS WHERE THE EVIDENCE GATE IS OFF -- cross-region, or where the bucket's region cannot be determined. In-region the gate already bounds the start transient by each handle's own consumed bytes, and this flag never binds (measured: peak pressure 0.50, zero holds). MEASURED BAND 0.85-1.0: at 1.0 wall is 2.8x better than unbounded (41 s vs 116 s) with 71-119 evictions left; at 0.85 evictions reach 0-4 for about 10% more wall; at 0.5 it over-throttles by 55%. ABOVE 1.0 IT CANNOT WORK -- it admits more unread bytes than the tier holds, so the tier still evicts (1.3 held pressure exactly as asked and still evicted ~2100). IT BOUNDS BYTES, NOT FAIRNESS: reader spread stays 2.3-3.1 at every threshold against ~1.05 with the evidence gate on, so this limits the collapse rather than fixing it")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region. The warning is advisory and costs one IMDS lookup; silence it for a deliberately cross-region mount, or where IMDS is blocked and you do not want the attempt (#362)")
@@ -512,6 +514,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		DisableFooterTier2:     !f.footerTier2,
 		MaxReadahead:           f.maxReadahead,
 		ReadaheadEvidenceRatio: f.readaheadEvidence,
+		SiblingCoverage:        f.siblingCoverage,
 		NearRegion:             nearRegion,
 		RegionKnown:            regionKnown,
 		CoverageMin:            f.coverageMin,

@@ -282,3 +282,11 @@ func (w *pfWrapper) counterSnapshot() metrics.PrefetchDelta {
 		DeEstablished:    w.pf.DeEstablished(),
 	}
 }
+
+// setHoleDemanded installs the #316 hole-discount predicate under the wrapper's lock, so it
+// cannot be swapped while Observe is reading coverage.
+func (w *pfWrapper) setHoleDemanded(fn func(off, end int64) bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pf.SetHoleDemanded(fn)
+}
