@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docs: the per-connection cold first-traffic cost, and the evidence gate's second job**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A fourth rule in CONTRIBUTING's
+  measurement section, and the product consequence in `knobs.md`.
+
+  A new connection's S3 first-byte time starts at **~100–150 ms and settles to ~30 ms over
+  roughly its first second of traffic** — per-connection and ramp-like, not a setup cost: one
+  request per connection does *not* fix it, and about a second of traffic per connection does.
+  A client that opens many connections at once and measures immediately eats it in full: 22%
+  of first bytes under 50 ms against 92% after a one-second warm-up, so **a cold first arm
+  reads 3–10× worse than steady state**.
+
+  **The evidence gate's ramp turns out to protect against this, which nobody designed it for.**
+  Measured on two mounts started at the same instant: with the gate off lith opens **83% of its
+  fills on new connections every rep** and comes in **up to 49 points colder**, with *identical
+  bytes fetched*. The same cell explains the reused-connection queueing residual from #350 —
+  gate-off has **zero** (0.01 ms every rep) against 0.76–2.26 ms gate-on — so the ramp both
+  protects against the cold cost and causes the queueing. One mechanism, two signs.
+
+  Recorded with the consequence and the tension: gate-off mounts (cross-region, or
+  region-unknown) open their connections at once and pay the cold cost on every fresh mount,
+  which trades against the measured 1.96× ramp penalty at distance. **That net is unmeasured**,
+  and the docs say so rather than implying a recommendation.
+
+### Added
+
 - **`lith-s3bench -warmup-workers`: size the warm-up independently of the measured burst**
   ([#381](https://github.com/scttfrdmn/lith/issues/381)). The output line now reports
   `warmup=<dur>/<n>w`, so an arm that warmed at a different scale than it measured says so.

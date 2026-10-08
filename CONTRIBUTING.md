@@ -65,6 +65,20 @@ path: two models have been refuted by a clamp already present in the function be
 trusting a figure from an earlier session or a different fixture. A GET count published as
 `22 → 16` was `22 → 17` on six repeats. Report the stable value or the range.
 
+**Never quote a cold first run, and make the comparison simultaneous.** A fresh client's
+connections are slow for roughly their **first second of traffic each** — S3 first-byte time
+starts at ~100–150 ms and settles to ~30 ms, so a cold first arm reads **3–10× worse** than
+steady state ([#381](https://github.com/scttfrdmn/lith/issues/381)). One request per
+connection does not fix it; about a second of traffic per connection does. Use
+`lith-s3bench -warmup 1s -warmup-workers <same as -workers>`, or discard the first arm.
+
+And compare arms **at the same instant**, not interleaved minutes apart: endpoint conditions
+drift, and [#350](https://github.com/scttfrdmn/lith/issues/350) spent eight refuted
+mechanisms on a gap that was substantially an artifact of non-simultaneity. When a comparison
+keeps refuting mechanisms, check the comparison — were the arms simultaneous, were they
+configured identically (one was signing and one anonymous for several cells), and does the
+gap scale with something environmental.
+
 **Assert volume, not presence.** A test that checks a state, a non-zero, or a loose bound
 cannot catch a regression of the thing it was written for: `TestColdSequentialGetShape` once
 allowed "≤ 4× the ideal" and would not have noticed its own fix being reverted. Assert the
