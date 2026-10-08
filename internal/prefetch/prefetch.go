@@ -88,7 +88,10 @@ type Prefetcher struct {
 	// covMin<=0 disables the gate (behaviour-preserving default).
 	covWindow int
 	covMin    float64
-	covSpans  []covSpan // ring of the last covWindow reads (byte ranges)
+	covSpans  []covSpan
+	// holeDemanded, when set, is asked whether a hole between two reads holds bytes
+	// already demanded through lith (#316). Nil disables the discount.
+	holeDemanded func(off, end int64) bool // ring of the last covWindow reads (byte ranges)
 
 	// established (#229) is the single signal all three broad-fetch entry points
 	// gate on: the open-time ramp, the readahead-window growth, and open-time
@@ -301,15 +304,43 @@ func (p *Prefetcher) recordRead(off, length int64) float64 {
 	cs, ce := sp[0].off, sp[0].end
 	for _, s := range sp[1:] {
 		if s.off > ce {
-			union += ce - cs
-			cs, ce = s.off, s.end
-		} else if s.end > ce {
+			// A HOLE. Count it as covered when the bytes in it have already been
+			// DEMANDED through lith -- a sibling read them (#316).
+			//
+			// FOPEN_KEEP_CACHE shares the inode page cache, so a sibling's reads are
+			// served by the kernel and never reach this handle's stream. Its coverage
+			// is then ~1/N and the #221 gate holds it provisional from N=4, which
+			// measured 243x on 16 readers of one object with byte amplification of
+			// 1.001 -- the counters all look clean. Discounting such a hole makes the
+			// handle's coverage reflect what the FILE is doing rather than what this
+			// descriptor was left to see.
+			//
+			// The predicate is deliberately "already demanded", not "resident": a
+			// random walk's holes are not resident at all (#232 -- no lever, and
+			// prefetching for one adds bytes without moving the wall), and lith's own
+			// unread over-fetch is resident but undemanded, which must not count or a
+			// strided reader would discount the regions its own window swept and
+			// establish on them (#222's shape).
+			if p.holeDemanded == nil || !p.holeDemanded(ce, s.off) {
+				union += ce - cs
+				cs, ce = s.off, s.end
+				continue
+			}
+			ce = s.end
+			continue
+		}
+		if s.end > ce {
 			ce = s.end
 		}
 	}
 	union += ce - cs
 	return float64(union) / float64(span)
 }
+
+// SetHoleDemanded installs the predicate recordRead uses to decide whether a hole between
+// two reads holds bytes that were already demanded through lith (#316). A nil predicate
+// disables the discount, which is the default and reproduces the pre-#316 coverage exactly.
+func (p *Prefetcher) SetHoleDemanded(fn func(off, end int64) bool) { p.holeDemanded = fn }
 
 // SetGapMax sets the largest byte gap between consecutive reads that still counts
 // as sequential progress (#210/M16 1b). The FUSE layer sets it to the block size:

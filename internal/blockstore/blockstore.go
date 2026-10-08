@@ -1135,6 +1135,56 @@ func (bs *BlockStore) PrefetchUnreadResidentBytes() int64 {
 	return bs.mem.UnreadBytes()
 }
 
+// DemandedRange reports whether every chunk covering [off,end) is resident in a cache tier
+// AND has already been demanded -- fetched by a demand read, or prefetched and since consumed
+// (#316).
+//
+// WHY THIS PREDICATE AND NOT "IS IT RESIDENT". It is the one that distinguishes the three
+// ways a byte range lith has not just been asked for can look:
+//
+//   - A SIBLING ALREADY READ IT. Resident and not in bs.prefetched, because consuming a
+//     prefetched chunk removes it from that map. This is the #316 case: FOPEN_KEEP_CACHE
+//     shares the inode page cache, so one descriptor's reads are served by the kernel and
+//     never reach lith, and every other handle's offset stream has holes where its siblings
+//     read. Those holes are bytes a reader genuinely wanted.
+//   - NOBODY HAS TOUCHED IT. Not resident. This is a random walk's hole, and it must NOT be
+//     discounted -- #232 establishes that a random mmap walk has no lever and that
+//     prefetching for one adds bytes without moving the wall clock. Hole ALIGNMENT cannot
+//     tell these apart: 128 KiB-aligned holes describe a page-cache sibling and a random
+//     walk equally well, which is why the earlier proposal to key on alignment was wrong.
+//   - LITH FETCHED IT SPECULATIVELY AND NOBODY READ IT. Resident and still in
+//     bs.prefetched. Excluded deliberately: discounting our own unread over-fetch would be
+//     a feedback loop -- a strided reader whose skipped regions our window happened to
+//     cover would look better covered than it is, establish, and over-fetch further. That
+//     is #222's shape and this predicate is what keeps it out.
+//
+// Conservative on a partially-filled chunk: a chunk present with only some extents filled
+// does not count, because the hole may be in the missing part.
+func (bs *BlockStore) DemandedRange(k Key, off, end, objSize int64) bool {
+	if off >= end || off < 0 {
+		return false
+	}
+	if end > objSize {
+		end = objSize
+	}
+	if off >= end {
+		return false
+	}
+	for ci := off / ChunkSize; ci <= (end-1)/ChunkSize; ci++ {
+		_, filled, tier := bs.lookup(k, ci)
+		if tier == "" {
+			return false
+		}
+		if !covers(filled, maskForLen(chunkLenOf(ci, objSize))) {
+			return false
+		}
+		if _, undemanded := bs.prefetched.Load(bs.cacheKey(k, ci)); undemanded {
+			return false
+		}
+	}
+	return true
+}
+
 // PrefetchPressure is outstanding prefetch commitment as a fraction of the memory tier's
 // realized capacity -- the quantity the pressure gate admits against (#313). 0 when there
 // is no tier.

@@ -50,6 +50,10 @@ type Config struct {
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
+	// SiblingCoverage enables the #316 hole discount: a hole in a handle's read stream
+	// counts as covered when the bytes in it were already DEMANDED through lith, which is
+	// what a sibling descriptor's page-cache-served read looks like from here.
+	SiblingCoverage bool
 	// NearRegion and RegionKnown are the evidence policy's input (#349): whether the
 	// bucket is in the same region as this process, and whether that could be determined
 	// at all. Resolved once at mount, never from a measurement -- see evidenceRatioFor
@@ -263,7 +267,11 @@ type rawFS struct {
 	mu      sync.RWMutex
 	nodes   map[uint64]*node
 	handles map[uint64]*fileHandle
-	nextFh  uint64
+	// openPerKey counts open handles per object key, for the #316 hole discount. A hole
+	// may only be discounted when ANOTHER handle is open on the same file -- see
+	// siblingsOpen for why that condition is load-bearing rather than a heuristic.
+	openPerKey map[string]int
+	nextFh     uint64
 
 	// Sibling-readahead state (#63), guarded by sibMu.
 	sibMu         sync.Mutex
@@ -293,6 +301,7 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 		ctx:           context.Background(),
 		nodes:         map[uint64]*node{fuse.FUSE_ROOT_ID: {path: "", parent: fuse.FUSE_ROOT_ID, isDir: true}},
 		handles:       map[uint64]*fileHandle{},
+		openPerKey:    map[string]int{},
 		nextFh:        1,
 		sibLastPos:    map[string]int{},
 		sibPendingSet: map[string]struct{}{},
@@ -672,6 +681,16 @@ func (f *rawFS) logMiss(path string) {
 	slog.Info("lookup miss: path not under this mount's index", "path", "/"+path)
 }
 
+// siblingsOpen reports whether more than one descriptor is open on key (#316). Cheap: a
+// counter maintained at Open and Release, not a scan, because this is consulted per hole
+// per read.
+func (f *rawFS) siblingsOpen(key string) bool {
+	f.mu.RLock()
+	n := f.openPerKey[key]
+	f.mu.RUnlock()
+	return n > 1
+}
+
 // GetAttr returns attributes for a NodeId.
 func (f *rawFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
 	defer f.observe("getattr", time.Now())
@@ -727,11 +746,40 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	fh := f.nextFh
 	f.nextFh++
 	f.handles[fh] = h
+	f.openPerKey[h.key.Key]++
 	f.mu.Unlock()
 	// Mark the open on the timeline, so the interval between an application's open and the
 	// first byte it gets back is readable rather than inferred (#284). A no-op without
 	// --timeline-csv.
 	f.store.NoteHandleOpen(h.key.Key, fi.Size)
+
+	// #316: let the coverage gate see what the FILE is doing, not just what this
+	// descriptor was left to see after its siblings' reads were absorbed by the shared
+	// page cache. Per handle, because the predicate closes over this handle's key and
+	// size. Captured by value so a later index swap cannot change what it asks about.
+	if f.cfg.SiblingCoverage {
+		k, size := h.key, fi.Size
+		h.pf.setHoleDemanded(func(off, end int64) bool {
+			// BOTH conditions are necessary, and the first one is the correction that
+			// a one-handle test caught.
+			//
+			// "Already demanded" alone is not enough: lith fetches a whole 1 MiB chunk
+			// to serve a 128 KiB read, so a LONE strided reader's own demand reads make
+			// its own sub-chunk holes look demanded. At chunk granularity the #316 shape
+			// and a strided walk are indistinguishable -- in both cases the chunk
+			// covering the hole was demanded. What differs is WHO demanded it, and the
+			// cheapest sound proxy for "someone else" is that someone else is reading
+			// this file at all.
+			//
+			// So a hole is discounted only when another descriptor is open on the same
+			// object, which is exactly the condition #316 describes and precisely not
+			// #222's (a single strided reader).
+			if !f.siblingsOpen(k.Key) {
+				return false
+			}
+			return f.store.DemandedRange(k, off, end, size)
+		})
+	}
 
 	// CargoShip-backed file (#94): its bytes live in packed `.tar.zst` chunks.
 	// Resolve the read-mapping and stream the covering chunk region; a cargo
@@ -1191,6 +1239,13 @@ func (f *rawFS) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	f.mu.Lock()
 	h := f.handles[input.Fh]
 	delete(f.handles, input.Fh)
+	if h != nil {
+		if n := f.openPerKey[h.key.Key] - 1; n > 0 {
+			f.openPerKey[h.key.Key] = n
+		} else {
+			delete(f.openPerKey, h.key.Key)
+		}
+	}
 	f.mu.Unlock()
 	if h != nil {
 		// Give up this handle's share of the budget, or the divisor only ever grows (#301).
