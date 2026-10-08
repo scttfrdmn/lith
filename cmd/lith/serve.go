@@ -92,7 +92,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.maxRange, "max-range", "64MiB", "max coalesced range GET size")
 	fl.StringVar(&f.prefetchBudget, "prefetch-budget", "", "max bytes of un-demanded prefetch (default: 50% of --mem-cache)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
-	fl.BoolVar(&f.siblingCoverage, "prefetch-sibling-coverage", false, "count a hole in a handle's read stream as covered when its bytes were already demanded through lith (experimental, #316)")
+	fl.BoolVar(&f.siblingCoverage, "prefetch-sibling-coverage", false, "count a hole in a handle's read stream as covered when another descriptor is open on the same object AND its bytes were already demanded through lith (experimental, #316)")
 	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds, first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (diagnostic, #350)")
 	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment exceeds this fraction of --mem-cache; 0 disables (experimental, #313)")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region (#362)")
