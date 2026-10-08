@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--prefetch-sibling-coverage`'s `--help` described only one of its two conditions**
+  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Reported externally. I wrote that
+  help text before a test forced the design correction that *added* the sibling condition, and
+  then updated `knobs.md` and the code comments without revisiting the flag's own help — so
+  the one place an operator actually reads described "already demanded" alone.
+
+  That matters rather than being cosmetic: the sibling condition is what keeps a **lone
+  strided reader** from discounting its own sub-chunk holes and establishing, which is
+  [#222](https://github.com/scttfrdmn/lith/issues/222)'s shape. Someone reading the old help
+  would have had no way to know why the flag did nothing for a single reader, or that it was
+  deliberately doing nothing. The help now states both conditions, which hole sizes each one
+  covers, and the measured result.
+
 ### Added
 
 - **`--prefetch-sibling-coverage`: concurrent readers of one object can establish again**
@@ -33,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers. Holes wider than `--block-size` never reach either condition — the byte-gap gate
   forces `Random` first, which is also why a 16 MiB-stride fixture tests nothing here and the
   first version of that test was vacuous for passing on the wrong gate.
+
+  **Confirmed externally at the default `--prefetch-coverage-min`:** 16 of 16 readers
+  establish in both reps, wall **67 s → 2.9 s**, `coverage_held` from ~1000 to **16** (the
+  same as `O_DIRECT`), with the holes themselves unchanged — it discounts them rather than
+  removing them. It is also the most byte-efficient of the three ways to get there: **0.67 GB
+  fetched for 0.54 GB read**, against 1.89 GB for `--prefetch-coverage-min 0.05` and
+  0.86–1.53 GB for `O_DIRECT`.
 
   "Already demanded" rather than "resident" is deliberate twice over: a random walk's holes
   are not resident at all ([#232](https://github.com/scttfrdmn/lith/issues/232) — no lever
