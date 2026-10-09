@@ -29,7 +29,7 @@ func TestMeasuredTTFBDistinguishesTheSeedFromAMeasurement(t *testing.T) {
 	}
 
 	// One real sample flips it, and the value is the sample rather than the seed.
-	bs.recordTTFB(3 * time.Millisecond)
+	bs.recordTTFB(3*time.Millisecond, fillWhole)
 	d, measured = bs.MeasuredTTFB()
 	if !measured {
 		t.Error("a store with a sample still reports not-measured")
@@ -40,7 +40,7 @@ func TestMeasuredTTFBDistinguishesTheSeedFromAMeasurement(t *testing.T) {
 
 	// The median, not the latest or the mean — so one slow fill cannot move the policy.
 	for _, s := range []time.Duration{2, 4, 3, 900, 3} {
-		bs.recordTTFB(s * time.Millisecond)
+		bs.recordTTFB(s*time.Millisecond, fillWhole)
 	}
 	d, measured = bs.MeasuredTTFB()
 	if !measured {
@@ -53,8 +53,8 @@ func TestMeasuredTTFBDistinguishesTheSeedFromAMeasurement(t *testing.T) {
 	// A non-positive sample is ignored rather than recorded as zero, which would drag the
 	// median toward a latency no endpoint has.
 	before, _ := bs.MeasuredTTFB()
-	bs.recordTTFB(0)
-	bs.recordTTFB(-time.Second)
+	bs.recordTTFB(0, fillWhole)
+	bs.recordTTFB(-time.Second, fillWhole)
 	if after, _ := bs.MeasuredTTFB(); after != before {
 		t.Errorf("a zero/negative sample changed the median from %v to %v", before, after)
 	}

@@ -55,25 +55,26 @@ type Metrics struct {
 	formatIdxPfB  prometheus.Counter
 	formatRanges  *prometheus.CounterVec // format
 
-	fillPartial prometheus.Counter     // partial (sub-chunk) fills (#118)
-	fillBytes   *prometheus.CounterVec // fill bytes by kind=plan|demand|whole|gap (#118/#124)
-	fillRuns    prometheus.Counter     // coalesced fill-batch range GETs (#124)
-	fillGap     prometheus.Counter     // bytes fetched only to close coalesce gaps (#124)
-	fillBatchSz prometheus.Histogram   // ranges per fill batch (#124/session 30)
-	fillInfl    prometheus.Gauge       // fill-batch runs currently in flight (#31)
-	fillInflPk  prometheus.Gauge       // high-water mark of fill-batch runs in flight (#31)
-	nfsClients  prometheus.Gauge       // active NFS gateway clients (#143)
-	nfsSeqState prometheus.Gauge       // per-path sequential-read states held (#197)
-	nfsOps      *prometheus.CounterVec // NFS ops by op= (#143)
-	nfsReadByte prometheus.Counter     // bytes served over NFS READ (#143)
-	backFrames  prometheus.Counter     // CargoShip frames fetched (#94)
-	backReuse   prometheus.Counter     // CargoShip frames served from the decoded-frame cache (#137)
-	backDecomp  prometheus.Counter     // CargoShip bytes decompressed (#94)
-	backCkFail  prometheus.Counter     // CargoShip per-frame checksum failures (#94)
-	readSize    prometheus.Histogram   // FUSE read request sizes (#65)
-	readN       atomic.Int64           // read count, for bench mean
-	readSum     atomic.Int64           // summed read bytes, for bench mean
-	distinct    *distinctReads         // per-object chunk bitmaps (#65)
+	fillPartial prometheus.Counter       // partial (sub-chunk) fills (#118)
+	fillBytes   *prometheus.CounterVec   // fill bytes by kind=plan|demand|whole|gap (#118/#124)
+	fillSecs    *prometheus.HistogramVec // fill first-byte latency by the same kind (#362)
+	fillRuns    prometheus.Counter       // coalesced fill-batch range GETs (#124)
+	fillGap     prometheus.Counter       // bytes fetched only to close coalesce gaps (#124)
+	fillBatchSz prometheus.Histogram     // ranges per fill batch (#124/session 30)
+	fillInfl    prometheus.Gauge         // fill-batch runs currently in flight (#31)
+	fillInflPk  prometheus.Gauge         // high-water mark of fill-batch runs in flight (#31)
+	nfsClients  prometheus.Gauge         // active NFS gateway clients (#143)
+	nfsSeqState prometheus.Gauge         // per-path sequential-read states held (#197)
+	nfsOps      *prometheus.CounterVec   // NFS ops by op= (#143)
+	nfsReadByte prometheus.Counter       // bytes served over NFS READ (#143)
+	backFrames  prometheus.Counter       // CargoShip frames fetched (#94)
+	backReuse   prometheus.Counter       // CargoShip frames served from the decoded-frame cache (#137)
+	backDecomp  prometheus.Counter       // CargoShip bytes decompressed (#94)
+	backCkFail  prometheus.Counter       // CargoShip per-frame checksum failures (#94)
+	readSize    prometheus.Histogram     // FUSE read request sizes (#65)
+	readN       atomic.Int64             // read count, for bench mean
+	readSum     atomic.Int64             // summed read bytes, for bench mean
+	distinct    *distinctReads           // per-object chunk bitmaps (#65)
 }
 
 // New creates and registers the metric collectors on a fresh registry.
@@ -253,6 +254,17 @@ func New() *Metrics {
 		fillBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_fill_bytes_total", Help: "Bytes fetched from S3 by fill kind: plan (format projection plan), demand-batch (coalesced union of a demand-read burst), demand (single unfilled-extent read), whole (streaming/prefetch), gap (fetched only to close a sub-coalesce-gap hole) (#118/#124/#125).",
 		}, []string{"kind"}),
+		fillSecs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "lith_fill_seconds",
+			Help: "S3 FIRST-BYTE latency per fill, split by the SAME kind label as lith_fill_bytes_total (#362). kind=\"whole\" is a streaming or prefetch fill; kind=\"demand\" is a read of an unfilled extent that no prediction covered -- which IS the random-fault shape of #232. So {kind=\"demand\"} answers \"what is a fault costing me\", its _count answers \"how many faults\", and the split against kind=\"whole\" answers \"is this mount streaming or faulting\". An operator lost most of a day to a 1.2 TB mount that was working correctly in its worst regime, because the per-fault latency and the fill kind were both known internally and neither was exported. READ IT WITH lith_ttfb_floor_seconds, which is load-invariant by construction: demand fills at ~141 ms against a ~19 ms endpoint floor is one round trip per miss, and lith has no lever for it (#232). There is deliberately no threshold here and no verdict -- the numbers are lith's job and the judgement is the operator's.",
+			// Same buckets as lith_ttfb_seconds, so the two are directly comparable, with
+			// the long tail that matters here: a 4 KiB probe into a TB-scale hash table was
+			// measured at 141 ms, which sits in the 0.2 bucket.
+			Buckets: []float64{
+				0.001, 0.005, 0.010, 0.020, 0.025, 0.030, 0.040, 0.050,
+				0.060, 0.080, 0.100, 0.200, 0.500, 1.0,
+			},
+		}, []string{"kind"}),
 		fillRuns: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_fill_runs_total", Help: "Coalesced fill-batch range GETs (#124).",
 		}),
@@ -305,7 +317,7 @@ func New() *Metrics {
 		m.inflight, m.prefetchIss, m.prefetchHit, m.uncovered, m.straddle, m.staleTotal, m.fuseLatency, m.prefetchWait,
 		m.pfHalved, m.pfResetRand, m.pfLowCoverage, m.pfCovHeld, m.pfPressHeld, m.ttfb, m.wireTTFB, m.connAcquire, m.reqWrite, m.endpointTTFB, m.pfEvClamped, m.pfEvWithheld, m.pfDeEstab, m.pfEvictUnread, m.sibPrefetch, m.sibUnread, m.formatDetect,
 		m.formatPlane, m.formatReplan, m.formatIdxPfB, m.formatRanges, m.readSize,
-		m.fillPartial, m.fillBytes, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
+		m.fillPartial, m.fillBytes, m.fillSecs, m.fillRuns, m.fillGap, m.fillBatchSz, m.fillInfl, m.fillInflPk,
 		m.backFrames, m.backReuse, m.backDecomp, m.backCkFail,
 		m.nfsClients, m.nfsSeqState, m.nfsOps, m.nfsReadByte)
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -957,4 +969,12 @@ func (d *distinctReads) totalBytes() int64 {
 		total += o.set * o.gran
 	}
 	return total
+}
+
+// FillSeconds records a fill's first-byte latency under the same kind label as FillBytes
+// (#362). Nil-safe.
+func (m *Metrics) FillSeconds(kind string, d time.Duration) {
+	if m != nil && m.fillSecs != nil {
+		m.fillSecs.WithLabelValues(kind).Observe(d.Seconds())
+	}
 }

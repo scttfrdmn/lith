@@ -159,13 +159,42 @@ func floorIndex(n int) int {
 	return 1
 }
 
-// recordTTFB feeds a fill's first-byte latency into the rolling windows.
-func (bs *BlockStore) recordTTFB(d time.Duration) {
+// recordTTFB feeds a fill's first-byte latency into the rolling windows, and exports it
+// LABELLED BY FILL KIND (#362).
+//
+// WHY THE KIND IS THE USEFUL LABEL. An operator mounted a 1.206 TB kraken2 database and ran a
+// tool that classified zero reads in eleven minutes, with bytes trickling in. The mount was
+// working correctly -- it was in #232's regime, a serial fault stream at ~141 ms per 4 KiB
+// probe, which lith has no lever to speed up -- and it took three instances and a lot of wrong
+// theories to establish that, because, in their words: "the per-fault latency, the fill kind,
+// and the random-vs-sequential classification are all things lith knows and I couldn't see."
+//
+// `whole` is a streaming/prefetch fill; `demand` is a read of an unfilled extent that no
+// prediction covered, which IS the fault-stream shape. So lith_fill_seconds{kind="demand"}
+// answers "what is a fault costing me", its _count answers "how many faults", and the split
+// against kind="whole" answers "is this mount streaming or faulting" -- the three things they
+// could not see, as a scrape rather than a judgement.
+//
+// LABELLED BY KIND RATHER THAN BY DETECTOR STATE, which is what the issue's framing suggested:
+// the kind is already decided at every call site of the fetch seam, whereas the prefetch
+// detector's state lives in internal/fuse and would have to be plumbed down through the
+// blockstore to get here. The kind is also the more direct answer -- it says what lith DID,
+// not what it predicted.
+//
+// NO THRESHOLD ANYWHERE. Pair it with lith_ttfb_floor_seconds, which is load-invariant by
+// construction, and the verdict reads itself: demand fills at 141 ms against a 19 ms endpoint
+// floor is a fault stream paying one round trip per miss. Two bad constants have already
+// shipped on this project (#340, #349), so the judgement stays with the operator and the
+// numbers are what lith provides.
+func (bs *BlockStore) recordTTFB(d time.Duration, kind fillKind) {
 	if d <= 0 {
 		return
 	}
 	if r, ok := bs.rec.(ttfbRecorder); ok {
 		r.S3TTFB(d)
+	}
+	if r, ok := bs.rec.(fillLatencyRecorder); ok {
+		r.FillSeconds(kind.label(), d)
 	}
 	bs.ttfbMu.Lock()
 	// The long window, for the load-invariant floor (#349). Kept separate from the 8-sample
@@ -308,7 +337,7 @@ func (bs *BlockStore) fillExtentSpan(ctx context.Context, k Key, ci int64, base 
 	if got := bs.budget.acquire(length); got > 0 {
 		defer bs.budget.release(got)
 	}
-	body, etag, err := bs.fetchReader(ctx, k, absOff, length)
+	body, etag, err := bs.fetchReader(ctx, k, absOff, length, kind)
 	if err != nil {
 		return nil, 0, err
 	}

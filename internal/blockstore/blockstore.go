@@ -727,7 +727,7 @@ func (bs *BlockStore) fillRun(ctx context.Context, k Key, first, last, objSize i
 		defer bs.budget.release(got)
 	}
 
-	body, etag, err := bs.fetchReader(ctx, k, off, length)
+	body, etag, err := bs.fetchReader(ctx, k, off, length, kind)
 	if err != nil {
 		bs.failRun(k, first, owned, err)
 		return err
@@ -1383,6 +1383,13 @@ func (bs *BlockStore) recordPressureHeld() {
 // fillRecorder is an optional Recorder extension for the sparse-fill metrics
 // (#118/#124): partial fills, bytes by fill kind, coalesced-run count, and bytes
 // fetched only to close gaps.
+// fillLatencyRecorder is an optional Recorder extension for per-kind fill latency (#362):
+// how long a fill's first byte took, split by what kind of fill it was. Optional and
+// type-asserted, so an existing Recorder implementer needs no change.
+type fillLatencyRecorder interface {
+	FillSeconds(kind string, d time.Duration)
+}
+
 type fillRecorder interface {
 	FillPartial()
 	FillBytes(kind string, n int64)

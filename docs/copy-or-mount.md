@@ -73,6 +73,46 @@ them asynchronously gets most of it back; `kraken2 --memory-mapping` and the
 `bwa`/`samtools` mmap paths cannot, because a page fault exposes exactly one
 offset.
 
+### Telling this regime apart from a slow mount, in one scrape
+
+The reporter above lost most of a day to this, and the reason is worth stating:
+**the mount was working correctly**, so there was nothing wrong to find. What they
+needed was not a fix but a verdict, and every number for it was already inside
+lith and none of it was exported
+([#362](https://github.com/scttfrdmn/lith/issues/362)). Now it is. With
+`--metrics`:
+
+```promql
+# what is one fault costing?            (expect ~1 round trip, and no better)
+histogram_quantile(0.5, rate(lith_fill_seconds_bucket{kind="demand"}[1m]))
+
+# what does this endpoint cost at best? (load-invariant by construction)
+lith_ttfb_floor_seconds
+
+# is this mount streaming, or faulting? (the ratio IS the diagnosis)
+rate(lith_fill_seconds_count{kind="demand"}[1m])
+  / ignoring(kind) sum without(kind)(rate(lith_fill_seconds_count[1m]))
+```
+
+Read it like this:
+
+| what you see | what it means |
+|---|---|
+| `demand` ≈ the floor, and `demand` is a **small share** of fills | healthy. Prefetch is covering the stream; the few demand fills are its cold start. |
+| `demand` ≈ the floor, and `demand` is **~all** of the fills | **this regime.** Every read is a fault paying one round trip, and the mount is already as fast as one fault at a time can be. Restructure the access or move the data. |
+| `demand` **far above** the floor | not this regime — something is queueing. The floor is what the endpoint costs when nothing is in the way, so a large gap is lith's own concurrency or the link, not S3. |
+
+`kind="demand"` means *a fill no prediction covered*, which is why it is the right
+signal here and not a measure of randomness: a sequential reader whose prefetch is
+keeping up shows `kind="whole"`.
+
+**There is deliberately no threshold and no log line.** lith reports the three
+numbers and the judgement is yours — two defaults placed from a plausible-looking
+constant have already had to be withdrawn from this project
+([#340](https://github.com/scttfrdmn/lith/issues/340),
+[#349](https://github.com/scttfrdmn/lith/issues/349)), and "is my workload in this
+regime" is a question about the workload, not about lith.
+
 **Many-small-object stores** — Zarr, sharded datasets read in key order. **The
 one shape where the answer is nuanced.** Reading these cold pays a serial S3
 round-trip per object. v0.2 shipped sibling readahead

@@ -45,7 +45,7 @@ func TestFloorTTFBSeparatesALoadedNearEndpointFromAnIdleFarOne(t *testing.T) {
 	feed := func(samples []time.Duration) *BlockStore {
 		bs := &BlockStore{ttfbSeed: 40 * time.Millisecond}
 		for _, d := range samples {
-			bs.recordTTFB(d)
+			bs.recordTTFB(d, fillWhole)
 		}
 		return bs
 	}
@@ -104,7 +104,7 @@ func TestFloorTTFBSeparatesALoadedNearEndpointFromAnIdleFarOne(t *testing.T) {
 	// endpoint. Inject one well below the far endpoint's round trip and the floor must
 	// barely move.
 	before, _ := far.FloorTTFB()
-	far.recordTTFB(1 * time.Millisecond)
+	far.recordTTFB(1*time.Millisecond, fillWhole)
 	after, _ := far.FloorTTFB()
 	if after < before-time.Millisecond {
 		t.Errorf("one 1ms sample moved the far floor from %v to %v; the estimator is a "+
@@ -121,7 +121,7 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 	// The median is available from the FIRST fill, because the policy that reads it needs an
 	// answer early. The floor is a different contract: it is an estimate of a distribution,
 	// so it withholds until it has one.
-	bs.recordTTFB(28 * time.Millisecond)
+	bs.recordTTFB(28*time.Millisecond, fillWhole)
 	if _, ok := bs.MeasuredTTFB(); !ok {
 		t.Error("the median is not available after one fill")
 	}
@@ -129,7 +129,7 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 		t.Error("a floor was reported from one fill")
 	}
 	for i := 1; i < ttfbFloorMin; i++ {
-		bs.recordTTFB(28 * time.Millisecond)
+		bs.recordTTFB(28*time.Millisecond, fillWhole)
 	}
 	if _, ok := bs.FloorTTFB(); !ok {
 		t.Errorf("no floor after %d fills, the stated minimum", ttfbFloorMin)
@@ -145,10 +145,10 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 	// property of the percentile, it is the quantity cell 2 of #349 measures, and the first
 	// draft of this test had it coupled to ttfbFloorMin by accident.
 	for i := 0; i < 40; i++ { // a demand prefix worth of fast fills
-		bs.recordTTFB(24 * time.Millisecond)
+		bs.recordTTFB(24*time.Millisecond, fillWhole)
 	}
 	for i := 0; i < 200; i++ { // and a burst: 40/250 = 16% fast, above the p10 line
-		bs.recordTTFB(110 * time.Millisecond)
+		bs.recordTTFB(110*time.Millisecond, fillWhole)
 	}
 	med, _ := bs.MeasuredTTFB()
 	floor, _ := bs.FloorTTFB()
@@ -165,7 +165,7 @@ func TestFloorTTFBWithholdsAnEstimateUntilItHasSamples(t *testing.T) {
 	// unqueued first byte, there is no evidence left about the endpoint's own latency, and
 	// reporting a stale low figure would be worse than reporting the truth.
 	for i := 0; i < ttfbFloorWindow; i++ {
-		bs.recordTTFB(110 * time.Millisecond)
+		bs.recordTTFB(110*time.Millisecond, fillWhole)
 	}
 	if floor, _ := bs.FloorTTFB(); floor < 100*time.Millisecond {
 		t.Errorf("floor %v after the window went fully slow; past its tolerance the floor "+
@@ -186,9 +186,9 @@ func TestFloorTTFBIsAnInstrumentAndNothingReadsIt(t *testing.T) {
 	// a policy reading one would behave differently from a policy reading the other.
 	for i := 0; i < 128; i++ {
 		if i%4 == 0 {
-			bs.recordTTFB(24 * time.Millisecond)
+			bs.recordTTFB(24*time.Millisecond, fillWhole)
 		} else {
-			bs.recordTTFB(105 * time.Millisecond)
+			bs.recordTTFB(105*time.Millisecond, fillWhole)
 		}
 	}
 	med, _ := bs.MeasuredTTFB()
@@ -225,7 +225,7 @@ func TestFloorTTFBIsAvailableOnASingleSmallReadsWorthOfFills(t *testing.T) {
 	const demandFills = 16
 	var firstAvailable int
 	for i := 0; i < demandFills; i++ {
-		bs.recordTTFB(time.Duration(22+i%12) * time.Millisecond)
+		bs.recordTTFB(time.Duration(22+i%12)*time.Millisecond, fillWhole)
 		if _, ok := bs.FloorTTFB(); ok && firstAvailable == 0 {
 			firstAvailable = i + 1
 		}
@@ -249,7 +249,7 @@ func TestFloorTTFBIsAvailableOnASingleSmallReadsWorthOfFills(t *testing.T) {
 	// The whole 24-fill read, burst included: the floor must still report the demand
 	// latency, because that is what the endpoint costs when nothing is queued ahead.
 	for i := 0; i < 8; i++ {
-		bs.recordTTFB(time.Duration(95+i*2) * time.Millisecond)
+		bs.recordTTFB(time.Duration(95+i*2)*time.Millisecond, fillWhole)
 	}
 	med, _ := bs.MeasuredTTFB()
 	floor, _ = bs.FloorTTFB()
@@ -264,9 +264,9 @@ func TestFloorTTFBIsAvailableOnASingleSmallReadsWorthOfFills(t *testing.T) {
 
 	// Never defined by the single smallest sample, at the smallest permitted window.
 	small := &BlockStore{ttfbSeed: 40 * time.Millisecond}
-	small.recordTTFB(1 * time.Millisecond) // one implausible outlier
+	small.recordTTFB(1*time.Millisecond, fillWhole) // one implausible outlier
 	for i := 0; i < ttfbFloorMin-1; i++ {
-		small.recordTTFB(60 * time.Millisecond)
+		small.recordTTFB(60*time.Millisecond, fillWhole)
 	}
 	if floor, ok := small.FloorTTFB(); !ok {
 		t.Error("no floor at exactly ttfbFloorMin samples")
