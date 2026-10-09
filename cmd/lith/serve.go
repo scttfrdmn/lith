@@ -94,7 +94,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.BoolVar(&f.siblingCoverage, "prefetch-sibling-coverage", false, "count a hole in a handle's read stream as covered when another descriptor is open on the same object AND its bytes were already demanded through lith (experimental, #316)")
 	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds, first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (diagnostic, #350)")
-	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment exceeds this fraction of --mem-cache; 0 disables (experimental, #313)")
+	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of the memory tier's realized capacity (#313). 0 (default) ENGAGES THE GATE AT 0.85 on every export, because the gateway has no evidence gate: internal/nfs carries its own per-path detector and never bounds a window by what a reader has consumed, so this is an export's only admission bound. Negative forces it off. MEASURED BAND 0.85-1.0, on a FUSE mount with 16 concurrent readers -- the gateway inherits it by the arithmetic (same blockstore, same committed-bytes counter, same tier) rather than by its own measurement, which is #337's cell. Above 1.0 cannot work: it admits more unread bytes than the tier holds, so the tier still evicts")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region (#362)")
 	fl.StringVar(&f.coalesceGap, "coalesce-gap", "0", "largest gap between fill ranges merged into one GET; 0 = derive from NIC × TTFB (#124)")
 	fl.IntVar(&f.s3Concurrency, "s3-concurrency", 128, "max concurrent S3 requests")
@@ -250,12 +250,22 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if f.nicGbps > 0 {
 		nicBytesPerSec = int64(f.nicGbps * 1e9 / 8)
 	}
+	// THE GATEWAY HAS NO EVIDENCE GATE, so the literal 0 is the truth and not a placeholder
+	// (#313). internal/nfs carries its own minimal per-path detector (seqState: lastEnd,
+	// frontier, lastTouch) and never calls into internal/prefetch, so nothing in this path
+	// bounds a window by what a reader has consumed -- EvidenceRatioFor is not reachable from
+	// here at any region pair. That makes the tier-pressure gate the only admission bound an
+	// export has, so it engages on every export. It is inherited by arithmetic rather than by
+	// its own measurement; see defaultPressureMax and #337.
+	pressureMax := pressureMaxFor(f.prefetchPressure, 0)
+	log.Info("prefetch admission", "evidence_ratio", 0.0, "pressure_max", pressureMax,
+		"note", "the gateway has no evidence gate")
 	bs, err := blockstore.New(client, blockstore.Config{
 		Bucket: bucket, BlockSize: blockSize, MemCache: memCache, MaxRange: maxRange,
 		DiskCache: diskCache, DiskPath: diskPath, DiskWriters: 8,
 		S3Concurrency: f.s3Concurrency, PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget: prefetchBudget, InflightBytes: inflight,
-		PrefetchPressureMax: f.prefetchPressure,
+		PrefetchPressureMax: pressureMax,
 		CoalesceGap:         coalesceGap, NICBytesPerSec: nicBytesPerSec,
 		Recorder: met,
 	})
@@ -263,6 +273,12 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		return err
 	}
 	defer bs.Close()
+	if w := pressureMaxWarning(f.prefetchPressure); w != "" {
+		log.Warn("prefetch pressure gate", "warning", w)
+	}
+	if w := pressureBudgetWarning(pressureMax, bs.PrefetchBudgetBytes(), bs.MemCap()); w != "" {
+		log.Warn("prefetch pressure gate", "warning", w)
+	}
 
 	ln, err := net.Listen("tcp", f.listen)
 	if err != nil {
