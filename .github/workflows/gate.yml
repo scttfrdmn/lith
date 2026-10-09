@@ -27,7 +27,10 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
         with:
-          version: v2.13.2
+          # Must track the Go in go.mod. go1.27.2 writes export data VERSION 5 and v2.13.2
+          # reads at most 4, so the lint could not import sync/atomic and failed every
+          # package with a typecheck error -- which looks like a code problem and is not one.
+          version: v2.14.0
       - name: go test -race
         run: go test -race ./...
       - name: govulncheck
