@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The peak-vs-baseline `--nic-gbps` warning now fires on the mount, where the mistake is
+  made** ([#239](https://github.com/scttfrdmn/lith/issues/239)). It existed only in
+  `lith doctor`, which is opt-in, while the error is committed on the mount command line. A
+  tester passed `--nic-gbps 15` for a `c7g.4xlarge` whose sustained baseline is `7.5` — the
+  `15` is the "Up to 15 Gigabit" **peak** from the instance page — and paid **654 MB fetched
+  against 382 MB for the same 110 MB of data, with an indistinguishable wall clock**: 42 % more
+  bytes for zero milliseconds. Nothing on the path they used said so.
+
+  Same one-consumer gap as [#240](https://github.com/scttfrdmn/lith/issues/240),
+  [#242](https://github.com/scttfrdmn/lith/issues/242),
+  [#346](https://github.com/scttfrdmn/lith/issues/346) and
+  [#393](https://github.com/scttfrdmn/lith/issues/393): a second consumer of the same
+  machinery with its own wiring. The decision is now one function both commands call, so they
+  cannot drift, and it fires only when `--nic-gbps` is set — an ordinary mount pays nothing.
+
+  **It also stops warning against figures lith did not measure, which it previously did.** The
+  old guard compared against any source other than `fallback`, which included `imds-estimate`
+  — and #317 established that the size-keyed estimate reads 50 Gbps on a `c8gn.48xlarge` whose
+  real figure is 600. "Your `--nic-gbps 600` is well above the detected baseline of 50" would
+  have had the operator right and lith wrong. The comparison is now restricted to `ethtool`,
+  `DescribeInstanceTypes`, and a cache of one of those. The exact-peak case needs no threshold
+  at all, because AWS reports both numbers; only the secondary "well above the baseline"
+  heuristic carries one (1.5×, set below the reported case's 2.0× so that case is caught).
+
+  `doctor` now prints both figures — `7.5 Gbps baseline (peak 15.0 — --nic-gbps wants the
+  baseline, not this)` — where it printed one unlabelled number, which is what made copying
+  the wrong one easy. The peak is shown only when it is a *distinct measured* figure;
+  `ethtool`, the estimate and the fallback all set peak = baseline, and printing "peak 10.0"
+  for an assumption would invent a fact.
+
+  The guard had **no test at all** before this change.
+
 - **NIC detection reported 50 Gbps on a 600 Gbps box, and said nothing about why**
   ([#317](https://github.com/scttfrdmn/lith/issues/317)). Reported externally from a
   `c8gn.48xlarge`. Two independent defects, one visible and one not.

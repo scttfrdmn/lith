@@ -388,6 +388,21 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	} else {
 		log.Info("nic bandwidth", "source", "unknown (using fixed in-flight fallback)")
 	}
+	// THE PEAK-VS-BASELINE WARNING BELONGS HERE, not only in doctor (#239). The mistake is
+	// made on this command line -- a tester passed --nic-gbps 15 for a c7g.4xlarge whose
+	// baseline is 7.5 and paid 654 MB against 382 MB for the same data, for an
+	// indistinguishable wall clock -- and `lith doctor` is opt-in, so the one place the error
+	// is committed said nothing about it. Same one-consumer gap as #240/#242/#346/#393.
+	//
+	// Only when an override is set, so an ordinary mount pays nothing: resolveNIC
+	// short-circuits on the override and therefore learns nothing about the real device, so
+	// the comparison needs a second resolution with the override ignored. An un-overridden
+	// mount already pays that cost on its own detection, and the result is cached.
+	if f.nicGbps > 0 {
+		if w := nicOverrideWarning(f.nicGbps, resolveNIC(ctx, nicDir, 0)); w != "" {
+			log.Warn("nic bandwidth", "warning", w)
+		}
+	}
 	// Why each earlier source did not answer (#317). The chain used to log only its winner,
 	// so an IAM denial on DescribeInstanceTypes was invisible: the operator saw a plausible
 	// number and had no reason to think an exact one was one policy action away. WARN rather

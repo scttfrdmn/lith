@@ -164,3 +164,33 @@ func TestNICAttemptsAreReported(t *testing.T) {
 		}
 	}
 }
+
+// The peak-vs-baseline warning must fire where the MISTAKE IS MADE (#239). It lived only in
+// `lith doctor`, which is opt-in, while the error is committed on the mount command line --
+// the same one-consumer gap as #240/#242/#346/#393. A pure function that both commands could
+// call proves nothing about whether the mount calls it.
+func TestNICOverrideWarningIsCheckedWhereTheMistakeIsMade(t *testing.T) {
+	for _, path := range []string{"cmd_mount.go", "cmd_doctor.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "nicOverrideWarning(") {
+			t.Errorf("%s never calls nicOverrideWarning: passing the advertised peak to "+
+				"--nic-gbps fetched 654 MB against 382 MB for the same data, and nothing on "+
+				"this path would say so (#239)", path)
+		}
+	}
+	// And it must re-resolve with the override IGNORED. Comparing the override against itself
+	// is vacuous, and resolveNIC short-circuits on it, so a call that forwarded f.nicGbps
+	// would always see baseline == peak == the override and never warn.
+	src, err := os.ReadFile("cmd_mount.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "nicOverrideWarning(f.nicGbps, resolveNIC(ctx, nicDir, 0))") {
+		t.Error("the mount does not compare against a detection that ignores the override; " +
+			"resolveNIC short-circuits on --nic-gbps, so any other argument makes the " +
+			"comparison vacuous")
+	}
+}

@@ -456,3 +456,101 @@ func nicVerdict(nic nicInfo, detail string) (checkStatus, string, string) {
 	}
 	return info, detail, ""
 }
+
+// nicOverrideWarning returns a warning when a --nic-gbps value looks like the instance's
+// advertised PEAK rather than its sustained baseline, and "" when it does not (#239).
+//
+// WHY THIS EXISTS. --nic-gbps sizes --inflight-bytes, the readahead window, and the
+// device-derived parts-max/coalesce-gap, and it wants the SUSTAINED BASELINE. The number AWS
+// shows on the instance page is the PEAK -- "Up to 15 Gigabit" -- so the obvious value to copy
+// is the wrong one by roughly 2x on burst-credit classes. Measured on a c7g.4xlarge, whose
+// baseline is 7.5, with an A3dyn/U hyperslab over 3 reps:
+//
+//	--nic-gbps 15  (the peak, what was passed) : 654 MB fetched for 110 MB wanted = 6.0x
+//	--nic-gbps 7.5 (the true baseline)         : 382 MB fetched for 110 MB wanted = 3.5x
+//
+// 42% fewer bytes and an indistinguishable wall clock (2.35-2.79 s against 2.38-3.31 s). The
+// window scales with the stated baseline, so overstating it fetches 272 MB nobody reads and
+// earns zero milliseconds. In-region that is request cost; cross-region it is billed egress.
+//
+// IT ONLY SPEAKS WHEN THE COMPARISON IS AGAINST A MEASURED FIGURE. That is the correction this
+// function makes over the doctor-only version it replaces, and #317 is why: an `imds-estimate`
+// baseline comes from a size-keyed table with no family dimension and was measured 12x LOW on
+// a c8gn.48xlarge. Warning that a user's correct 600 is "well above the detected baseline 50"
+// would be exactly backwards -- the user would be right and the estimate wrong. A `fallback`
+// baseline is a flat 10 Gbps assumption and is no better. So both are excluded, and the only
+// bases for comparison are ethtool, DescribeInstanceTypes, and a cache of one of those.
+func nicOverrideWarning(override float64, det nicInfo) string {
+	if override <= 0 || !nicSourceIsMeasured(det.Source) || det.BaselineGbps <= 0 {
+		return ""
+	}
+	// THE SOUND CASE, and it needs no threshold: the value IS the advertised peak. Only
+	// DescribeInstanceTypes reports a peak distinct from the baseline, so this fires exactly
+	// where AWS itself has told us both numbers. The 0.95 is a float-equality tolerance, not
+	// a judgement about how wrong is too wrong.
+	if det.PeakGbps > det.BaselineGbps && override >= det.PeakGbps*0.95 {
+		return fmt.Sprintf("--nic-gbps %.1f is this instance's PEAK, not its sustained "+
+			"baseline (baseline %.1f, peak %.1f, source=%s). --nic-gbps wants the baseline: "+
+			"the readahead window scales with it, so the peak fetches bytes nobody reads for "+
+			"no speed gain — measured 654 MB against 382 MB for the same 110 MB of data, with "+
+			"an indistinguishable wall clock. Pass --nic-gbps %.1f (#239)",
+			override, det.BaselineGbps, det.PeakGbps, det.Source, det.BaselineGbps)
+	}
+	// THE HEURISTIC CASE: a value well above a measured baseline that is not the peak either
+	// -- someone has typed a number from somewhere else. 1.5x is a judgement and the only
+	// fitted constant here; it is set below the 2.0x of the reported case (15 against a 7.5
+	// baseline) so that case is caught, and above 1.0 so a rounding difference or a genuine
+	// small correction is not nagged about. A warning, never a clamp.
+	if override >= det.BaselineGbps*overstatedBaselineRatio {
+		return fmt.Sprintf("--nic-gbps %.1f is %.1fx the detected sustained baseline %.1f "+
+			"(source=%s). --nic-gbps wants the baseline, not the advertised 'Up to N Gigabit' "+
+			"peak; overstating it over-fetches for no speed gain (#239)",
+			override, override/det.BaselineGbps, det.BaselineGbps, det.Source)
+	}
+	return ""
+}
+
+// overstatedBaselineRatio is how far above a MEASURED baseline a --nic-gbps value must sit
+// before it is called out, when it is not an exact peak match. Below the 2.0x of the reported
+// case so that case is caught; above 1.0 so a small deliberate correction is not nagged about.
+const overstatedBaselineRatio = 1.5
+
+// nicSourceIsMeasured reports whether a resolved NIC figure came from somewhere that actually
+// knows, as opposed to an assumption.
+//
+// This is the same distinction nicVerdict grades on, and it is load-bearing in two places: a
+// figure that was not measured must not be reported as fact (#317), and it must not be used as
+// the basis for correcting an operator (#239). `imds-estimate` is excluded because the
+// size-keyed table has no family dimension and was measured 12x low; `fallback` because it is
+// a flat 10 Gbps assumption; `--nic-gbps` because it is the thing being checked.
+func nicSourceIsMeasured(source string) bool {
+	switch {
+	case source == "ethtool", source == "DescribeInstanceTypes":
+		return true
+	case strings.HasPrefix(source, "cache("):
+		// A cache entry is only ever written from a successful DescribeInstanceTypes
+		// resolution, so it carries a measured figure.
+		return true
+	}
+	return false
+}
+
+// nicDetailLine renders doctor's NIC fact line: which figure this is, the peak when there is a
+// distinct measured one, the source, and the two device-derived knobs it feeds (#239).
+//
+// IT NAMES THE FIGURE because the unlabelled version is what made copying the wrong number
+// easy. doctor printed "7.5 Gbps (source=...)" with nothing saying that --nic-gbps wants the
+// SMALLER of the two values AWS publishes for a burst-credit instance, and the larger one is
+// the one on the instance page.
+//
+// The peak is shown only when it is DISTINCT. ethtool reports a fixed negotiated link, the
+// size estimate and the fallback are single assumptions, and all three set peak = baseline;
+// printing "peak 10.0" there would invent a second fact that does not exist.
+func nicDetailLine(nic nicInfo, partsMax, inflight int64) string {
+	s := fmt.Sprintf("%.1f Gbps baseline", nic.BaselineGbps)
+	if nic.PeakGbps > nic.BaselineGbps {
+		s += fmt.Sprintf(" (peak %.1f — --nic-gbps wants the baseline, not this)", nic.PeakGbps)
+	}
+	return s + fmt.Sprintf(" (source=%s) → parts-max %d MiB, inflight %d MiB",
+		nic.Source, partsMax/(1<<20), inflight/(1<<20))
+}
