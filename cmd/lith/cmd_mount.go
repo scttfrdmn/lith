@@ -409,6 +409,9 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	// than INFO when the winner is itself an admission of ignorance, because that is the case
 	// where reading these lines changes what someone does.
 	logNICAttempts(log, nic)
+	if err := validateInflightBytes(f.inflightBytes); err != nil {
+		return err
+	}
 	inflight, inflightDesc := computeInflightBytes(f.inflightBytes, nic.BaselineGbps)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
 	// Device-derived coalesce gap inputs (#124/session 30): NIC baseline in

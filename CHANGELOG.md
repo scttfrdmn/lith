@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`lith serve nfs` never detected the NIC, so a stock gateway ran with byte gating disabled**
+  ([#393](https://github.com/scttfrdmn/lith/issues/393)). Found while reading the resolution
+  chain for #317. The gateway set the NIC rate only from an explicit `--nic-gbps`, derived the
+  in-flight budget not at all, and passed no first-byte-latency seed — **three** missing
+  derivations, where the mount has all three:
+
+  | | stock `lith mount` | stock `lith serve nfs` (before) |
+  |---|---|---|
+  | `NICBytesPerSec` | detected | **0** → coalesce gap pinned to its 256 KiB floor instead of the device figure (~1 MiB at a 25 Gbps baseline) |
+  | `InflightBytes` | `2 × NIC × 100 ms`, else a 512 MiB fallback | **0**, which `blockstore.Config` documents as *"0 disables byte gating"* |
+  | `TTFB` seed | 40 ms | **unset** → `MeasuredTTFB` returns the seed until the first fill lands, so the gap floored on every cold prefix regardless |
+
+  A mount cannot reach any of those states: `computeInflightBytes` never returns 0, by
+  construction and by `TestFallbackNeverZero`.
+
+  **`TestServeMountFlagParity` passed throughout, and that is the more useful finding.** It
+  asserts every mount flag is either present on `serve nfs` or documented inapplicable —
+  `--nic-gbps` and `--inflight-bytes` were both present. **The flags existed and nothing
+  derived from them.** That is the second time the gate which should have caught a bug was
+  checking the adjacent property, and the sixth instance of this project's most repeated shape:
+  a second consumer of the same machinery with its own wiring, tests covering only the first
+  (#240, #242, #346, #239, #393).
+
+  So the gate is now **derivation** parity, not flag parity: `TestServeMountBlockStoreConfigParity`
+  walks both commands' ASTs and requires every `blockstore.Config` field the mount sets to be
+  set by the gateway too, or documented with a reason. It would have caught all three missing
+  derivations, and the exception map is currently **empty**. A gateway left at a field's zero
+  value is not the same as a mount at its derived default.
+
+  The gateway also gains the mount's two NIC diagnostics, which it should have had: the
+  per-source failure reasons (#317) and the peak-vs-baseline warning (#239). **An export is
+  more exposed than a mount to a wrong NIC figure** — every client's bytes cross the one link,
+  so a figure 12× low or 2× high is multiplied across all of them.
+
+  **This is a restricting change for existing gateways:** an export that previously had no
+  bytes-in-flight bound now acquires a NIC-derived one. That is the intended design and matches
+  every mount, but a gateway tuned around the unbounded behaviour could slow down; pass
+  `--inflight-bytes` explicitly to keep a specific figure. `docs/serving-a-cluster.md` says so.
+
+- **A malformed `--inflight-bytes` was silently discarded by `lith mount`**
+  ([#393](https://github.com/scttfrdmn/lith/issues/393)). Found while unifying the two
+  commands' derivation. `serve nfs` parsed the flag and returned the error; the mount only
+  passed the string to `computeInflightBytes`, which **falls through on a parse failure** — so
+  an unusable value was accepted, replaced by the derived default, and the mount logged that
+  derived budget with nothing saying the flag had been ignored. The #264 class: a flag that
+  looks set and is not. Both commands now validate, and the two failure modes are reported
+  distinctly — an unparseable value is not blamed on positivity.
+
+  (`parseSize` is deliberately lenient about case and whitespace, so `512 MiB` and `512mib`
+  are valid; a test asserting otherwise was wrong about the contract and was corrected rather
+  than the parser.)
+
 - **The peak-vs-baseline `--nic-gbps` warning now fires on the mount, where the mistake is
   made** ([#239](https://github.com/scttfrdmn/lith/issues/239)). It existed only in
   `lith doctor`, which is opt-in, while the error is committed on the mount command line. A
