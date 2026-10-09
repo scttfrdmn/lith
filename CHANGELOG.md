@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **NIC detection reported 50 Gbps on a 600 Gbps box, and said nothing about why**
+  ([#317](https://github.com/scttfrdmn/lith/issues/317)). Reported externally from a
+  `c8gn.48xlarge`. Two independent defects, one visible and one not.
+
+  **The estimate table has no family dimension.** `sizeBandwidthGbps` is keyed on the size
+  suffix alone, so `c8gn.48xlarge` — rated 600 Gbps across two network cards — resolved
+  through `"48xlarge"` to **50**, a confident figure **12× low**, logged at INFO with no
+  warning anywhere. The uncomfortable part is that the code already knew: the table's own
+  comment read *"Network-optimized ('n') and metal variants exceed these"*. It documented the
+  blind spot and returned a number into it.
+
+  The estimate now **declines** for any family carrying the `n` attribute (`c5n`, `c7gn`,
+  `c8gn`, `m5n`, `m6idn`, `i3en`, `im4gn`, `is4gen`, `d3en`, …), so the chain falls to the
+  fallback, the mount reports the NIC as undetected and `doctor` WARNs. That makes the *figure*
+  lower — 10 Gbps, in ratio further from 600 — and the *signal* correct, which is the trade
+  worth making: a wrong number that presents as detected gets acted on, an admitted unknown
+  gets asked about. It is the same call `EvidenceRatioFor` makes for an unknown region. The
+  attribute is read **after** the generation digits, so `trn1` and `inf2` — whose `n` is part
+  of the family name — are not misclassified.
+
+  **And every source that fails now says why**, in the startup log and in `doctor`. The chain
+  previously reported only its winner, which hid the actionable case: on a ParallelCluster head
+  node the `DescribeInstanceTypes` call is *refused* (the default node roles do not grant
+  `ec2:DescribeInstanceTypes`), lith fell through to the size estimate, and nothing anywhere
+  said the precise path had been denied. The reporter could not distinguish a box that had been
+  refused from one that had never asked, so there was no reason to think an exact figure was one
+  IAM action away. `ethtool` and `DescribeInstanceTypes` now return reasons rather than a bare
+  `0`/`false`, because their failure modes call for different actions — install it, fix the
+  route, accept that ENA has no speed to report, grant one IAM action, retry a timeout.
+
+  The reasons are reported at **WARN** when the winning figure was not measured (`fallback` or
+  `imds-estimate`) and at DEBUG/INFO behind a measured one, so a normal startup is quiet and an
+  unmeasured one is not. **`doctor` now WARNs on `imds-estimate` as well**, where it was an
+  INFO inside an all-PASS report. The reasons are never written to the NIC cache — they
+  describe one resolution on one box at one moment, and a cached "denied" would be replayed on
+  runs that never called the API.
+
+  Known residual, named rather than quietly left: families whose network far exceeds the table
+  *without* an `n` — `hpc7g`/`hpc7a`, `p4d`/`p5`, `trn1` — and the flat `metal` entry. Each
+  would need its own rule, none has been reported, and inventing rules for families nobody has
+  run is how a table gets a second generation of wrong entries.
+
 ### Added
 
 - **The mount and the gateway warn when `--mem-cache` cannot fit on the box**

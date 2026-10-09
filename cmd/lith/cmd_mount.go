@@ -388,6 +388,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	} else {
 		log.Info("nic bandwidth", "source", "unknown (using fixed in-flight fallback)")
 	}
+	// Why each earlier source did not answer (#317). The chain used to log only its winner,
+	// so an IAM denial on DescribeInstanceTypes was invisible: the operator saw a plausible
+	// number and had no reason to think an exact one was one policy action away. WARN rather
+	// than INFO when the winner is itself an admission of ignorance, because that is the case
+	// where reading these lines changes what someone does.
+	logNICAttempts(log, nic)
 	inflight, inflightDesc := computeInflightBytes(f.inflightBytes, nic.BaselineGbps)
 	log.Info("inflight-bytes budget", "budget", inflightDesc)
 	// Device-derived coalesce gap inputs (#124/session 30): NIC baseline in
