@@ -33,9 +33,9 @@ func TestEvidenceRatioFor(t *testing.T) {
 		// defaulting it on would turn a plumbing slip into a 2x regression at distance.
 		{"near but not known is off", 0, true, false, 0},
 	} {
-		got := evidenceRatioFor(tc.configured, tc.nearRegion, tc.regionKnwn)
+		got := EvidenceRatioFor(tc.configured, tc.nearRegion, tc.regionKnwn)
 		if got != tc.want {
-			t.Errorf("%s: evidenceRatioFor(%v, near=%v, known=%v) = %v, want %v",
+			t.Errorf("%s: EvidenceRatioFor(%v, near=%v, known=%v) = %v, want %v",
 				tc.name, tc.configured, tc.nearRegion, tc.regionKnwn, got, tc.want)
 		}
 	}
@@ -61,12 +61,12 @@ func TestEvidenceRatioIsStableAcrossAMountsLife(t *testing.T) {
 		{"forced on", 4, false, true},
 		{"forced off", -1, true, true},
 	} {
-		first := evidenceRatioFor(cfg.configured, cfg.nearRegion, cfg.regionKnwn)
+		first := EvidenceRatioFor(cfg.configured, cfg.nearRegion, cfg.regionKnwn)
 		// The same inputs 1000 reads later. Nothing the mount does to itself -- burst
 		// depth, queueing, eviction -- can appear in these arguments, which is the whole
 		// point of the change: there is no run-dependent term to vary.
 		for range 1000 {
-			if got := evidenceRatioFor(cfg.configured, cfg.nearRegion, cfg.regionKnwn); got != first {
+			if got := EvidenceRatioFor(cfg.configured, cfg.nearRegion, cfg.regionKnwn); got != first {
 				t.Fatalf("%s: ratio moved from %v to %v with identical inputs",
 					cfg.name, first, got)
 			}
@@ -80,13 +80,13 @@ func TestEvidenceRatioEncodesTheMeasuredSplit(t *testing.T) {
 	// In-region: forcing the gate on took six concurrent slice readers from 3281 / 1827 /
 	// 375 MB (three identical cells) to 358.6 MB in 3/3, r = 1.00, with no wall-clock cost.
 	// So the default must engage here.
-	if got := evidenceRatioFor(0, true, true); got != defaultEvidenceRatio {
+	if got := EvidenceRatioFor(0, true, true); got != defaultEvidenceRatio {
 		t.Errorf("in-region default = %v, want %v: the 5-9x concurrent over-fetch is not "+
 			"fixed", got, defaultEvidenceRatio)
 	}
 	// Cross-region: forcing it on cost r = 1.96 on a dd whole-object read with ZERO overlap
 	// (min forced 15.80 s > max off 12.07 s, n = 4, p = 1/70). So the default must not.
-	if got := evidenceRatioFor(0, false, true); got != 0 {
+	if got := EvidenceRatioFor(0, false, true); got != 0 {
 		t.Errorf("cross-region default = %v, want 0: this is the measured ~2x ramp penalty "+
 			"at distance", got)
 	}

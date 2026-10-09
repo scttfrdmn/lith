@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The prefetch pressure gate now defaults ON where the evidence gate is off**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). `--prefetch-pressure-max 0` — the
+  default — no longer means "disabled". It now decides from the evidence gate, which covers
+  exactly the complementary case: **`0.85` where that gate is off** (cross-region, or where the
+  bucket's region cannot be determined), and **off where it is on**. A negative value forces it
+  off, including on a mount where the default would engage. **`lith serve nfs` engages it on
+  every export**, because the gateway has no evidence gate at all.
+
+  This is the keystone six other issues were sequenced behind, and the reason it is a default
+  rather than a mechanism is that the mechanism already shipped. The evidence gate bounds each
+  handle by its **own consumed bytes**, which is available from its first read and so has no
+  start transient. Where it is off, nothing did: N handles establish within milliseconds of
+  each other while the rationing divisor still reads 1, so each dispatches a full-budget
+  window. Since `--prefetch-budget` defaults to half the tier, 16 readers starting together
+  were measured at pressure **8.000** — N × 0.5 — against a steady state of 0.50.
+
+  **`0.85` rather than `1.0`**, both of which are inside the measured band, and the reason is a
+  mechanism rather than a point between two observations. At `1.0` wall is 2.8× better than an
+  unbounded start (41 s vs 116 s) with **71–119 unread chunks still evicted**; at `0.85`
+  evictions reach **0–4** for about 10% more wall. An evicted unread prefetch is a byte that
+  was fetched and discarded, and this default engages only where the evidence gate does not —
+  cross-region, where those bytes are billed **egress**. So the trade is ~10% wall against ~100
+  discarded-byte events, on exactly the mounts where a discarded byte has a price. In-region,
+  where wall clock would be the only term, the gate stays off.
+
+  **What it does not do, said before it ships: it bounds bytes, not fairness.** Reader spread
+  stayed 2.3–3.1 at every threshold tested, against ~1.05 with the evidence gate on. It limits
+  the collapse; the fairness half of the gate-off case is still open.
+
+  The two gates are decided from **one input**: `pressureMaxFor` reads
+  `EvidenceRatioFor`'s *result* rather than re-deciding from the region pair. Two policies over
+  the same two booleans are two policies that can drift, and the failure would be silent — both
+  gates off, or both on, with nothing in the log looking wrong. A test asserts over the real
+  policy function that **exactly one** gate is in force at stock defaults, for every region
+  pair. It also makes the composition right for cases no region pair describes: forcing
+  `--readahead-evidence-ratio 4` cross-region stands this gate down, and forcing `-1` in-region
+  engages it.
+
+  `lith serve nfs` passes a literal `0` because that is the truth and not a placeholder:
+  `internal/nfs` carries its own per-path detector and never calls into `internal/prefetch`, so
+  no window in that path is bounded by what a reader has consumed at any region pair. The
+  gateway therefore inherits the band **by the arithmetic** — same blockstore, same
+  committed-bytes counter, same tier — rather than by its own measurement, which is
+  [#337](https://github.com/scttfrdmn/lith/issues/337)'s cell. Said out loud because a figure
+  measured on one population and applied to another is how two bad defaults already shipped
+  here.
+
+  Both commands now log `prefetch admission` with both gates' resolved values, so which one is
+  in force is greppable rather than inferred, and `lith serve nfs` gained the
+  `--prefetch-pressure-max` sanity warning the mount already had.
+
+### Added
+
+- **A warning when `--prefetch-budget` and `--prefetch-pressure-max` compose into a stall**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). Found while deriving the default
+  above, by writing out the denominator rather than the interesting term.
+
+  The gate is sized against the **tier**, while the quantity it limits is independently bounded
+  by `--prefetch-budget`, which defaults to **half** the tier. That is the entire reason the
+  new default is safe: one handle's steady-state pressure is ~0.50 against a 0.85 threshold, so
+  the gate is silent until a concurrent start makes the divisor lag. Raise `--prefetch-budget`
+  to or above `0.85 × --mem-cache` and a single handle at full budget sits **at** the threshold,
+  so the gate holds dispatches continuously and the mount throttles itself with nothing wrong —
+  and `lith_prefetch_pressure_held_total` would climb and look like the gate working. Two knobs
+  that are individually reasonable, composing into a self-inflicted stall that nothing would
+  have reported.
+
+  The mount and the gateway now warn, naming the figure to lower. `BlockStore.MemCap()` is
+  exported so the check uses the tier's **realized** capacity (shards × per-shard) rather than
+  the requested `--mem-cache`.
+
 ### Fixed
 
 - **`--prefetch-sibling-coverage`'s `--help` described only one of its two conditions**

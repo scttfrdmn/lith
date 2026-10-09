@@ -1027,6 +1027,13 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 // per-handle window and the sibling/parts reservations all draw on it.
 func (bs *BlockStore) PrefetchBudgetBytes() int64 { return bs.pfBudgetBytes }
 
+// MemCap is the memory tier's REALIZED capacity -- shards times per-shard bytes, which is not
+// exactly the requested --mem-cache once it is divided 64 ways. It is the denominator
+// PrefetchPressure divides by and so the denominator --prefetch-pressure-max is a fraction OF,
+// exported so a caller can check the two knobs compose before the mount starts serving (#313).
+// 0 when there is no memory tier.
+func (bs *BlockStore) MemCap() int64 { return bs.memCap }
+
 // PrefetchBudgetBlocks is the number of readahead blocks the prefetch budget
 // allows to be outstanding across all handles; the FUSE layer divides it by the
 // live handle count to size each handle's window (#55).

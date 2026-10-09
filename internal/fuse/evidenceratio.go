@@ -2,7 +2,7 @@
 
 package fuse
 
-// evidenceRatioFor decides the #256 evidence-gate ratio in force for a read: the bound on a
+// EvidenceRatioFor decides the #256 evidence-gate ratio in force for a read: the bound on a
 // committed readahead window as a multiple of the bytes the handle has actually consumed.
 //
 // WHY THE GATE EXISTS. The window is sized by concurrency and by the NIC, never by how much
@@ -56,7 +56,13 @@ package fuse
 //     MinIO is near and loses the saving, which is what --readahead-evidence-ratio 4 is for.
 //     Erring off costs only the saving; erring on is the measured ~2x at distance.
 //  4. Same region -> ratio 4. Different region -> off.
-func evidenceRatioFor(configured float64, nearRegion, regionKnown bool) float64 {
+//
+// EXPORTED BECAUSE A SECOND GATE'S DEFAULT READS IT (#313). The tier-pressure gate
+// (--prefetch-pressure-max) covers exactly the mounts this one does not, so cmd/lith derives
+// its default from this function's RESULT rather than from the region pair directly. Two
+// policies reading the same region booleans would be two policies that can drift; one reading
+// the other's answer cannot. See pressureMaxFor in cmd/lith.
+func EvidenceRatioFor(configured float64, nearRegion, regionKnown bool) float64 {
 	if configured > 0 {
 		return configured
 	}

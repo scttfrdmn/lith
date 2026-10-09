@@ -56,7 +56,7 @@ type Config struct {
 	SiblingCoverage bool
 	// NearRegion and RegionKnown are the evidence policy's input (#349): whether the
 	// bucket is in the same region as this process, and whether that could be determined
-	// at all. Resolved once at mount, never from a measurement -- see evidenceRatioFor
+	// at all. Resolved once at mount, never from a measurement -- see EvidenceRatioFor
 	// for why a latency signal cannot do this job.
 	NearRegion  bool
 	RegionKnown bool
@@ -1402,7 +1402,7 @@ func (f *rawFS) objectKey(relPath string) string {
 // the measurement changes as fills complete, and because deriving it at open would read the
 // 40 ms seed instead of the device (#292).
 func (f *rawFS) evidenceRatio() float64 {
-	return evidenceRatioFor(f.cfg.ReadaheadEvidenceRatio, f.cfg.NearRegion, f.cfg.RegionKnown)
+	return EvidenceRatioFor(f.cfg.ReadaheadEvidenceRatio, f.cfg.NearRegion, f.cfg.RegionKnown)
 }
 
 func (f *rawFS) coverageMin() float64 {

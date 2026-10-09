@@ -113,7 +113,7 @@ func newMountCmd() *cobra.Command {
 	fl.IntVar(&f.diskWriters, "disk-writers", 4, "write-behind workers for the disk cache")
 	fl.BoolVar(&f.siblingCoverage, "prefetch-sibling-coverage", false, "count a hole in a handle's read stream as covered when ANOTHER DESCRIPTOR IS OPEN on the same object AND the bytes in the hole were already DEMANDED through lith (#316). EXPERIMENTAL, off by default. BOTH conditions are required and they cover different hole sizes: lith fetches a whole 1 MiB chunk to serve a 128 KiB read, so for holes SMALLER than a chunk a reader's own demand fetches already satisfy the demanded condition and the sibling condition is the only guard -- without it a lone STRIDED reader discounts its own holes and establishes, which is #222's shape. The demanded condition holds the band between a chunk and a block. Holes wider than --block-size reach neither, because the byte-gap gate forces Random before coverage is consulted. THE CASE: lith opens with FOPEN_KEEP_CACHE so every descriptor on an inode shares the kernel page cache, a sibling's reads are served by the kernel and never reach lith, each handle's own stream is punctate with coverage about 1/N, and from four concurrent readers of one object the #221 coverage gate holds every handle provisional so NOTHING prefetches -- measured 243x slower than one reader alone with byte amplification of 1.001, so no byte or request counter can see it. Measured with this flag at the default coverage-min: 16 of 16 readers establish, wall 67s -> 2.9s, and 0.67 GB fetched for 0.54 GB read, which is more byte-efficient than either --prefetch-coverage-min 0.05 (1.89 GB) or O_DIRECT (0.86-1.53 GB)")
 	fl.BoolVar(&f.wireTTFB, "wire-ttfb", false, "export lith_s3_wire_ttfb_seconds: first-byte latency as the HTTP transport sees it, next to lith_ttfb_seconds from the fill path (#350). A DIAGNOSTIC, not a tuning knob -- if the wire figure is low while the fill figure is high, the delay is above the wire (SDK middleware, deserialization, or the fill goroutine waiting to be rescheduled) rather than at the endpoint. It forces the plain-*http.Client path instead of the AWS SDK's BuildableClient, because that one exposes no RoundTripper hook, so do not leave it on in production")
-	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of --mem-cache (#313). 0 (default) disables it. ONLY FOR MOUNTS WHERE THE EVIDENCE GATE IS OFF -- cross-region, or where the bucket's region cannot be determined. In-region the gate already bounds the start transient by each handle's own consumed bytes, and this flag never binds (measured: peak pressure 0.50, zero holds). MEASURED BAND 0.85-1.0: at 1.0 wall is 2.8x better than unbounded (41 s vs 116 s) with 71-119 evictions left; at 0.85 evictions reach 0-4 for about 10% more wall; at 0.5 it over-throttles by 55%. ABOVE 1.0 IT CANNOT WORK -- it admits more unread bytes than the tier holds, so the tier still evicts (1.3 held pressure exactly as asked and still evicted ~2100). IT BOUNDS BYTES, NOT FAIRNESS: reader spread stays 2.3-3.1 at every threshold against ~1.05 with the evidence gate on, so this limits the collapse rather than fixing it")
+	fl.Float64Var(&f.prefetchPressure, "prefetch-pressure-max", 0, "drop a prefetch dispatch when outstanding prefetch commitment already exceeds this fraction of the memory tier's realized capacity (#313). 0 (default) DECIDES FROM THE EVIDENCE GATE, which covers the complementary case: 0.85 where that gate is OFF (cross-region, or where the bucket's region cannot be determined), and off where it is ON -- in-region each handle is already bounded by its own consumed bytes and this gate was measured never to bind there (peak pressure 0.50, zero holds, because --prefetch-budget defaults to half the tier). Negative forces it off, including on a mount where the default would engage. MEASURED BAND 0.85-1.0: at 1.0 wall is 2.8x better than an unbounded start (41 s vs 116 s) with 71-119 unread chunks still evicted; at 0.85 evictions reach 0-4 for about 10% more wall; at 0.5 it over-throttles by 55% while buying nothing over 0.85. The default is the low end because this engages only where a discarded byte is billed egress. ABOVE 1.0 IT CANNOT WORK -- it admits more unread bytes than the tier holds, so the tier still evicts (1.3 held pressure exactly as asked and still evicted ~2100). IT BOUNDS BYTES, NOT FAIRNESS: reader spread stays 2.3-3.1 at every threshold against ~1.05 with the evidence gate on, so this limits the collapse rather than fixing it")
 	fl.BoolVar(&f.noRegionCheck, "no-region-check", false, "do not warn when the bucket's region differs from this instance's region. The warning is advisory and costs one IMDS lookup; silence it for a deliberately cross-region mount, or where IMDS is blocked and you do not want the attempt (#362)")
 	fl.StringVar(&f.inflightBytes, "inflight-bytes", "", "max bytes in flight to S3 (default: 2 × NIC bandwidth × 100ms)")
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101); serves only /metrics (no pprof)")
@@ -273,6 +273,16 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	nearRegion, regionKnown := regionPair(ctx, client)
 	log.Info("evidence gate input", "same_region", nearRegion, "region_known", regionKnown)
 
+	// The two gates are decided together, from one input, because they cover complementary
+	// mounts (#313). The evidence gate bounds each handle by its own consumed bytes; where it
+	// is off there is no consumption bound at all, and that is where the concurrent-start
+	// overshoot lives (peak pressure 8.000 = N handles x a half-tier budget each). Logged
+	// side by side so which one is in force is greppable rather than inferred -- #362 was an
+	// afternoon lost to a condition the mount knew and did not say.
+	evidenceRatio := fusefs.EvidenceRatioFor(f.readaheadEvidence, nearRegion, regionKnown)
+	pressureMax := pressureMaxFor(f.prefetchPressure, evidenceRatio)
+	log.Info("prefetch admission", "evidence_ratio", evidenceRatio, "pressure_max", pressureMax)
+
 	var (
 		ix       *index.Index
 		closeIdx func() error
@@ -416,7 +426,7 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		S3Concurrency:       f.s3Concurrency,
 		PrefetchConcurrency: f.prefetchConc,
 		PrefetchBudget:      prefetchBudget,
-		PrefetchPressureMax: f.prefetchPressure,
+		PrefetchPressureMax: pressureMax,
 		CoalesceGap:         coalesceGap, // 0 → device-derived
 		NICBytesPerSec:      nicBytesPerSec,
 		TTFB:                ttfbSeed,
@@ -428,6 +438,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		return err
 	}
 	defer bs.Close()
+	// Both knobs resolved, so the one way the pressure gate self-throttles is now checkable
+	// (#313). Done after New because the tier's realized capacity is shards x per-shard, not
+	// the requested --mem-cache, and the budget may have been derived from it.
+	if w := pressureBudgetWarning(pressureMax, bs.PrefetchBudgetBytes(), bs.MemCap()); w != "" {
+		log.Warn("prefetch pressure gate", "warning", w)
+	}
 	effConc := f.prefetchConc
 	if effConc <= 0 {
 		effConc = f.s3Concurrency
