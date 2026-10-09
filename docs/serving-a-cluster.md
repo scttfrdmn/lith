@@ -59,6 +59,27 @@ with N and the working set. The gateway's own read path is concurrent and has
 **no FUSE hop** — a single stream reads *faster* than a FUSE mount (1,463 MB/s
 loopback) — but aggregate cold throughput is still bounded by the one NIC.
 
+### The gateway now detects the NIC, like the mount
+
+Until recently `lith serve nfs` derived nothing from the device: it set the NIC rate only from
+an explicit `--nic-gbps`, never derived an in-flight budget, and passed no first-byte-latency
+seed. A stock export therefore ran with **no bytes-in-flight bound at all** (`InflightBytes: 0`
+disables byte gating) and its **coalesce gap pinned to the 256 KiB floor** instead of the
+device figure — roughly 1 MiB at a 25 Gbps baseline. A mount could not reach either state
+([#393](https://github.com/scttfrdmn/lith/issues/393)).
+
+It now resolves the NIC through the same chain the mount uses (`ethtool` → cache →
+`ec2:DescribeInstanceTypes` → size estimate → 10 Gbps fallback), derives
+`--inflight-bytes` from the baseline, and carries the mount's two NIC diagnostics — the
+per-source failure reasons ([#317](https://github.com/scttfrdmn/lith/issues/317)) and the
+peak-vs-baseline warning ([#239](https://github.com/scttfrdmn/lith/issues/239)). **An export is
+more exposed than a mount to a wrong NIC figure**, because every client's bytes cross the one
+link, so a figure 12× low or 2× high is multiplied across all of them.
+
+**If you tuned a gateway around the old unbounded behaviour, this is a restricting change:** an
+export that previously had no byte gating now acquires a NIC-derived one. Pass
+`--inflight-bytes` explicitly to keep a specific figure.
+
 ### Several mounts on one host: `--mem-cache` is per-daemon
 
 `--mem-cache` defaults to **25 % of system RAM for each mount**, so mounts on one host add

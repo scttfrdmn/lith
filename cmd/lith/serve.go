@@ -240,21 +240,51 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 	if err != nil {
 		return err
 	}
-	var prefetchBudget, inflight int64
+	var prefetchBudget int64
 	if f.prefetchBudget != "" {
 		if prefetchBudget, err = parseSize(f.prefetchBudget); err != nil {
 			return err
 		}
 	}
-	if f.inflightBytes != "" {
-		if inflight, err = parseSize(f.inflightBytes); err != nil {
-			return err
+	if err := validateInflightBytes(f.inflightBytes); err != nil {
+		return err
+	}
+	// THE GATEWAY NOW DETECTS THE NIC, like the mount (#393). It previously set
+	// NICBytesPerSec only from an explicit --nic-gbps and derived the in-flight budget not at
+	// all, so a stock export ran with:
+	//
+	//	NICBytesPerSec 0 -> deriveCoalesceGap returns gapFloor (256 KiB) rather than the
+	//	                    device figure, so sparse reads were split into more, smaller GETs
+	//	InflightBytes  0 -> which blockstore.Config documents as "0 disables byte gating",
+	//	                    so an export had NO bytes-in-flight bound at all
+	//
+	// A mount cannot reach either state: computeInflightBytes never returns 0, by construction
+	// and by TestFallbackNeverZero. TestServeMountFlagParity passed throughout because it
+	// checks whether a flag EXISTS on both commands, not whether an unset one resolves to the
+	// same kind of value -- the flags were present and nothing derived from them.
+	nicDir := os.TempDir()
+	if f.indexFile != "" {
+		nicDir = filepath.Dir(f.indexFile)
+	}
+	nic := resolveNIC(ctx, nicDir, f.nicGbps)
+	if nic.Source != "" {
+		log.Info("nic bandwidth", "baseline_gbps", nic.BaselineGbps, "peak_gbps", nic.PeakGbps,
+			"source", nic.Source)
+	} else {
+		log.Info("nic bandwidth", "source", "unknown (using fixed in-flight fallback)")
+	}
+	// Flag parity for the two NIC diagnostics the mount already had (#317, #239). An export is
+	// MORE exposed than a mount to both: every client's bytes cross this one link, so a NIC
+	// figure that is 12x low or 2x high is multiplied across all of them.
+	if f.nicGbps > 0 {
+		if w := nicOverrideWarning(f.nicGbps, resolveNIC(ctx, nicDir, 0)); w != "" {
+			log.Warn("nic bandwidth", "warning", w)
 		}
 	}
-	var nicBytesPerSec int64
-	if f.nicGbps > 0 {
-		nicBytesPerSec = int64(f.nicGbps * 1e9 / 8)
-	}
+	logNICAttempts(log, nic)
+	inflight, inflightDesc := computeInflightBytes(f.inflightBytes, nic.BaselineGbps)
+	log.Info("inflight-bytes budget", "budget", inflightDesc)
+	nicBytesPerSec := int64(nic.BaselineGbps * 1e9 / 8)
 	// THE GATEWAY HAS NO EVIDENCE GATE, so the literal 0 is the truth and not a placeholder
 	// (#313). internal/nfs carries its own minimal per-path detector (seqState: lastEnd,
 	// frontier, lastTouch) and never calls into internal/prefetch, so nothing in this path
@@ -272,6 +302,11 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		PrefetchBudget: prefetchBudget, InflightBytes: inflight,
 		PrefetchPressureMax: pressureMax,
 		CoalesceGap:         coalesceGap, NICBytesPerSec: nicBytesPerSec,
+		// The first-byte-latency seed the coalesce gap is derived from, refined by the
+		// rolling median once fills complete. MeasuredTTFB returns this seed while no fill
+		// has landed, so omitting it floored the gap on every cold prefix even with the NIC
+		// known -- the third derivation missing from this command (#393).
+		TTFB:     40 * time.Millisecond,
 		Recorder: met,
 	})
 	if err != nil {

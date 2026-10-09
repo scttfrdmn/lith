@@ -165,3 +165,29 @@ func pressureMaxWarning(v float64) string {
 	}
 	return ""
 }
+
+// validateInflightBytes rejects a malformed or non-positive --inflight-bytes instead of
+// silently deriving from the NIC as though the flag had not been set.
+//
+// Found while unifying the two commands' in-flight derivation (#393). `lith serve nfs` parsed
+// the flag itself and returned the error; `lith mount` only ever passed it to
+// computeInflightBytes, which falls through on a parse failure -- so `--inflight-bytes 512MB`
+// (a typo for 512MiB is fine, but `512 MB` with a space, or `512mib`, or `0`) was accepted,
+// ignored, and replaced by the derived default. The mount then logged the derived budget,
+// which is honest, but nothing said the flag had been discarded.
+//
+// That is the #264 class: a flag that looks set and is not. Both commands now validate, so the
+// shared derivation could not quietly take serve's error handling away.
+func validateInflightBytes(flag string) error {
+	if flag == "" {
+		return nil
+	}
+	n, err := parseSize(flag)
+	if err != nil {
+		return fmt.Errorf("--inflight-bytes %q: %w", flag, err)
+	}
+	if n <= 0 {
+		return fmt.Errorf("--inflight-bytes must be positive, got %q", flag)
+	}
+	return nil
+}

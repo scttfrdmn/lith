@@ -3,6 +3,10 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -80,6 +84,154 @@ func TestServeMountFlagParity(t *testing.T) {
 		}
 		if serve[name] {
 			t.Errorf("serveInapplicable lists %q, but `serve nfs` actually has it", name)
+		}
+	}
+}
+
+// serveConfigInapplicable documents every blockstore.Config field `lith mount` sets that
+// `lith serve nfs` intentionally does not, with the reason. Empty is the goal.
+var serveConfigInapplicable = map[string]string{
+	// Recorder is set by both, under different names (the mount's timeline recorder vs the
+	// gateway's metrics), so it is not listed here -- the key is what is compared.
+}
+
+// configKeysSetIn returns the blockstore.Config field names a file assigns.
+func configKeysSetIn(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), path, src, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	keys := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Config" {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "blockstore" {
+			return true
+		}
+		for _, el := range lit.Elts {
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				if k, ok := kv.Key.(*ast.Ident); ok {
+					keys[k.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	return keys
+}
+
+// ★ DERIVATION PARITY, which is the property TestServeMountFlagParity does not have and the
+// one that would have caught #393.
+//
+// That test asserts a mount flag is either PRESENT on `serve nfs` or documented inapplicable.
+// `--nic-gbps` and `--inflight-bytes` were both present, so it passed — while `runServeNFS`
+// never called resolveNIC or computeInflightBytes and never passed a TTFB seed. A stock export
+// therefore ran with NICBytesPerSec 0 (the coalesce gap pinned to its 256 KiB floor instead of
+// the device figure), no TTFB seed (the gap floored on every cold prefix regardless), and
+// InflightBytes 0 — which blockstore.Config documents as "0 disables byte gating", a state a
+// mount cannot reach because computeInflightBytes never returns 0.
+//
+// The flags existed and nothing derived from them. So the gate has to compare what the two
+// commands actually BUILD, not what they accept. Three missing derivations, three missing
+// config keys — all three visible here.
+func TestServeMountBlockStoreConfigParity(t *testing.T) {
+	mount := configKeysSetIn(t, "cmd_mount.go")
+	serve := configKeysSetIn(t, "serve.go")
+	if len(mount) == 0 || len(serve) == 0 {
+		t.Fatal("found no blockstore.Config literal in one of the commands; the AST walk is " +
+			"broken, not the code")
+	}
+
+	var missing []string
+	for name := range mount {
+		if serve[name] {
+			continue
+		}
+		if _, documented := serveConfigInapplicable[name]; documented {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("blockstore.Config fields `lith mount` sets and `lith serve nfs` does not: %s\n"+
+			"A gateway left at a field's zero value is not the same as a mount at its derived "+
+			"default — InflightBytes 0 disables byte gating, NICBytesPerSec 0 floors the "+
+			"coalesce gap, TTFB 0 floors it on the cold prefix (#393). Set them on serve, or "+
+			"add a reason to serveConfigInapplicable.", strings.Join(missing, ", "))
+	}
+
+	// Guard against stale documentation, same as the flag test.
+	for name := range serveConfigInapplicable {
+		if !mount[name] {
+			t.Errorf("serveConfigInapplicable lists %q, which `lith mount` does not set", name)
+		}
+		if serve[name] {
+			t.Errorf("serveConfigInapplicable lists %q, but `serve nfs` actually sets it", name)
+		}
+	}
+}
+
+// The three derivations themselves, named, because a config key can be present and assigned a
+// zero literal. This is the narrower assertion that pins #393's actual fix.
+func TestServeDerivesTheDeviceKnobs(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, tc := range []struct{ call, why string }{
+		// ANCHORED ON THE PRIMARY RESOLUTION, not on the bare name. serve.go calls
+		// resolveNIC twice -- once for the figure it uses and once with the override ignored,
+		// for #239's comparison -- so grepping for "resolveNIC(" alone stayed green when the
+		// primary call was replaced by a literal. Found by the revert sweep, not by reading.
+		{"nic := resolveNIC(ctx, nicDir, f.nicGbps)",
+			"without it NICBytesPerSec is 0 and the coalesce gap floors at 256 KiB"},
+		{"computeInflightBytes(f.inflightBytes, nic.BaselineGbps)",
+			"without it InflightBytes is 0, which disables byte gating"},
+		{"logNICAttempts(", "flag parity with the mount's #317 diagnostics"},
+		{"nicOverrideWarning(", "flag parity with the mount's #239 guard; an export is more exposed"},
+	} {
+		if !strings.Contains(s, tc.call) {
+			t.Errorf("serve.go does not call %s — %s (#393)", tc.call, tc.why)
+		}
+	}
+	// A TTFB seed that is literally zero is the same defect as not setting the field.
+	if !strings.Contains(s, "TTFB:") {
+		t.Error("serve.go sets no TTFB seed: MeasuredTTFB returns the seed until the first " +
+			"fill lands, so the coalesce gap floors on every cold prefix (#393)")
+	}
+	if strings.Contains(s, "TTFB:     0") || strings.Contains(s, "TTFB: 0") {
+		t.Error("serve.go sets TTFB to zero, which is indistinguishable from not setting it")
+	}
+}
+
+// BOTH commands must validate --inflight-bytes. The shared derivation
+// (computeInflightBytes) falls through on a parse failure, so a command that does not
+// validate first accepts a typo, discards it, and logs a derived budget as though the flag had
+// never been passed (#393). serve always errored; the mount never did, and unifying the
+// derivation would have been a chance to lose serve's half rather than gain mount's.
+func TestBothCommandsValidateInflightBytes(t *testing.T) {
+	for _, path := range []string{"cmd_mount.go", "serve.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "validateInflightBytes(f.inflightBytes)") {
+			t.Errorf("%s does not validate --inflight-bytes: a malformed value would be "+
+				"silently replaced by the NIC-derived default, with nothing saying the flag "+
+				"was ignored (#393, the #264 class)", path)
 		}
 	}
 }
