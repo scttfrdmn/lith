@@ -70,7 +70,7 @@ func (bs *BlockStore) decoder() (dec *zstd.Decoder, release func(), ok bool) {
 // fetched) and first-byte latency. For an ordinary key the logical space is the
 // object itself (one range GET). For a CargoShip chunk it is the chunk's
 // uncompressed tar stream, served by decoding the covering zstd frames.
-func (bs *BlockStore) fetchReader(ctx context.Context, k Key, off, length int64) (io.ReadCloser, string, error) {
+func (bs *BlockStore) fetchReader(ctx context.Context, k Key, off, length int64, kind fillKind) (io.ReadCloser, string, error) {
 	// A frameless (plain .tar) CargoShip chunk reads like an ordinary object: the
 	// requested offset is already a byte offset in the uncompressed tar object
 	// (the FUSE layer added the file's archive_offset), so it is a direct range
@@ -89,12 +89,12 @@ func (bs *BlockStore) fetchReader(ctx context.Context, k Key, off, length int64)
 		// this once: #322 moved the per-read prefetch counters off WithLabelValues onto
 		// atomic adds for the same reason.
 		if err == nil {
-			bs.recordTTFB(time.Since(t0))
+			bs.recordTTFB(time.Since(t0), kind)
 		}
 		bs.record(func(r Recorder) { r.S3Get(length, err != nil); r.EndInflight() })
 		return body, etag, err
 	}
-	return bs.cargoFetch(ctx, k, off, length)
+	return bs.cargoFetch(ctx, k, off, length, kind)
 }
 
 // frameKey identifies a decoded frame in the frame cache: the chunk object key
@@ -111,7 +111,7 @@ func frameKey(chunkKey string, compOff int64) string {
 // requested slice assembled. A tree walk thus fetches and decodes each frame
 // exactly once regardless of how many files it covers (#137). A checksum
 // mismatch is ErrStale (never a silent bad read).
-func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) (io.ReadCloser, string, error) {
+func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64, kind fillKind) (io.ReadCloser, string, error) {
 	frames := k.Cargo.Frames
 	end := off + length
 	if off < 0 || length <= 0 {
@@ -191,7 +191,7 @@ func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) 
 			flights = append(flights, fl2)
 			j++
 		}
-		et, db, err := bs.fetchFrameRun(ctx, k, frames, i, j, flights, copySlice)
+		et, db, err := bs.fetchFrameRun(ctx, k, frames, i, j, flights, copySlice, kind)
 		if err != nil {
 			return nil, "", err
 		}
@@ -215,7 +215,7 @@ func (bs *BlockStore) cargoFetch(ctx context.Context, k Key, off, length int64) 
 // (waking any waiters), and copies each frame's overlap into out via emit. On
 // any error the run's still-unpublished flights are failed with that error so
 // waiters do not hang. Returns the chunk object's ETag and total bytes decoded.
-func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargoship.Frame, lo, hi int, flights []*frameFlight, emit func(cargoship.Frame, []byte)) (etag string, decBytes int64, err error) {
+func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargoship.Frame, lo, hi int, flights []*frameFlight, emit func(cargoship.Frame, []byte), kind fillKind) (etag string, decBytes int64, err error) {
 	// Ensure every owned flight is resolved, even on an early error, so no waiter
 	// hangs. published tracks how many we have fulfilled already.
 	published := 0
@@ -240,7 +240,7 @@ func (bs *BlockStore) fetchFrameRun(ctx context.Context, k Key, frames []cargosh
 	// Stopped before the recorder callbacks, same as the plain path above: their cost is
 	// lith's, not the endpoint's.
 	if gerr == nil {
-		bs.recordTTFB(time.Since(t0))
+		bs.recordTTFB(time.Since(t0), kind)
 	}
 	bs.record(func(r Recorder) { r.S3Get(compLen, gerr != nil); r.EndInflight() })
 	if gerr != nil {

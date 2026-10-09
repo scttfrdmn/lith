@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith_fill_seconds{kind}`: what a fault costs, as a scrape rather than a judgement**
+  ([#362](https://github.com/scttfrdmn/lith/issues/362), condition 2). An operator mounted a
+  1.206 TB kraken2 database, ran a tool that classified **zero reads in eleven minutes**, and
+  spent three instances and most of a day establishing that **the mount was working
+  correctly** — it was in [#232](https://github.com/scttfrdmn/lith/issues/232)'s regime, a
+  serial fault stream at ~141 ms per 4 KiB probe, which lith has no lever to speed up. In
+  their words: *"the per-fault latency, the fill kind, and the random-vs-sequential
+  classification are all things lith knows and I couldn't see."*
+
+  Fill first-byte latency is now exported under the same `kind` label as
+  `lith_fill_bytes_total`. `kind="demand"` is a fill **no prediction covered**, which is the
+  fault-stream shape: its quantiles answer *what is a fault costing me*, its `_count` answers
+  *how many faults*, and its share against `kind="whole"` answers *is this mount streaming or
+  faulting*. Those are the three things they could not see.
+
+  **Labelled by fill kind rather than by detector state**, which is what the issue's framing
+  suggested. The kind is already decided at every call site of the fetch seam, where the
+  prefetch detector's state lives in `internal/fuse` and would have to be plumbed down through
+  the blockstore; and the kind is the more direct answer, because it says what lith *did*
+  rather than what it predicted.
+
+  **No threshold and no verdict.** Read it with `lith_ttfb_floor_seconds`, which is
+  load-invariant by construction, and the diagnosis reads itself: demand fills at ~141 ms
+  against a ~19 ms endpoint floor is one round trip per miss. `docs/copy-or-mount.md` now
+  carries the three queries and how to read them, including the case that is *not* this
+  regime — demand latency far above the floor is queueing, not S3. Two defaults placed from a
+  plausible-looking constant have already had to be withdrawn here
+  ([#340](https://github.com/scttfrdmn/lith/issues/340),
+  [#349](https://github.com/scttfrdmn/lith/issues/349)), and "is my workload in this regime"
+  is a question about the workload.
+
+
 ## [1.12.0] - 2026-10-09
 
 ### Added
