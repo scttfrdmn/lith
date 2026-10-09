@@ -143,3 +143,24 @@ func TestMemTierHeadroomIsCheckedByBothCommands(t *testing.T) {
 		}
 	}
 }
+
+// The NIC chain's failure reasons must be SURFACED, not merely collected (#317). resolveNIC
+// filling in nicInfo.Tried changes nothing on its own; the reporter's ask was that the log and
+// doctor say why each source failed, and a collected-but-unreported field is the shape that
+// shipped dead once already (the ttfbRecorder hook).
+func TestNICAttemptsAreReported(t *testing.T) {
+	for _, tc := range []struct{ path, call string }{
+		{"cmd_mount.go", "logNICAttempts("},
+		{"cmd_doctor.go", "addNICAttempts("},
+	} {
+		src, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), tc.call) {
+			t.Errorf("%s does not reference %s: the NIC chain would collect its failure "+
+				"reasons and report none of them, which is exactly the invisibility #317 was "+
+				"filed about", tc.path, tc.call)
+		}
+	}
+}

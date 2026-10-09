@@ -198,17 +198,9 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 	}
 	detail := fmt.Sprintf("%.1f Gbps (source=%s) → parts-max %d MiB, inflight %d MiB",
 		nic.BaselineGbps, nic.Source, partsMax/(1<<20), inflight/(1<<20))
-	switch nic.Source {
-	case "fallback":
-		// Every detection path failed; the values above are assumptions, not
-		// measurements. WARN (not INFO) so an all-PASS report does not hide it.
-		d.add(warn, "nic", detail+" — NIC undetected (no ethtool speed, no IMDS type, no DescribeInstanceTypes)",
-			"pass --nic-gbps <Gbps>; without it the device-derived knobs are guesses (e.g. parts-max)")
-	case "imds-estimate":
-		d.add(info, "nic", detail+fmt.Sprintf(" — estimated from %s size (DescribeInstanceTypes denied); pass --nic-gbps for the exact baseline", nic.InstanceType), "")
-	default:
-		d.add(info, "nic", detail, "")
-	}
+	st, verdict, fix := nicVerdict(nic, detail)
+	d.add(st, "nic", verdict, fix)
+	addNICAttempts(d, nic)
 
 	// Peak-vs-baseline guard (#239): --nic-gbps wants the *sustained baseline*, but
 	// the number AWS advertises ("Up to N Gigabit") is the *peak*. Passing the peak
