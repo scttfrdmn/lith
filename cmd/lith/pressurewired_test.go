@@ -127,3 +127,19 @@ func TestTheMountDerivesPressureFromTheEvidencePolicy(t *testing.T) {
 		t.Error("cmd_mount.go does not call pressureMaxFor")
 	}
 }
+
+// The headroom check must be IN both command paths, which the pure-function tests cannot show.
+// Same reason as TestPressureMaxReachesTheBlockStore: a warning nobody calls is a warning that
+// does not exist, and it builds, lints and tests clean.
+func TestMemTierHeadroomIsCheckedByBothCommands(t *testing.T) {
+	for _, path := range []string{"cmd_mount.go", "serve.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "memTierHeadroomWarning(") {
+			t.Errorf("%s never calls memTierHeadroomWarning: a 20 GB --mem-cache on a 33 GB "+
+				"box would mount silently and be OOM-killed (#314)", path)
+		}
+	}
+}

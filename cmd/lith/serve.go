@@ -124,6 +124,11 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 			return err
 		}
 	}
+	// Before anything is fetched: the failure this warns about is the process being killed
+	// (#314), and on a gateway that takes every client's mount down with it.
+	if w := memTierHeadroomWarning(memCache, totalMemBytes()); w != "" {
+		log.Warn("memory tier", "warning", w)
+	}
 
 	var wireMet **metrics.Metrics
 	var wireTrace s3client.WireTraceFunc
