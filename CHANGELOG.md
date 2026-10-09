@@ -7,6 +7,231 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-09
+
+### Added
+
+- **The mount and the gateway warn when `--mem-cache` cannot fit on the box**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)). A 20 GB tier on a 33 GB box was
+  accepted silently and the daemon was OOM-killed at RSS 30.56 GB. The check runs before
+  anything is fetched, because the failure it predicts is the process dying.
+
+  **The mechanism is not the one the issue was filed with, and the correction matters because
+  two of its three proposed fixes were built on it.** #314 modelled the footprint as the tier
+  **plus** outstanding prefetch commitment (20 + 13.078 GB, summing to MemTotal almost
+  exactly). That addition does not hold. `lith_prefetch_committed_bytes` is charged at
+  *dispatch* and released only on consume/evict/fail, so it keeps counting a chunk after that
+  chunk has landed **in the tier** — it double-counts the resident half — and a dispatched
+  chunk that has not yet been admitted holds no chunk buffer at all, because `cloneChunk` runs
+  *after* `fetchReader` returns and after the bytes-in-flight budget is acquired. The field's
+  own comment in `blockstore.go` says it: *"it is NOT a memory figure"*.
+
+  What does explain it is the collector. The tier is live Go heap (every chunk is a
+  `make([]byte, cl)`), lith sets neither `GOGC` nor `GOMEMLIMIT`, and at the default
+  `GOGC=100` the heap target is about **twice** the live set. A 20 GB tier therefore targets
+  ~40 GB on a 33 GB box and the process dies on the way there — which also explains why the
+  kill came at 30.56 GB rather than at the 33.08 GB the additive model predicted.
+
+  So the ceiling is **~50 % of RAM**, and it is arithmetic from `GOGC`'s definition rather
+  than a constant anyone picked — the distinction that cost three releases on
+  [#340](https://github.com/scttfrdmn/lith/issues/340)/[#349](https://github.com/scttfrdmn/lith/issues/349).
+  `2 × tier` is a *lower* bound on the target (the tier is not the only live heap), so the
+  check under-warns rather than over-warns: a warning that fires on a configuration which
+  would have survived teaches operators to ignore it. The message names the ceiling and
+  `GOMEMLIMIT`, which makes the collector work harder instead of letting the kernel kill the
+  process.
+
+  A warning and not a clamp or a refusal, consistent with `--prefetch-pressure-max`: an
+  operator who typed a number keeps it, and a tier fills lazily, so a short-lived mount over a
+  small dataset may never reach the bound.
+
+  Also documents *why* the default is 25 % — previously unwritten, and now load-bearing.
+
+- **A warning when `--prefetch-budget` and `--prefetch-pressure-max` compose into a stall**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). Found while deriving the default
+  above, by writing out the denominator rather than the interesting term.
+
+  The gate is sized against the **tier**, while the quantity it limits is independently bounded
+  by `--prefetch-budget`, which defaults to **half** the tier. That is the entire reason the
+  new default is safe: one handle's steady-state pressure is ~0.50 against a 0.85 threshold, so
+  the gate is silent until a concurrent start makes the divisor lag. Raise `--prefetch-budget`
+  to or above `0.85 × --mem-cache` and a single handle at full budget sits **at** the threshold,
+  so the gate holds dispatches continuously and the mount throttles itself with nothing wrong —
+  and `lith_prefetch_pressure_held_total` would climb and look like the gate working. Two knobs
+  that are individually reasonable, composing into a self-inflicted stall that nothing would
+  have reported.
+
+  The mount and the gateway now warn, naming the figure to lower. `BlockStore.MemCap()` is
+  exported so the check uses the tier's **realized** capacity (shards × per-shard) rather than
+  the requested `--mem-cache`.
+
+- **`--prefetch-sibling-coverage`: concurrent readers of one object can establish again**
+  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Experimental, off by default.
+
+  lith opens with `FOPEN_KEEP_CACHE`, so every descriptor on an inode shares the kernel page
+  cache: a sibling's reads are served by the kernel and never reach lith, each handle's own
+  stream is punctate with coverage ≈ 1/N, and from **four** concurrent readers of one object
+  the [#221](https://github.com/scttfrdmn/lith/issues/221) coverage gate holds every handle
+  provisional so **nothing prefetches**. Measured **243× slower** than one reader alone with
+  byte amplification of **1.001** — the cleanest byte count of any cell and the slowest run,
+  so no byte or request counter can see it.
+
+  A hole now counts as covered when another descriptor is open on the same object **and** the
+  bytes in it were already *demanded* through lith. Both conditions are load-bearing, and the
+  first was added after a test caught the fix being wrong: lith fetches a whole 1 MiB chunk to
+  serve a 128 KiB read, so for holes **smaller than a chunk** a *lone strided* reader's own
+  demand fetches make its own holes look demanded — which is
+  [#222](https://github.com/scttfrdmn/lith/issues/222)'s shape and exactly what must not
+  establish. At chunk granularity the two cases are indistinguishable; what differs is *who*
+  demanded the bytes, and "someone else has this file open" is the cheapest sound proxy.
+
+  The demanded condition holds the band **between a chunk and a block**, which nothing else
+  covers. Holes wider than `--block-size` never reach either condition — the byte-gap gate
+  forces `Random` first, which is also why a 16 MiB-stride fixture tests nothing here and the
+  first version of that test was vacuous for passing on the wrong gate.
+
+  **Confirmed externally at the default `--prefetch-coverage-min`:** 16 of 16 readers
+  establish in both reps, wall **67 s → 2.9 s**, `coverage_held` from ~1000 to **16** (the
+  same as `O_DIRECT`), with the holes themselves unchanged — it discounts them rather than
+  removing them. It is also the most byte-efficient of the three ways to get there: **0.67 GB
+  fetched for 0.54 GB read**, against 1.89 GB for `--prefetch-coverage-min 0.05` and
+  0.86–1.53 GB for `O_DIRECT`.
+
+  "Already demanded" rather than "resident" is deliberate twice over: a random walk's holes
+  are not resident at all ([#232](https://github.com/scttfrdmn/lith/issues/232) — no lever
+  there, and prefetching for one adds bytes without moving the wall clock), and lith's own
+  unread over-fetch *is* resident but undemanded, which must not count or a strided reader
+  would establish on regions its own window swept.
+
+- **Docs: the per-connection cold first-traffic cost, and the evidence gate's second job**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A fourth rule in CONTRIBUTING's
+  measurement section, and the product consequence in `knobs.md`.
+
+  A new connection's S3 first-byte time starts at **~100–150 ms and settles to ~30 ms over
+  roughly its first second of traffic** — per-connection and ramp-like, not a setup cost: one
+  request per connection does *not* fix it, and about a second of traffic per connection does.
+  A client that opens many connections at once and measures immediately eats it in full: 22%
+  of first bytes under 50 ms against 92% after a one-second warm-up, so **a cold first arm
+  reads 3–10× worse than steady state**.
+
+  **The evidence gate's ramp turns out to protect against this, which nobody designed it for.**
+  Measured on two mounts started at the same instant: with the gate off lith opens **83% of its
+  fills on new connections every rep** and comes in **up to 49 points colder**, with *identical
+  bytes fetched*. The same cell explains the reused-connection queueing residual from #350 —
+  gate-off has **zero** (0.01 ms every rep) against 0.76–2.26 ms gate-on — so the ramp both
+  protects against the cold cost and causes the queueing. One mechanism, two signs.
+
+  Recorded with the consequence and the tension: gate-off mounts (cross-region, or
+  region-unknown) open their connections at once and pay the cold cost on every fresh mount,
+  which trades against the measured 1.96× ramp penalty at distance. **That net is unmeasured**,
+  and the docs say so rather than implying a recommendation.
+
+- **`lith-s3bench -warmup-workers`: size the warm-up independently of the measured burst**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). The output line now reports
+  `warmup=<dur>/<n>w`, so an arm that warmed at a different scale than it measured says so.
+
+  This is the variable the remaining #381 asymmetry turns on. A **fresh lith mount is fast
+  while a fresh `lith-s3bench` process at the same instant is slow** — 17 of 18 simultaneous
+  pairs — and the structural difference is that a mount does region resolution and an index
+  read *before* its burst. The ladder established that a *tiny* separate request does not warm
+  the effect (`head-object` and one worker for 0.2 s both left it present), so the open
+  question is **how much traffic does**, and answering it needs the warm-up and the
+  measurement sized independently *within one process* — which `-warmup` alone could not
+  express.
+
+- **`lith-s3bench -warmup`, and the measured window's offset from process start**
+  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A discarded window of the given
+  length before the measured one, in the same process, and a `start+NNNms` field in the output
+  so a cold first arm is self-identifying in a log.
+
+  The first s3bench process of a run has been measured with a 3–10× worse first-byte tail in
+  **7 of 7 runs**, with the idle gap beforehand ranging from seconds to ~8 h — which rules out
+  a simply-cold endpoint. The decisive datum: a first s3bench process read **endpoint 97.7 ms
+  while a lith mount on the same box, same key, same instant read 41.2 ms**. That rules out
+  the endpoint, the network path, and box-wide state like DNS or the NIC, and leaves something
+  in or keyed to the process's **first contact**.
+
+  So this is both the mitigation and a diagnostic: **if an in-process warm-up removes the
+  effect, it is first-contact-in-process** rather than anything run-level, and no amount of
+  warming from a separate process would have fixed it. Observed immediately: with a warm-up
+  the `conn="new"` arm disappears entirely and acquisition drops from 0.65–149 ms to 0.01 ms.
+
+  The warm-up does **not** reset the request cursor, so the measured window reads different
+  ranges than the warm-up did and cannot be measuring a self-warmed object; and its wire
+  samples are discarded, which matters because folding them in would silently return the
+  effect being removed.
+
+- **`lith-s3bench` reports the same wire split as the mount, and labels its auth mode**
+  ([#350](https://github.com/scttfrdmn/lith/issues/350)). A `SPLIT` line per connection
+  class: `acquire`, `write`, `endpoint` and their `wire` sum, from the *same*
+  `internal/s3client` tracer the mount uses.
+
+  The comparison that issue has come down to is whether S3 answers a mount's requests slower
+  than an equivalent client's — and that cannot be settled while the two programs measure
+  through different code. Means rather than percentiles, because the question is which
+  *interval* carries the time and the three means must sum to the wire mean, which
+  percentiles do not.
+
+  **Auth is now in the output line**, because an external comparison ran for several cells
+  with the mount **signing** and this tool **anonymous** — identical request fields, identical
+  ranges, identical SDK, different credentials — and nothing in either program's output said
+  so. It turned out to be worth only 6–21 points rather than the gap under investigation, but
+  it cost cells to establish that, and a confound visible in the output cannot persist
+  silently. `-fresh-buffers` self-labels for the same reason.
+
+### Changed
+
+- **The prefetch pressure gate now defaults ON where the evidence gate is off**
+  ([#313](https://github.com/scttfrdmn/lith/issues/313)). `--prefetch-pressure-max 0` — the
+  default — no longer means "disabled". It now decides from the evidence gate, which covers
+  exactly the complementary case: **`0.85` where that gate is off** (cross-region, or where the
+  bucket's region cannot be determined), and **off where it is on**. A negative value forces it
+  off, including on a mount where the default would engage. **`lith serve nfs` engages it on
+  every export**, because the gateway has no evidence gate at all.
+
+  This is the keystone six other issues were sequenced behind, and the reason it is a default
+  rather than a mechanism is that the mechanism already shipped. The evidence gate bounds each
+  handle by its **own consumed bytes**, which is available from its first read and so has no
+  start transient. Where it is off, nothing did: N handles establish within milliseconds of
+  each other while the rationing divisor still reads 1, so each dispatches a full-budget
+  window. Since `--prefetch-budget` defaults to half the tier, 16 readers starting together
+  were measured at pressure **8.000** — N × 0.5 — against a steady state of 0.50.
+
+  **`0.85` rather than `1.0`**, both of which are inside the measured band, and the reason is a
+  mechanism rather than a point between two observations. At `1.0` wall is 2.8× better than an
+  unbounded start (41 s vs 116 s) with **71–119 unread chunks still evicted**; at `0.85`
+  evictions reach **0–4** for about 10% more wall. An evicted unread prefetch is a byte that
+  was fetched and discarded, and this default engages only where the evidence gate does not —
+  cross-region, where those bytes are billed **egress**. So the trade is ~10% wall against ~100
+  discarded-byte events, on exactly the mounts where a discarded byte has a price. In-region,
+  where wall clock would be the only term, the gate stays off.
+
+  **What it does not do, said before it ships: it bounds bytes, not fairness.** Reader spread
+  stayed 2.3–3.1 at every threshold tested, against ~1.05 with the evidence gate on. It limits
+  the collapse; the fairness half of the gate-off case is still open.
+
+  The two gates are decided from **one input**: `pressureMaxFor` reads
+  `EvidenceRatioFor`'s *result* rather than re-deciding from the region pair. Two policies over
+  the same two booleans are two policies that can drift, and the failure would be silent — both
+  gates off, or both on, with nothing in the log looking wrong. A test asserts over the real
+  policy function that **exactly one** gate is in force at stock defaults, for every region
+  pair. It also makes the composition right for cases no region pair describes: forcing
+  `--readahead-evidence-ratio 4` cross-region stands this gate down, and forcing `-1` in-region
+  engages it.
+
+  `lith serve nfs` passes a literal `0` because that is the truth and not a placeholder:
+  `internal/nfs` carries its own per-path detector and never calls into `internal/prefetch`, so
+  no window in that path is bounded by what a reader has consumed at any region pair. The
+  gateway therefore inherits the band **by the arithmetic** — same blockstore, same
+  committed-bytes counter, same tier — rather than by its own measurement, which is
+  [#337](https://github.com/scttfrdmn/lith/issues/337)'s cell. Said out loud because a figure
+  measured on one population and applied to another is how two bad defaults already shipped
+  here.
+
+  Both commands now log `prefetch admission` with both gates' resolved values, so which one is
+  in force is greppable rather than inferred, and `lith serve nfs` gained the
+  `--prefetch-pressure-max` sanity warning the mount already had.
+
 ### Fixed
 
 - **`lith serve nfs` never detected the NIC, so a stock gateway ran with byte gating disabled**
@@ -135,119 +360,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would need its own rule, none has been reported, and inventing rules for families nobody has
   run is how a table gets a second generation of wrong entries.
 
-### Added
-
-- **The mount and the gateway warn when `--mem-cache` cannot fit on the box**
-  ([#314](https://github.com/scttfrdmn/lith/issues/314)). A 20 GB tier on a 33 GB box was
-  accepted silently and the daemon was OOM-killed at RSS 30.56 GB. The check runs before
-  anything is fetched, because the failure it predicts is the process dying.
-
-  **The mechanism is not the one the issue was filed with, and the correction matters because
-  two of its three proposed fixes were built on it.** #314 modelled the footprint as the tier
-  **plus** outstanding prefetch commitment (20 + 13.078 GB, summing to MemTotal almost
-  exactly). That addition does not hold. `lith_prefetch_committed_bytes` is charged at
-  *dispatch* and released only on consume/evict/fail, so it keeps counting a chunk after that
-  chunk has landed **in the tier** — it double-counts the resident half — and a dispatched
-  chunk that has not yet been admitted holds no chunk buffer at all, because `cloneChunk` runs
-  *after* `fetchReader` returns and after the bytes-in-flight budget is acquired. The field's
-  own comment in `blockstore.go` says it: *"it is NOT a memory figure"*.
-
-  What does explain it is the collector. The tier is live Go heap (every chunk is a
-  `make([]byte, cl)`), lith sets neither `GOGC` nor `GOMEMLIMIT`, and at the default
-  `GOGC=100` the heap target is about **twice** the live set. A 20 GB tier therefore targets
-  ~40 GB on a 33 GB box and the process dies on the way there — which also explains why the
-  kill came at 30.56 GB rather than at the 33.08 GB the additive model predicted.
-
-  So the ceiling is **~50 % of RAM**, and it is arithmetic from `GOGC`'s definition rather
-  than a constant anyone picked — the distinction that cost three releases on
-  [#340](https://github.com/scttfrdmn/lith/issues/340)/[#349](https://github.com/scttfrdmn/lith/issues/349).
-  `2 × tier` is a *lower* bound on the target (the tier is not the only live heap), so the
-  check under-warns rather than over-warns: a warning that fires on a configuration which
-  would have survived teaches operators to ignore it. The message names the ceiling and
-  `GOMEMLIMIT`, which makes the collector work harder instead of letting the kernel kill the
-  process.
-
-  A warning and not a clamp or a refusal, consistent with `--prefetch-pressure-max`: an
-  operator who typed a number keeps it, and a tier fills lazily, so a short-lived mount over a
-  small dataset may never reach the bound.
-
-  Also documents *why* the default is 25 % — previously unwritten, and now load-bearing.
-
-### Changed
-
-- **The prefetch pressure gate now defaults ON where the evidence gate is off**
-  ([#313](https://github.com/scttfrdmn/lith/issues/313)). `--prefetch-pressure-max 0` — the
-  default — no longer means "disabled". It now decides from the evidence gate, which covers
-  exactly the complementary case: **`0.85` where that gate is off** (cross-region, or where the
-  bucket's region cannot be determined), and **off where it is on**. A negative value forces it
-  off, including on a mount where the default would engage. **`lith serve nfs` engages it on
-  every export**, because the gateway has no evidence gate at all.
-
-  This is the keystone six other issues were sequenced behind, and the reason it is a default
-  rather than a mechanism is that the mechanism already shipped. The evidence gate bounds each
-  handle by its **own consumed bytes**, which is available from its first read and so has no
-  start transient. Where it is off, nothing did: N handles establish within milliseconds of
-  each other while the rationing divisor still reads 1, so each dispatches a full-budget
-  window. Since `--prefetch-budget` defaults to half the tier, 16 readers starting together
-  were measured at pressure **8.000** — N × 0.5 — against a steady state of 0.50.
-
-  **`0.85` rather than `1.0`**, both of which are inside the measured band, and the reason is a
-  mechanism rather than a point between two observations. At `1.0` wall is 2.8× better than an
-  unbounded start (41 s vs 116 s) with **71–119 unread chunks still evicted**; at `0.85`
-  evictions reach **0–4** for about 10% more wall. An evicted unread prefetch is a byte that
-  was fetched and discarded, and this default engages only where the evidence gate does not —
-  cross-region, where those bytes are billed **egress**. So the trade is ~10% wall against ~100
-  discarded-byte events, on exactly the mounts where a discarded byte has a price. In-region,
-  where wall clock would be the only term, the gate stays off.
-
-  **What it does not do, said before it ships: it bounds bytes, not fairness.** Reader spread
-  stayed 2.3–3.1 at every threshold tested, against ~1.05 with the evidence gate on. It limits
-  the collapse; the fairness half of the gate-off case is still open.
-
-  The two gates are decided from **one input**: `pressureMaxFor` reads
-  `EvidenceRatioFor`'s *result* rather than re-deciding from the region pair. Two policies over
-  the same two booleans are two policies that can drift, and the failure would be silent — both
-  gates off, or both on, with nothing in the log looking wrong. A test asserts over the real
-  policy function that **exactly one** gate is in force at stock defaults, for every region
-  pair. It also makes the composition right for cases no region pair describes: forcing
-  `--readahead-evidence-ratio 4` cross-region stands this gate down, and forcing `-1` in-region
-  engages it.
-
-  `lith serve nfs` passes a literal `0` because that is the truth and not a placeholder:
-  `internal/nfs` carries its own per-path detector and never calls into `internal/prefetch`, so
-  no window in that path is bounded by what a reader has consumed at any region pair. The
-  gateway therefore inherits the band **by the arithmetic** — same blockstore, same
-  committed-bytes counter, same tier — rather than by its own measurement, which is
-  [#337](https://github.com/scttfrdmn/lith/issues/337)'s cell. Said out loud because a figure
-  measured on one population and applied to another is how two bad defaults already shipped
-  here.
-
-  Both commands now log `prefetch admission` with both gates' resolved values, so which one is
-  in force is greppable rather than inferred, and `lith serve nfs` gained the
-  `--prefetch-pressure-max` sanity warning the mount already had.
-
-### Added
-
-- **A warning when `--prefetch-budget` and `--prefetch-pressure-max` compose into a stall**
-  ([#313](https://github.com/scttfrdmn/lith/issues/313)). Found while deriving the default
-  above, by writing out the denominator rather than the interesting term.
-
-  The gate is sized against the **tier**, while the quantity it limits is independently bounded
-  by `--prefetch-budget`, which defaults to **half** the tier. That is the entire reason the
-  new default is safe: one handle's steady-state pressure is ~0.50 against a 0.85 threshold, so
-  the gate is silent until a concurrent start makes the divisor lag. Raise `--prefetch-budget`
-  to or above `0.85 × --mem-cache` and a single handle at full budget sits **at** the threshold,
-  so the gate holds dispatches continuously and the mount throttles itself with nothing wrong —
-  and `lith_prefetch_pressure_held_total` would climb and look like the gate working. Two knobs
-  that are individually reasonable, composing into a self-inflicted stall that nothing would
-  have reported.
-
-  The mount and the gateway now warn, naming the figure to lower. `BlockStore.MemCap()` is
-  exported so the check uses the tier's **realized** capacity (shards × per-shard) rather than
-  the requested `--mem-cache`.
-
-### Fixed
-
 - **`--prefetch-sibling-coverage`'s `--help` described only one of its two conditions**
   ([#316](https://github.com/scttfrdmn/lith/issues/316)). Reported externally. I wrote that
   help text before a test forced the design correction that *added* the sibling condition, and
@@ -260,130 +372,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would have had no way to know why the flag did nothing for a single reader, or that it was
   deliberately doing nothing. The help now states both conditions, which hole sizes each one
   covers, and the measured result.
-
-### Added
-
-- **`--prefetch-sibling-coverage`: concurrent readers of one object can establish again**
-  ([#316](https://github.com/scttfrdmn/lith/issues/316)). Experimental, off by default.
-
-  lith opens with `FOPEN_KEEP_CACHE`, so every descriptor on an inode shares the kernel page
-  cache: a sibling's reads are served by the kernel and never reach lith, each handle's own
-  stream is punctate with coverage ≈ 1/N, and from **four** concurrent readers of one object
-  the [#221](https://github.com/scttfrdmn/lith/issues/221) coverage gate holds every handle
-  provisional so **nothing prefetches**. Measured **243× slower** than one reader alone with
-  byte amplification of **1.001** — the cleanest byte count of any cell and the slowest run,
-  so no byte or request counter can see it.
-
-  A hole now counts as covered when another descriptor is open on the same object **and** the
-  bytes in it were already *demanded* through lith. Both conditions are load-bearing, and the
-  first was added after a test caught the fix being wrong: lith fetches a whole 1 MiB chunk to
-  serve a 128 KiB read, so for holes **smaller than a chunk** a *lone strided* reader's own
-  demand fetches make its own holes look demanded — which is
-  [#222](https://github.com/scttfrdmn/lith/issues/222)'s shape and exactly what must not
-  establish. At chunk granularity the two cases are indistinguishable; what differs is *who*
-  demanded the bytes, and "someone else has this file open" is the cheapest sound proxy.
-
-  The demanded condition holds the band **between a chunk and a block**, which nothing else
-  covers. Holes wider than `--block-size` never reach either condition — the byte-gap gate
-  forces `Random` first, which is also why a 16 MiB-stride fixture tests nothing here and the
-  first version of that test was vacuous for passing on the wrong gate.
-
-  **Confirmed externally at the default `--prefetch-coverage-min`:** 16 of 16 readers
-  establish in both reps, wall **67 s → 2.9 s**, `coverage_held` from ~1000 to **16** (the
-  same as `O_DIRECT`), with the holes themselves unchanged — it discounts them rather than
-  removing them. It is also the most byte-efficient of the three ways to get there: **0.67 GB
-  fetched for 0.54 GB read**, against 1.89 GB for `--prefetch-coverage-min 0.05` and
-  0.86–1.53 GB for `O_DIRECT`.
-
-  "Already demanded" rather than "resident" is deliberate twice over: a random walk's holes
-  are not resident at all ([#232](https://github.com/scttfrdmn/lith/issues/232) — no lever
-  there, and prefetching for one adds bytes without moving the wall clock), and lith's own
-  unread over-fetch *is* resident but undemanded, which must not count or a strided reader
-  would establish on regions its own window swept.
-
-### Added
-
-- **Docs: the per-connection cold first-traffic cost, and the evidence gate's second job**
-  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A fourth rule in CONTRIBUTING's
-  measurement section, and the product consequence in `knobs.md`.
-
-  A new connection's S3 first-byte time starts at **~100–150 ms and settles to ~30 ms over
-  roughly its first second of traffic** — per-connection and ramp-like, not a setup cost: one
-  request per connection does *not* fix it, and about a second of traffic per connection does.
-  A client that opens many connections at once and measures immediately eats it in full: 22%
-  of first bytes under 50 ms against 92% after a one-second warm-up, so **a cold first arm
-  reads 3–10× worse than steady state**.
-
-  **The evidence gate's ramp turns out to protect against this, which nobody designed it for.**
-  Measured on two mounts started at the same instant: with the gate off lith opens **83% of its
-  fills on new connections every rep** and comes in **up to 49 points colder**, with *identical
-  bytes fetched*. The same cell explains the reused-connection queueing residual from #350 —
-  gate-off has **zero** (0.01 ms every rep) against 0.76–2.26 ms gate-on — so the ramp both
-  protects against the cold cost and causes the queueing. One mechanism, two signs.
-
-  Recorded with the consequence and the tension: gate-off mounts (cross-region, or
-  region-unknown) open their connections at once and pay the cold cost on every fresh mount,
-  which trades against the measured 1.96× ramp penalty at distance. **That net is unmeasured**,
-  and the docs say so rather than implying a recommendation.
-
-### Added
-
-- **`lith-s3bench -warmup-workers`: size the warm-up independently of the measured burst**
-  ([#381](https://github.com/scttfrdmn/lith/issues/381)). The output line now reports
-  `warmup=<dur>/<n>w`, so an arm that warmed at a different scale than it measured says so.
-
-  This is the variable the remaining #381 asymmetry turns on. A **fresh lith mount is fast
-  while a fresh `lith-s3bench` process at the same instant is slow** — 17 of 18 simultaneous
-  pairs — and the structural difference is that a mount does region resolution and an index
-  read *before* its burst. The ladder established that a *tiny* separate request does not warm
-  the effect (`head-object` and one worker for 0.2 s both left it present), so the open
-  question is **how much traffic does**, and answering it needs the warm-up and the
-  measurement sized independently *within one process* — which `-warmup` alone could not
-  express.
-
-### Added
-
-- **`lith-s3bench -warmup`, and the measured window's offset from process start**
-  ([#381](https://github.com/scttfrdmn/lith/issues/381)). A discarded window of the given
-  length before the measured one, in the same process, and a `start+NNNms` field in the output
-  so a cold first arm is self-identifying in a log.
-
-  The first s3bench process of a run has been measured with a 3–10× worse first-byte tail in
-  **7 of 7 runs**, with the idle gap beforehand ranging from seconds to ~8 h — which rules out
-  a simply-cold endpoint. The decisive datum: a first s3bench process read **endpoint 97.7 ms
-  while a lith mount on the same box, same key, same instant read 41.2 ms**. That rules out
-  the endpoint, the network path, and box-wide state like DNS or the NIC, and leaves something
-  in or keyed to the process's **first contact**.
-
-  So this is both the mitigation and a diagnostic: **if an in-process warm-up removes the
-  effect, it is first-contact-in-process** rather than anything run-level, and no amount of
-  warming from a separate process would have fixed it. Observed immediately: with a warm-up
-  the `conn="new"` arm disappears entirely and acquisition drops from 0.65–149 ms to 0.01 ms.
-
-  The warm-up does **not** reset the request cursor, so the measured window reads different
-  ranges than the warm-up did and cannot be measuring a self-warmed object; and its wire
-  samples are discarded, which matters because folding them in would silently return the
-  effect being removed.
-
-### Added
-
-- **`lith-s3bench` reports the same wire split as the mount, and labels its auth mode**
-  ([#350](https://github.com/scttfrdmn/lith/issues/350)). A `SPLIT` line per connection
-  class: `acquire`, `write`, `endpoint` and their `wire` sum, from the *same*
-  `internal/s3client` tracer the mount uses.
-
-  The comparison that issue has come down to is whether S3 answers a mount's requests slower
-  than an equivalent client's — and that cannot be settled while the two programs measure
-  through different code. Means rather than percentiles, because the question is which
-  *interval* carries the time and the three means must sum to the wire mean, which
-  percentiles do not.
-
-  **Auth is now in the output line**, because an external comparison ran for several cells
-  with the mount **signing** and this tool **anonymous** — identical request fields, identical
-  ranges, identical SDK, different credentials — and nothing in either program's output said
-  so. It turned out to be worth only 6–21 points rather than the gap under investigation, but
-  it cost cells to establish that, and a confound visible in the output cannot persist
-  silently. `-fresh-buffers` self-labels for the same reason.
 
 ## [1.11.0] - 2026-10-07
 
@@ -3058,7 +3046,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/scttfrdmn/lith/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/scttfrdmn/lith/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/scttfrdmn/lith/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/scttfrdmn/lith/compare/v1.8.0...v1.9.0
