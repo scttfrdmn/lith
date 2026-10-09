@@ -196,30 +196,17 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 	} else if partsMax > 64<<20 {
 		partsMax = 64 << 20
 	}
-	detail := fmt.Sprintf("%.1f Gbps (source=%s) → parts-max %d MiB, inflight %d MiB",
-		nic.BaselineGbps, nic.Source, partsMax/(1<<20), inflight/(1<<20))
+	detail := nicDetailLine(nic, partsMax, inflight)
 	st, verdict, fix := nicVerdict(nic, detail)
 	d.add(st, "nic", verdict, fix)
 	addNICAttempts(d, nic)
 
-	// Peak-vs-baseline guard (#239): --nic-gbps wants the *sustained baseline*, but
-	// the number AWS advertises ("Up to N Gigabit") is the *peak*. Passing the peak
-	// over-sizes the readahead window and fetches bytes that are never read for no
-	// speed gain. When an override is set, re-detect the instance's true baseline
-	// (ignoring the override) and warn if the override looks like the advertised
-	// peak — substantially above the detected baseline.
+	// Peak-vs-baseline guard (#239), now shared with the mount so the two cannot disagree
+	// about what counts as an overstatement. Re-detects with the override ignored, because
+	// resolveNIC short-circuits on it and so reports nothing about the real device.
 	if f.nicGbps > 0 {
-		det := resolveNIC(ctx, os.TempDir(), 0)
-		switch {
-		case det.PeakGbps > det.BaselineGbps && f.nicGbps >= det.PeakGbps*0.95:
-			d.add(warn, "nic-gbps",
-				fmt.Sprintf("--nic-gbps %.1f matches this instance's peak (baseline %.1f, peak %.1f, source=%s)",
-					f.nicGbps, det.BaselineGbps, det.PeakGbps, det.Source),
-				fmt.Sprintf("--nic-gbps wants the sustained baseline (%.1f), not the 'Up to N Gigabit' peak — the peak over-fetches for no speed gain", det.BaselineGbps))
-		case det.Source != "fallback" && det.BaselineGbps > 0 && f.nicGbps >= det.BaselineGbps*1.5:
-			d.add(warn, "nic-gbps",
-				fmt.Sprintf("--nic-gbps %.1f is well above the detected baseline %.1f (source=%s)", f.nicGbps, det.BaselineGbps, det.Source),
-				"--nic-gbps wants the sustained baseline, not the advertised 'Up to N Gigabit' peak; overstating it over-fetches for no speed gain")
+		if w := nicOverrideWarning(f.nicGbps, resolveNIC(ctx, os.TempDir(), 0)); w != "" {
+			d.add(warn, "nic-gbps", w, "pass the sustained baseline; `lith doctor` prints both figures above")
 		}
 	}
 

@@ -518,3 +518,129 @@ func TestLogNICAttemptsReachesTheMountLog(t *testing.T) {
 		t.Errorf("logged attempts for a chain that had none:\n%s", out)
 	}
 }
+
+// THE REPORTED CASE: a c7g.4xlarge whose sustained baseline is 7.5, given the peak of 15 off
+// the instance page. 654 MB fetched against 382 MB for the same 110 MB of data, for an
+// indistinguishable wall clock (#239). This guard shipped with no test at all.
+func TestNICOverrideWarning(t *testing.T) {
+	// DescribeInstanceTypes reports both figures, which is what makes the exact case sound.
+	c7g := nicInfo{InstanceType: "c7g.4xlarge", BaselineGbps: 7.5, PeakGbps: 15,
+		Source: "DescribeInstanceTypes"}
+
+	w := nicOverrideWarning(15, c7g)
+	if w == "" {
+		t.Fatal("--nic-gbps 15 against a 7.5 baseline / 15 peak draws no warning: this is the " +
+			"exact configuration #239 was filed from")
+	}
+	// The message must carry both numbers and the value to use, because the operator's next
+	// action is retyping the flag.
+	for _, want := range []string{"PEAK", "7.5", "15", "--nic-gbps 7.5"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning omits %q, so it is not actionable: %q", want, w)
+		}
+	}
+	// The correct value is silent, and so is a value below the baseline (someone deliberately
+	// throttling lith is not making this mistake).
+	for _, ok := range []float64{7.5, 7.0, 4.0, 1.0} {
+		if w := nicOverrideWarning(ok, c7g); w != "" {
+			t.Errorf("--nic-gbps %g against a 7.5 baseline warns: %q", ok, w)
+		}
+	}
+	// Between baseline and the 1.5x heuristic: not nagged about. A small deliberate
+	// correction upward is a legitimate thing to do.
+	if w := nicOverrideWarning(9, c7g); w != "" {
+		t.Errorf("--nic-gbps 9 (1.2x baseline) warns; small corrections must be allowed: %q", w)
+	}
+	// At and above 1.5x, but not the peak: the heuristic case.
+	if w := nicOverrideWarning(11.25, c7g); w == "" {
+		t.Error("--nic-gbps 11.25 (1.5x the measured baseline, not the peak) draws no warning")
+	} else if strings.Contains(w, "PEAK") {
+		t.Errorf("a non-peak overstatement was reported as the peak: %q", w)
+	}
+	// Nothing to compare against.
+	if w := nicOverrideWarning(0, c7g); w != "" {
+		t.Errorf("no override, but warned: %q", w)
+	}
+}
+
+// ★ THE SOUNDNESS RULE: never correct an operator against a figure lith did not measure.
+// #317 established that the size-keyed estimate was 12x LOW on a c8gn.48xlarge, so warning
+// that a correct 600 is "well above the detected baseline 50" would be exactly backwards --
+// the operator right and lith wrong.
+func TestNICOverrideWarningOnlyTrustsMeasuredSources(t *testing.T) {
+	for _, src := range []string{"imds-estimate", "fallback", "--nic-gbps", "", "something-new"} {
+		det := nicInfo{InstanceType: "c8gn.48xlarge", BaselineGbps: 50, PeakGbps: 50, Source: src}
+		if w := nicOverrideWarning(600, det); w != "" {
+			t.Errorf("source=%s: warned that 600 is too high against an UNMEASURED baseline "+
+				"of 50 — on c8gn.48xlarge 600 is the right answer and 50 is the 12x-low "+
+				"estimate (#317), so this correction would be backwards: %q", src, w)
+		}
+	}
+	// Measured sources are trusted, including a cache of one.
+	for _, src := range []string{"ethtool", "DescribeInstanceTypes", "cache(DescribeInstanceTypes)"} {
+		det := nicInfo{InstanceType: "c7g.4xlarge", BaselineGbps: 7.5, PeakGbps: 7.5, Source: src}
+		if w := nicOverrideWarning(15, det); w == "" {
+			t.Errorf("source=%s: a measured 7.5 baseline against --nic-gbps 15 draws no "+
+				"warning", src)
+		}
+	}
+}
+
+// nicSourceIsMeasured is the same "was this figure measured?" distinction nicVerdict grades
+// on, and both #317 (do not report an assumption as fact) and #239 (do not correct an
+// operator against one) depend on it. Asserted directly so the two uses cannot drift.
+func TestNICSourceIsMeasured(t *testing.T) {
+	for src, want := range map[string]bool{
+		"ethtool":                      true,
+		"DescribeInstanceTypes":        true,
+		"cache(DescribeInstanceTypes)": true,
+		"cache(ethtool)":               true,
+		"imds-estimate":                false, // 12x low on c8gn.48xlarge (#317)
+		"fallback":                     false, // a flat 10 Gbps assumption
+		"--nic-gbps":                   false, // the thing being checked
+		"":                             false,
+	} {
+		if got := nicSourceIsMeasured(src); got != want {
+			t.Errorf("nicSourceIsMeasured(%q) = %v, want %v", src, got, want)
+		}
+	}
+	// Cross-check against the other consumer of the same distinction: every source
+	// nicVerdict grades as INFO-worthy except the operator's own override is measured, and
+	// every source it WARNs about is not.
+	for _, src := range []string{"fallback", "imds-estimate"} {
+		if st, _, _ := nicVerdict(nicInfo{Source: src}, "d"); st != warn {
+			t.Errorf("%s is unmeasured but nicVerdict does not WARN on it", src)
+		}
+		if nicSourceIsMeasured(src) {
+			t.Errorf("%s is treated as measured but nicVerdict WARNs on it", src)
+		}
+	}
+}
+
+// doctor's NIC line must NAME which figure it is showing and show the peak when there is a
+// distinct measured one -- that is #239 ask 1, and the unlabelled single number is what made
+// copying the wrong one easy.
+func TestDoctorNICLineNamesBothFigures(t *testing.T) {
+	// A burst-credit class, where the two differ.
+	got := nicDetailLine(nicInfo{BaselineGbps: 7.5, PeakGbps: 15, Source: "DescribeInstanceTypes"}, 8<<20, 192<<20)
+	for _, want := range []string{"7.5 Gbps baseline", "peak 15.0", "wants the baseline"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("doctor's NIC line omits %q: %q", want, got)
+		}
+	}
+	// A fixed link or an assumption sets peak = baseline. Printing "peak 10.0" there would
+	// invent a distinct fact that does not exist.
+	for _, ni := range []nicInfo{
+		{BaselineGbps: 10, PeakGbps: 10, Source: "fallback"},
+		{BaselineGbps: 25, PeakGbps: 25, Source: "ethtool"},
+		{BaselineGbps: 50, PeakGbps: 50, Source: "imds-estimate"},
+	} {
+		got := nicDetailLine(ni, 8<<20, 192<<20)
+		if strings.Contains(got, "peak") {
+			t.Errorf("source=%s has no distinct peak but the line claims one: %q", ni.Source, got)
+		}
+		if !strings.Contains(got, "baseline") {
+			t.Errorf("source=%s: the figure is still unlabelled: %q", ni.Source, got)
+		}
+	}
+}
