@@ -182,6 +182,12 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 			return err
 		}
 	}
+	// Checked HERE, before anything is fetched, because the failure it warns about is the
+	// process being killed (#314). A warning that arrives after the mount is serving competes
+	// with the OOM it is predicting.
+	if w := memTierHeadroomWarning(memCache, totalMemBytes()); w != "" {
+		log.Warn("memory tier", "warning", w)
+	}
 	diskCache, err := parseSize(f.diskCache)
 	if err != nil {
 		return err

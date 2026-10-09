@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The mount and the gateway warn when `--mem-cache` cannot fit on the box**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)). A 20 GB tier on a 33 GB box was
+  accepted silently and the daemon was OOM-killed at RSS 30.56 GB. The check runs before
+  anything is fetched, because the failure it predicts is the process dying.
+
+  **The mechanism is not the one the issue was filed with, and the correction matters because
+  two of its three proposed fixes were built on it.** #314 modelled the footprint as the tier
+  **plus** outstanding prefetch commitment (20 + 13.078 GB, summing to MemTotal almost
+  exactly). That addition does not hold. `lith_prefetch_committed_bytes` is charged at
+  *dispatch* and released only on consume/evict/fail, so it keeps counting a chunk after that
+  chunk has landed **in the tier** — it double-counts the resident half — and a dispatched
+  chunk that has not yet been admitted holds no chunk buffer at all, because `cloneChunk` runs
+  *after* `fetchReader` returns and after the bytes-in-flight budget is acquired. The field's
+  own comment in `blockstore.go` says it: *"it is NOT a memory figure"*.
+
+  What does explain it is the collector. The tier is live Go heap (every chunk is a
+  `make([]byte, cl)`), lith sets neither `GOGC` nor `GOMEMLIMIT`, and at the default
+  `GOGC=100` the heap target is about **twice** the live set. A 20 GB tier therefore targets
+  ~40 GB on a 33 GB box and the process dies on the way there — which also explains why the
+  kill came at 30.56 GB rather than at the 33.08 GB the additive model predicted.
+
+  So the ceiling is **~50 % of RAM**, and it is arithmetic from `GOGC`'s definition rather
+  than a constant anyone picked — the distinction that cost three releases on
+  [#340](https://github.com/scttfrdmn/lith/issues/340)/[#349](https://github.com/scttfrdmn/lith/issues/349).
+  `2 × tier` is a *lower* bound on the target (the tier is not the only live heap), so the
+  check under-warns rather than over-warns: a warning that fires on a configuration which
+  would have survived teaches operators to ignore it. The message names the ceiling and
+  `GOMEMLIMIT`, which makes the collector work harder instead of letting the kernel kill the
+  process.
+
+  A warning and not a clamp or a refusal, consistent with `--prefetch-pressure-max`: an
+  operator who typed a number keeps it, and a tier fills lazily, so a short-lived mount over a
+  small dataset may never reach the bound.
+
+  Also documents *why* the default is 25 % — previously unwritten, and now load-bearing.
+
 ### Changed
 
 - **The prefetch pressure gate now defaults ON where the evidence gate is off**
