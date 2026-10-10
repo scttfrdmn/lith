@@ -265,72 +265,61 @@ func TestPrefetchRangeCommitsOnlyItsExtents(t *testing.T) {
 // first wrote the function without it — found by a revert sweep, not by reading.
 //
 // An extent prefetch is still speculation committed against the tier. A second prefetch entry
-// point that skipped the gate would be an admission-control hole that scales with however many
-// strided readers a mount has, and the gauge the gate reads would look fine the whole time
+// point that skipped the gate would be an admission-control hole scaling with however many
+// strided readers a mount has, and the gauge the gate reads would look fine throughout,
 // because the bypassing path still charges `committed`.
+//
+// IT DRIVES `committed` DIRECTLY RATHER THAN RACING TO RAISE IT. The first version of this
+// test dispatched 64 prefetches concurrently behind a GET delay and asserted some were held:
+// it got 31 holds locally and ZERO in CI, because whether commitment accumulates depends on
+// how many dispatches overlap before any lands, which is the scheduler's business. That is a
+// tight assertion on a load-sensitive quantity — the same mistake as the #313 gate test that
+// asserted the gate HALVES peak pressure and then flaked in the full-tree run. The question
+// here is narrow and deserves a narrow test: does PrefetchRange CONSULT the gate?
 func TestPrefetchRangeObeysThePressureGate(t *testing.T) {
-	srv := fake.New()
-	// SIZED SO THE COMMITMENT CAN ACTUALLY EXCEED THE TIER, which the first version of this
-	// fixture could not: an extent prefetch commits ~64 KiB and a chunk can only be committed
-	// once (the prefetched-set dedup), so the ceiling is distinctChunks x ExtentSize. With 64
-	// probes into a 16 MiB object that is 1 MiB of commitment, which never approaches 0.85 of
-	// any valid tier — it measured pressure 0.062 and held nothing, and would have "passed"
-	// as evidence of a gate that was not there.
-	const objSize = 64 << 20    // 64 chunks, so 64 distinct commitments are reachable
-	const tier = int64(2) << 20 // commitment ceiling ~4 MiB, i.e. ~2x the tier
-	srv.Put("obj", make([]byte, objSize), time.Unix(1_700_000_000, 0))
-
-	rec := &pressureRec{}
-	bs := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: tier, MaxRange: 64 << 20,
-		PrefetchPressureMax: 0.85, Recorder: rec,
-	})
-	k := keyFor(t, srv, "obj")
-
-	// CONCURRENTLY, with a GET delay, because that is the only shape the gate can see.
-	// Issued one at a time they complete and evict before the next starts, so each one's
-	// commitment is released and `committed` never accumulates -- measured at pressure 0.062
-	// with 64 sequential probes, which is the same mistake #313's own analysis made when it
-	// reasoned about the gate from a serial model. The gate exists for dispatches that commit
-	// before any of them lands.
-	srv.GetDelay = 50 * time.Millisecond
-	const probes = 64
-	var wg sync.WaitGroup
-	for i := int64(0); i < probes; i++ {
-		wg.Add(1)
-		go func(i int64) {
-			defer wg.Done()
-			bs.PrefetchRange(context.Background(), k, i*(1<<20)+1234, 4<<10, objSize)
-		}(i)
-	}
-	wg.Wait()
-
-	held := rec.held.Load()
-	t.Logf("%d extent prefetches against a %d B tier at 0.85: %d held, pressure %.3f",
-		probes, tier, held, bs.PrefetchPressure())
-	if held == 0 {
-		t.Error("the pressure gate held nothing across 64 extent prefetches into a 1 MiB " +
-			"tier — PrefetchRange is bypassing #313's admission control, which is a hole " +
-			"that scales with the number of strided readers on the mount")
+	run := func(t *testing.T, pressureMax float64) (held int64, gets int) {
+		t.Helper()
+		srv := fake.New()
+		const objSize = 16 << 20
+		srv.Put("obj", make([]byte, objSize), time.Unix(1_700_000_000, 0))
+		rec := &pressureRec{}
+		bs := newStore(t, srv, Config{
+			BlockSize: 1 << 20, MemCache: 8 << 20, MaxRange: 64 << 20,
+			PrefetchPressureMax: pressureMax, Recorder: rec,
+		})
+		k := keyFor(t, srv, "obj")
+		// Pressure 0.9, above the 0.85 threshold, set outright. Nothing has to race.
+		if cap := bs.MemCap(); cap > 0 {
+			bs.pfCommittedBytes.Add(int64(0.9 * float64(cap)))
+		} else {
+			t.Fatal("fixture has no memory tier, so the gate's denominator is zero")
+		}
+		start := srv.GetCallCount()
+		bs.PrefetchRange(context.Background(), k, 1234, 4<<10, objSize)
+		return rec.held.Load(), srv.GetCallCount() - start
 	}
 
-	// And the control: with the gate off, the same run holds nothing. Without this the
-	// assertion above could pass on a fixture that holds for some unrelated reason.
-	rec2 := &pressureRec{}
-	bs2 := newStore(t, srv, Config{
-		BlockSize: 1 << 20, MemCache: tier, MaxRange: 64 << 20,
-		PrefetchPressureMax: 0, Recorder: rec2,
-	})
-	var wg2 sync.WaitGroup
-	for i := int64(0); i < probes; i++ {
-		wg2.Add(1)
-		go func(i int64) {
-			defer wg2.Done()
-			bs2.PrefetchRange(context.Background(), k, i*(1<<20)+1234, 4<<10, objSize)
-		}(i)
+	held, gets := run(t, 0.85)
+	t.Logf("gate at 0.85 with pressure pre-set to 0.90: held=%d, GETs=%d", held, gets)
+	if held != 1 {
+		t.Errorf("held %d dispatches, want 1 — PrefetchRange is bypassing #313's admission "+
+			"control, which is a hole that scales with the number of strided readers on the "+
+			"mount", held)
 	}
-	wg2.Wait()
-	if off := rec2.held.Load(); off != 0 {
-		t.Errorf("the gate held %d dispatches with PrefetchPressureMax=0", off)
+	if gets != 0 {
+		t.Errorf("the refused prefetch still issued %d GET(s); the gate must drop the "+
+			"dispatch, not merely count it", gets)
+	}
+
+	// THE CONTROL, without which the assertion above could pass for an unrelated reason: with
+	// the gate off, the identical fixture holds nothing and does fetch.
+	offHeld, offGets := run(t, 0)
+	t.Logf("gate off, same pressure: held=%d, GETs=%d", offHeld, offGets)
+	if offHeld != 0 {
+		t.Errorf("the gate held %d dispatches with PrefetchPressureMax=0", offHeld)
+	}
+	if offGets == 0 {
+		t.Error("with the gate off the prefetch fetched nothing, so the comparison above " +
+			"measures something other than the gate")
 	}
 }
