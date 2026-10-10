@@ -34,7 +34,26 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      # NO docker/setup-qemu-action. It used to be here and it is the reason v1.12.0's
+      # release failed TWICE before goreleaser did any work: the action pulls
+      # docker.io/tonistiigi/binfmt, and Docker Hub's UNAUTHENTICATED pull rate limit is
+      # per-runner-IP on a shared pool, so it fails intermittently and nothing in lith can
+      # make it fail less. The gate passed every time; attempt 3 succeeded after a wait.
+      #
+      # It is not needed. The Dockerfile has NO `RUN` instruction -- it is
+      # `FROM gcr.io/distroless/static` with two COPYs of binaries goreleaser has already
+      # built natively for both architectures -- so BuildKit never has to execute
+      # target-architecture code to assemble the arm64 image, and emulation has nothing to do.
+      #
+      # MEASURED, not assumed (#400): the gate now builds both platforms with buildx and no
+      # QEMU step, on the same runner image this job uses. That run's binfmt listing was
+      # `llvm-16-runtime`, `llvm-17-runtime`, `llvm-18-runtime` and NOTHING ELSE -- no
+      # qemu-aarch64 handler was registered, ambient or otherwise -- and the two-platform
+      # build succeeded anyway. So the conclusion rests on a property of the Dockerfile rather
+      # than on what happens to be installed on the runner.
+      #
+      # If a `RUN` is ever added to the Dockerfile for a cross-built platform, this comes back
+      # -- and the gate's two-platform build is what will fail first, on a PR, before a tag.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
       - name: log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
