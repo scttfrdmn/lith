@@ -455,7 +455,7 @@ func scoreTrace(label, arm string, cfg traceConfig, rows []row, k int, byteExact
 				}
 			}
 			for _, b := range got {
-				dispatches = append(dispatches, dispatch{atRow: i, block: b})
+				dispatches = append(dispatches, dispatch{atRow: i, block: b.Block})
 			}
 		}
 

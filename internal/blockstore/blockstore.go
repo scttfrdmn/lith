@@ -1022,6 +1022,87 @@ func (bs *BlockStore) Prefetch(ctx context.Context, k Key, blockIdx, objSize int
 	_ = bs.ensureChunks(ctx, k, c0, hi, objSize, true, nil, bs.fullWant(objSize), fillWhole)
 }
 
+// PrefetchRange prefetches only the EXTENTS covering [off, off+length) rather than the whole
+// block, at prefetch priority. Errors are swallowed (best-effort), like Prefetch.
+//
+// WHY THIS EXISTS (#222). The strided branch's prediction is correct about WHICH block a slice
+// reader will touch next -- at stride d it is exactly the next read's block, every time -- and
+// Prefetch could only fetch that block whole. A FITS 2-D cutout walking row segments therefore
+// paid one 1 MiB chunk per 4 KiB read: 256x, measured. There was no entry point between "fetch
+// one block" and "fetch nothing", which is why extending the demand lane to Strided made bytes
+// WORSE (~+14.9 KB/read) instead of better -- the extents were fetched in addition to a
+// prediction that already covered them.
+//
+// ACCOUNTING, which differs from Prefetch and is the one subtle part: Prefetch commits a whole
+// chunk's bytes per chunk, because it fills whole chunks. This commits only the WANTED EXTENT
+// SPAN, because that is what it fetches -- charging a full chunk for a 64 KiB extent would
+// over-report committed by up to 16x and so corrupt the pressure gate (#313) that reads it.
+// dropPrefetched releases exactly what was stored, so the two stay balanced.
+//
+// A partially-filled chunk is still marked prefetched-unread, so #55's eviction preference
+// protects it and a later demand read credits it. A demand read for a DIFFERENT extent of the
+// same chunk credits and clears the marker while leaving its own extents to fill normally,
+// which is the pre-existing behaviour of a partially-filled chunk and not new here.
+func (bs *BlockStore) PrefetchRange(ctx context.Context, k Key, off, length, objSize int64) {
+	if off < 0 || length <= 0 || off >= objSize {
+		return
+	}
+	end := off + length
+	if end > objSize {
+		end = objSize
+	}
+	c0, c1 := off/ChunkSize, (end-1)/ChunkSize
+	// Same pressure gate as Prefetch, for the same reason and read from the same counter: an
+	// extent prefetch is still speculation committed against the tier.
+	if bs.pfPressureMax > 0 && bs.prefetchPressure() >= bs.pfPressureMax {
+		bs.recordPressureHeld()
+		return
+	}
+	wantOf := func(ci int64) uint16 {
+		start := ci * ChunkSize
+		lo := int64(0)
+		if off > start {
+			lo = off - start
+		}
+		return extentMask(lo, end-start)
+	}
+	hi := c0 - 1
+	for ci := c0; ci <= c1; ci++ {
+		want := wantOf(ci)
+		if want == 0 {
+			continue
+		}
+		if _, f, tier := bs.lookup(k, ci); tier != "" && covers(f, want) {
+			hi = ci
+			continue
+		}
+		ck := bs.cacheKey(k, ci)
+		if _, dup := bs.prefetched.Load(ck); dup {
+			hi = ci
+			continue
+		}
+		lo, hhi := extentByteRange(want, chunkLenOf(ci, objSize))
+		n := hhi - lo
+		if n <= 0 {
+			continue
+		}
+		bs.pfCommittedBytes.Add(n)
+		if _, dup := bs.prefetched.LoadOrStore(ck, n); dup {
+			bs.pfCommittedBytes.Add(-n) // lost the race; give the bytes back
+		} else {
+			bs.record(func(r Recorder) { r.PrefetchIssued() })
+			if bs.timeline != nil {
+				bs.timeline.PrefetchDispatch(k.Key, ci, time.Now())
+			}
+		}
+		hi = ci
+	}
+	if hi < c0 {
+		return
+	}
+	_ = bs.ensureChunks(ctx, k, c0, hi, objSize, true, nil, wantOf, fillPrefetchRange)
+}
+
 // PrefetchBudgetBytes is the mount-wide byte budget for prefetch not yet
 // demanded. It is the total the prefetch Limits policy is built with (#64); the
 // per-handle window and the sibling/parts reservations all draw on it.

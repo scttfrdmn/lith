@@ -104,7 +104,11 @@ Read it like this:
 
 `kind="demand"` means *a fill no prediction covered*, which is why it is the right
 signal here and not a measure of randomness: a sequential reader whose prefetch is
-keeping up shows `kind="whole"`.
+keeping up shows `kind="whole"`. A **strided** reader — a FITS cutout, a hyperslab —
+shows `kind="prefetch-range"`, which is a prediction that was bounded to the extents
+the next read is expected to want rather than the whole block
+([#222](https://github.com/scttfrdmn/lith/issues/222)); seeing those bytes move from
+`whole` to `prefetch-range` is what that fix looks like from outside.
 
 **There is deliberately no threshold and no log line.** lith reports the three
 numbers and the judgement is yours — two defaults placed from a plausible-looking

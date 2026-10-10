@@ -65,8 +65,12 @@ func (f *rawFS) cargoReadahead(h *fileHandle, p cargoPart, chunkOff int64) {
 	if !obs.counters.Empty() {
 		h.pfMet.Record(obs.counters)
 	}
+	// Whole blocks, unconditionally. A CargoShip handle reads a decoded frame stream, so it
+	// never reaches the strided branch and no dispatch here carries a ReadLen -- asserted
+	// rather than assumed, because a silently-dropped ReadLen would be an over-fetch nobody
+	// would see.
 	for _, pb := range obs.dispatch {
 		pb := pb
-		go f.store.Prefetch(f.ctx, p.key, pb, p.uncompTotal)
+		go f.store.Prefetch(f.ctx, p.key, pb.Block, p.uncompTotal)
 	}
 }

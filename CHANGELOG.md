@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A strided slice reader fetches its extents instead of a whole block per read**
+  ([#222](https://github.com/scttfrdmn/lith/issues/222)). A FITS 2-D cutout walking row
+  segments at a constant stride is classified `Strided`, and both mechanisms built to stop
+  exactly that over-fetch skipped the state: the byte-exact demand lane gated on
+  `state == Random`, and the evidence gate is consulted only on the `Sequential` ramp.
+
+  **The two over-fetch paths are over-determined, and either half alone makes it worse.** That
+  is the whole reason this was not a one-line change, and two previous attempts failed on it.
+  Measured on the same fixture, steady-state bytes per 4 KiB read:
+
+  | demand lane | strided prediction | B/read | |
+  |---|---|---|---|
+  | `Random` only | whole block | 990,321 | baseline (what shipped) |
+  | **+ `Strided`** | whole block | 1,001,244 | **+1.1 % worse** |
+  | `Random` only | **bounded** | 1,044,935 | **+5.5 % worse** |
+  | **+ `Strided`** | **bounded** | **61,895** | **16.0× better** |
+
+  Extending the demand lane alone leaves the prediction fetching the whole chunk, so the
+  byte-exact read lands *on top of* it rather than inside it. Bounding the prediction alone
+  changes nothing at all, because the prediction is for the block the **next** read demands —
+  so a whole-chunk demand read asks for everything the bounded prefetch skipped and the
+  per-chunk singleflight joins the two into one whole-chunk GET anyway.
+
+  The prediction is **correct about which block** (at stride `d` it is exactly the next read's
+  block, every time) and wrong only about how much, so the fix gives it a way to say so:
+  `prefetch.Dispatch` now carries the length of the read that produced it — a fact, not a
+  policy — and the FUSE layer applies the **same** `byteExactThreshold` it already uses for
+  demand reads, so one rule lives in one place. `BlockStore.PrefetchRange` is the entry point
+  that was missing; there was previously nothing between "fetch one block" and "fetch nothing".
+
+  **`Cold` is deliberately excluded**, so the predicate is `Random || Strided` and not
+  `!= Sequential`: #233 establishes that a cold *sequential* read should fetch **more**, not
+  less, and `TestColdSequentialGetShape` catches the mistake (block 0 must still cost exactly
+  8 GETs). A strided **bulk** reader reports a whole-chunk read length, fails the threshold,
+  and keeps whole blocks — its next block genuinely is wanted whole.
+
+  Extent prefetches are labelled `kind="prefetch-range"` in `lith_fill_bytes_total` and
+  `lith_fill_seconds`, distinct from `whole`, so the bytes **moving** between the two is what
+  the fix looks like from outside. They commit only their extent span against the #313
+  pressure gate, not a whole chunk per chunk — charging chunk-granular would over-report the
+  quantity that gate admits against by up to 16×.
+
+  **Not fixed here, and named rather than implied:** the seek re-anchor
+  (`prefetch.go`'s `Sequential || Strided` branch) still dispatches two whole blocks per
+  landing, so a strided reader that occasionally jumps out of band still pays that path. It is
+  the third of #222's three over-fetch paths and it needs its own measurement.
+
 ### Added
 
 - **Docs: a root-created mount needs a root-run readiness check.** Reported from a benchmark

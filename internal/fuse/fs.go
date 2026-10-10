@@ -798,8 +798,9 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 			// objects win. Readahead operates on the chunk's uncompressed stream.
 			p := h.cargo[0]
 			base := p.archiveOff / f.blockSize
-			for _, blk := range h.pf.open(f.perHandleWindow(false)) {
-				b := base + blk
+			// Open()'s dispatches are the ramp, always whole blocks (ReadLen 0).
+			for _, pd := range h.pf.open(f.perHandleWindow(false)) {
+				b := base + pd.Block
 				go f.store.Prefetch(f.ctx, p.key, b, p.uncompTotal)
 			}
 			out.Fh = fh
@@ -855,8 +856,8 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	// otherwise sweep every column. A streaming footer handle keeps the window
 	// (it wants the whole file), like every non-footer handle.
 	if fi.Size > f.partsThreshold() && (h.footerKind == footer.FormatNone || h.footerStream) {
-		for _, pb := range h.pf.open(f.perHandleWindow(false)) {
-			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+		for _, pd := range h.pf.open(f.perHandleWindow(false)) {
+			go f.store.Prefetch(f.ctx, h.key, pd.Block, h.size)
 		}
 	}
 
@@ -951,7 +952,25 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// already byte-exact (sequential==false) and untouched. The detector still
 		// governs posture (it is not consulted to *change* the plan, only to pick the
 		// fetch granularity for a demand read the plan does not cover).
-		if sequential && h.pf.state() == prefetch.Random {
+		// Random OR Strided (#222). Both are "confirmed not a contiguous stream", which is
+		// the claim this lane needs; Cold is "not yet known" and must NOT be included, because
+		// #233 establishes that a cold sequential read should fetch MORE, not less -- block 0
+		// already costs 8 chunk GETs and three ways to fix that were refuted in #231.
+		//
+		// THIS HALF IS USELESS ALONE, AND SO IS THE OTHER HALF. The two over-fetch paths are
+		// over-determined, and the measurements say so in opposite directions:
+		//
+		//   this lane alone      : the strided PREDICTION still fetches the whole chunk, so a
+		//                          byte-exact demand read lands on top of it rather than inside
+		//                          it -- bytes went UP by ~14.9 KB per read
+		//   the prediction alone : NO CHANGE AT ALL. The prediction is for the block the NEXT
+		//                          read demands, so a whole-chunk demand read asks for
+		//                          everything the bounded prefetch skipped and the per-chunk
+		//                          singleflight joins the two into one whole-chunk GET
+		//
+		// Only moving both leaves a strided slice reader fetching its extents and nothing else.
+		// That is why #222 was never a one-line change in either file.
+		if st := h.pf.state(); sequential && (st == prefetch.Random || st == prefetch.Strided) {
 			if t := f.byteExactThreshold(); t > 0 && end-off <= t {
 				sequential = false
 			}
@@ -1008,8 +1027,30 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 				window: obs.window, dispatched: len(obs.dispatch), peak: obs.peak,
 			})
 		}
-		for _, pb := range obs.dispatch {
-			go f.store.Prefetch(f.ctx, h.key, pb, h.size)
+		// ONE GRANULARITY RULE, APPLIED IN ONE PLACE (#222). A dispatch carrying a ReadLen is
+		// a strided prediction, and the detector is reporting how much of the predicted block
+		// the reader is expected to want -- a fact, not a decision. The decision is the same
+		// one the demand lane above makes for a small read on a confirmed-not-sequential
+		// handle, so it reuses that threshold rather than introducing a second one that could
+		// drift from it.
+		//
+		// WHY BOUNDING THE PREDICTION IS THE FIX AND EXTENDING THE DEMAND LANE WAS NOT: the
+		// strided prediction is correct about WHICH block -- at stride d it is exactly the
+		// next read's block -- and wrong only about HOW MUCH. Adding the demand lane on top of
+		// it measured bytes going UP by ~14.9 KB per read, because the read's extents were
+		// then fetched in addition to a prediction that already covered them.
+		//
+		// A strided BULK reader reports a whole-chunk ReadLen, fails the threshold, and keeps
+		// whole blocks -- its next block genuinely is wanted whole.
+		for _, pd := range obs.dispatch {
+			if t := f.byteExactThreshold(); pd.ReadLen > 0 && t > 0 && pd.ReadLen <= t {
+				// The predicted read sits at the same offset WITHIN its block as the read
+				// that predicted it, which is what a constant stride means.
+				predOff := off + (pd.Block-blk)*f.blockSize
+				go f.store.PrefetchRange(f.ctx, h.key, predOff, pd.ReadLen, h.size)
+				continue
+			}
+			go f.store.Prefetch(f.ctx, h.key, pd.Block, h.size)
 		}
 	} else if f.pfTrace != nil {
 		// The prefetcher is deliberately not driven here — a whole-file parts fetch

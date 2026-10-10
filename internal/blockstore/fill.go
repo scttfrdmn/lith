@@ -223,11 +223,12 @@ func (bs *BlockStore) recordTTFB(d time.Duration, kind fillKind) {
 type fillKind int
 
 const (
-	fillWhole       fillKind = iota // a whole-chunk fill (streaming/prefetch/sequential demand)
-	fillDemand                      // a demand read of an unfilled extent (non-sequential)
-	fillPlan                        // a format plan's byte-exact projection range
-	fillDemandBatch                 // the coalesced union of a burst of demand reads (GatherDemand)
-	fillSilent                      // a fill whose bytes FillBatch accounts itself (no per-run recordFill)
+	fillWhole         fillKind = iota // a whole-chunk fill (streaming/prefetch/sequential demand)
+	fillDemand                        // a demand read of an unfilled extent (non-sequential)
+	fillPlan                          // a format plan's byte-exact projection range
+	fillDemandBatch                   // the coalesced union of a burst of demand reads (GatherDemand)
+	fillSilent                        // a fill whose bytes FillBatch accounts itself (no per-run recordFill)
+	fillPrefetchRange                 // an extent-granular PREFETCH: a bounded strided prediction (#222)
 )
 
 func (fk fillKind) label() string {
@@ -238,6 +239,11 @@ func (fk fillKind) label() string {
 		return "plan"
 	case fillDemandBatch:
 		return "demand-batch"
+	case fillPrefetchRange:
+		// Distinct from "whole" on purpose: both are prefetch, but this one fetched only the
+		// extents a strided prediction expects to be read, and the point of #222's fix is
+		// that those bytes MOVE from "whole" to here. A shared label would hide the fix.
+		return "prefetch-range"
 	default:
 		return "whole"
 	}

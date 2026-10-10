@@ -88,7 +88,7 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) 
 // are genuinely ordered (one finishes before the other starts) get ordered seqs,
 // which is the serialization a shared-cache replay needs.
 type observation struct {
-	dispatch []int64
+	dispatch []prefetch.Dispatch
 	seq      int64
 	after    prefetch.State
 	window   int64
@@ -180,7 +180,7 @@ func (w *pfWrapper) isEstablished() bool {
 	return w.pf.Established()
 }
 
-func (w *pfWrapper) open(maxWindow int64) []int64 {
+func (w *pfWrapper) open(maxWindow int64) []prefetch.Dispatch {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pf.SetMax(maxWindow)

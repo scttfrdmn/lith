@@ -406,7 +406,7 @@ func (p *Prefetcher) SetMax(n int64) {
 // tile. The ramp begins from the first read that establishes coverage (read ~2),
 // via Observe. With the coverage gate disabled it still dispatches the initial
 // window, preserving the pre-#229 open-time ramp.
-func (p *Prefetcher) Open() []int64 {
+func (p *Prefetcher) Open() []Dispatch {
 	p.haveLast = true
 	p.lastBlock = -1 // so the first read at block 0 registers as sequential (d=1)
 	p.state = Cold
@@ -423,8 +423,30 @@ func (p *Prefetcher) Open() []int64 {
 	return blockRange(0, initialWindow)
 }
 
+// Dispatch is one block the detector is asking to be prefetched, plus what the detector knows
+// about how much of it the reader is expected to want (#222).
+//
+// WHY A BLOCK INDEX IS NOT ENOUGH. The strided branch predicts blk+d, and that prediction is
+// CORRECT about where a slice reader is going -- at stride d it is exactly the next read's
+// block, every time. What it cannot express is that the reader wants 4 KiB of that block and
+// not all 1 MiB of it, so the block was fetched whole and a FITS 2-D cutout paid 256x its read.
+//
+// ReadLen carries a FACT, not a policy: the length of the read that produced this prediction.
+// The decision about what to do with it belongs to the FUSE layer, which already owns the
+// identical judgement for demand reads (byteExactThreshold) and can therefore apply one rule
+// in one place instead of two rules that drift.
+type Dispatch struct {
+	// Block is the block index to prefetch.
+	Block int64
+	// ReadLen is the length of the read that produced this prediction, when the prediction is
+	// for a reader expected to want only part of the block. ZERO MEANS THE WHOLE BLOCK, which
+	// is every sequential-ramp and seek-re-anchor dispatch: there, the reader has demonstrated
+	// contiguous progress and the whole block is what it is going to consume.
+	ReadLen int64
+}
+
 // Observe records a demand read at blockIdx, byteGap bytes from the end of the
-// previous read on this handle, and returns the block indices to dispatch now
+// previous read on this handle, and returns the blocks to dispatch now
 // (the frontier advance), empty when the frontier already leads far enough.
 //
 // byteGap distinguishes a stream from a scattered walk that the block-space
@@ -435,7 +457,7 @@ func (p *Prefetcher) Open() []int64 {
 // it falls through to the seek path. Contiguous streams (gap≈0) and kernel
 // reorder (gap ≪ block) are unaffected; seqGapMax defaults to "off" (MaxInt64)
 // so a caller that does not set it keeps the pre-1b behavior.
-func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
+func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 	// Demonstrated demand, accumulated before any gate so it is unaffected by
 	// whether the coverage gate is enabled (#256).
 	if length > 0 {
@@ -501,7 +523,13 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []int64 {
 		pred := blockIdx + d
 		if pred >= p.frontier {
 			p.frontier = pred + 1
-			return []int64{pred}
+			// ReadLen is this read's length (#222). A strided reader's next read is
+			// overwhelmingly the same size as this one -- that is what makes it a stride --
+			// so the length that produced the prediction is the best available statement of
+			// how much of the predicted block will be wanted. A bulk strided reader taking
+			// whole-chunk reads reports a whole-chunk length and is therefore unaffected,
+			// which is the constraint TestStridedBulkReaderKeepsWholeChunks pins.
+			return []Dispatch{{Block: pred, ReadLen: length}}
 		}
 		return nil
 	}
@@ -663,7 +691,7 @@ func (p *Prefetcher) inBand(b int64) bool {
 }
 
 // advance dispatches [frontier, target) and moves the frontier to target.
-func (p *Prefetcher) advance(target int64) []int64 {
+func (p *Prefetcher) advance(target int64) []Dispatch {
 	if target <= p.frontier {
 		return nil
 	}
@@ -673,13 +701,15 @@ func (p *Prefetcher) advance(target int64) []int64 {
 }
 
 // blockRange returns [start, start+count).
-func blockRange(start, count int64) []int64 {
+// blockRange is a whole-block dispatch run: every entry has ReadLen 0, because a frontier
+// advance is only ever issued to a handle that has demonstrated contiguous progress.
+func blockRange(start, count int64) []Dispatch {
 	if count <= 0 {
 		return nil
 	}
-	out := make([]int64, count)
+	out := make([]Dispatch, count)
 	for i := int64(0); i < count; i++ {
-		out[i] = start + i
+		out[i] = Dispatch{Block: start + i}
 	}
 	return out
 }

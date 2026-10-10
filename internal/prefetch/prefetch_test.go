@@ -9,7 +9,7 @@ import (
 
 func TestOpenDispatchesInitialWindow(t *testing.T) {
 	p := New(32)
-	if got := p.Open(); !reflect.DeepEqual(got, []int64{0, 1}) {
+	if got := blocksOf(p.Open()); !reflect.DeepEqual(got, []int64{0, 1}) {
 		t.Fatalf("Open() = %v, want [0 1]", got)
 	}
 }
@@ -19,7 +19,7 @@ func TestOpenDispatchesInitialWindow(t *testing.T) {
 // demand cursor.
 func TestSequentialFrontierLeadsNoDup(t *testing.T) {
 	p := New(32)
-	dispatched := append([]int64{}, p.Open()...) // [0,1]
+	dispatched := append([]int64{}, blocksOf(p.Open())...) // [0,1]
 
 	for blk := int64(0); blk <= 40; blk++ {
 		got := p.Observe(blk, 0, 0, 0)
@@ -28,7 +28,7 @@ func TestSequentialFrontierLeadsNoDup(t *testing.T) {
 			t.Fatalf("after read %d: frontier %d - cursor %d = %d < window %d",
 				blk, p.frontier, blk, p.frontier-blk, p.window)
 		}
-		dispatched = append(dispatched, got...)
+		dispatched = append(dispatched, blocksOf(got)...)
 	}
 	if p.State() != Sequential {
 		t.Fatalf("state = %v, want Sequential", p.State())
@@ -66,10 +66,10 @@ func TestStridedPredictsNext(t *testing.T) {
 	// repeat; #222 added the run because one repeat fires on coincidence -- a genuinely
 	// random walk was measured flipping to Strided 7 times in 2471 reads.
 	got := [][]int64{
-		p.Observe(0, 0, 0, 0),  // cold: establish last
-		p.Observe(5, 0, 0, 0),  // first delta 5, nothing to compare against
-		p.Observe(10, 0, 0, 0), // delta 5 repeats once: not yet enough evidence
-		p.Observe(15, 0, 0, 0), // repeats twice -> Strided, predict 20
+		blocksOf(p.Observe(0, 0, 0, 0)),  // cold: establish last
+		blocksOf(p.Observe(5, 0, 0, 0)),  // first delta 5, nothing to compare against
+		blocksOf(p.Observe(10, 0, 0, 0)), // delta 5 repeats once: not yet enough evidence
+		blocksOf(p.Observe(15, 0, 0, 0)), // repeats twice -> Strided, predict 20
 	}
 	want := [][]int64{nil, nil, nil, {20}}
 	if !reflect.DeepEqual(got, want) {
@@ -109,9 +109,9 @@ func TestReReadSameBlockNoop(t *testing.T) {
 // total blocks dispatched and the set of dispatched blocks.
 func sumDispatched(p *Prefetcher, reads []int64) (int, map[int64]bool) {
 	set := map[int64]bool{}
-	add := func(bs []int64) {
-		for _, b := range bs {
-			set[b] = true
+	add := func(ds []Dispatch) {
+		for _, d := range ds {
+			set[d.Block] = true
 		}
 	}
 	add(p.Open())
@@ -131,15 +131,15 @@ func TestInBandReorderNoHalving(t *testing.T) {
 	pr := New(32)
 	// Coverage check: each read must already be dispatched when it arrives.
 	covered := map[int64]bool{}
-	for _, b := range pr.Open() {
-		covered[b] = true
+	for _, d := range pr.Open() {
+		covered[d.Block] = true
 	}
 	for _, b := range reorder {
 		if !covered[b] {
 			t.Fatalf("read block %d was uncovered (prefetch did not lead)", b)
 		}
 		for _, d := range pr.Observe(b, 0, 0, 0) {
-			covered[d] = true
+			covered[d.Block] = true
 		}
 	}
 	if pr.Halvings() != 0 {
@@ -180,8 +180,8 @@ func TestSingleSeekHalvesOnce(t *testing.T) {
 		t.Fatalf("window = %d after seek, want %d (halved)", p.window, winBefore/2)
 	}
 	seen := map[int64]bool{}
-	for _, b := range got {
-		seen[b] = true
+	for _, d := range got {
+		seen[d.Block] = true
 	}
 	if !seen[200] {
 		t.Fatalf("seek did not dispatch at the target: got %v", got)
@@ -230,10 +230,10 @@ func TestDoubleSeekRandomThenRecover(t *testing.T) {
 func TestStrideUnchanged(t *testing.T) {
 	p := New(32)
 	got := [][]int64{
-		p.Observe(0, 0, 0, 0),  // establish
-		p.Observe(8, 0, 0, 0),  // first delta 8, nothing to compare against
-		p.Observe(16, 0, 0, 0), // repeats once: not yet enough evidence
-		p.Observe(24, 0, 0, 0), // repeats twice -> Strided, predict 32
+		blocksOf(p.Observe(0, 0, 0, 0)),  // establish
+		blocksOf(p.Observe(8, 0, 0, 0)),  // first delta 8, nothing to compare against
+		blocksOf(p.Observe(16, 0, 0, 0)), // repeats once: not yet enough evidence
+		blocksOf(p.Observe(24, 0, 0, 0)), // repeats twice -> Strided, predict 32
 	}
 	want := [][]int64{nil, nil, nil, {32}}
 	if !reflect.DeepEqual(got, want) {
@@ -267,7 +267,7 @@ func TestEstablishmentDispatchesTheCurrentBlock(t *testing.T) {
 		d := p.Observe(i, i<<23, 1<<17, 0)
 		if p.State() == Sequential && establishedOn < 0 {
 			establishedOn = i
-			dispatched = d
+			dispatched = blocksOf(d)
 			break
 		}
 	}
@@ -310,8 +310,8 @@ func TestEstablishedHandleDoesNotRedispatchItsBlock(t *testing.T) {
 
 	seen := map[int64]int{}
 	for i := int64(4); i < 40; i++ {
-		for _, b := range p.Observe(i, i<<23, 1<<17, 0) {
-			seen[b]++
+		for _, d := range p.Observe(i, i<<23, 1<<17, 0) {
+			seen[d.Block]++
 		}
 	}
 	for b, n := range seen {
@@ -320,4 +320,17 @@ func TestEstablishedHandleDoesNotRedispatchItsBlock(t *testing.T) {
 				"only move forward", b, n)
 		}
 	}
+}
+
+// blocksOf projects a dispatch list onto its block indices, for the tests that assert WHICH
+// blocks were dispatched rather than how much of them (#222 added the second dimension).
+func blocksOf(ds []Dispatch) []int64 {
+	if ds == nil {
+		return nil
+	}
+	out := make([]int64, len(ds))
+	for i, d := range ds {
+		out[i] = d.Block
+	}
+	return out
 }

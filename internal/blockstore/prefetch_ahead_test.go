@@ -59,12 +59,13 @@ func TestPrefetchAheadCoversDemand(t *testing.T) {
 		cond.Broadcast()
 		mu.Unlock()
 	}
-	waitStarted := func(blocks []int64) {
+	waitStarted := func(blocks []prefetch.Dispatch) {
 		mu.Lock()
 		defer mu.Unlock()
 		for {
 			all := true
-			for _, b := range blocks {
+			for _, pd := range blocks {
+				b := pd.Block
 				if b*mib >= size {
 					continue // no GET is issued for a block past EOF
 				}
@@ -82,9 +83,9 @@ func TestPrefetchAheadCoversDemand(t *testing.T) {
 
 	ctx := context.Background()
 	pf := prefetch.New(32)
-	dispatch := func(blocks []int64) {
-		for _, b := range blocks {
-			b := b
+	dispatch := func(blocks []prefetch.Dispatch) {
+		for _, pd := range blocks {
+			b := pd.Block
 			go bs.Prefetch(ctx, k, b, size)
 		}
 	}
