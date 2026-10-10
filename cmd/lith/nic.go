@@ -446,7 +446,19 @@ func addNICAttempts(d *doctor, nic nicInfo) {
 func nicVerdict(nic nicInfo, detail string) (checkStatus, string, string) {
 	switch nic.Source {
 	case "fallback":
-		return warn, detail + " — NIC undetected (no ethtool speed, no IMDS type, no DescribeInstanceTypes)",
+		// THE REASON IS NOT ALWAYS "NOTHING ANSWERED" ANY MORE. Before #317 this verdict was
+		// reached only when IMDS gave no instance type, so the fixed parenthetical was true.
+		// #317 added a second route -- IMDS names the type and the size-keyed estimate
+		// DECLINES because the family is network-optimized -- and the message was not updated
+		// for the path that change introduced. Reported from the box it was built for: it read
+		// "no IMDS type" on a mount where IMDS had returned `c8gn.48xlarge` and the row
+		// directly below said so by name. The #388 shape again, inside one report.
+		why := "no ethtool speed, no IMDS type, no DescribeInstanceTypes"
+		if nic.InstanceType != "" {
+			why = fmt.Sprintf("IMDS type %s known, but no usable bandwidth for it — see the "+
+				"nic: rows below", nic.InstanceType)
+		}
+		return warn, detail + " — NIC undetected (" + why + ")",
 			"pass --nic-gbps <Gbps>; without it the device-derived knobs are guesses (e.g. parts-max)"
 	case "imds-estimate":
 		return warn, detail + fmt.Sprintf(" — ESTIMATED from the %s size, not measured; the "+

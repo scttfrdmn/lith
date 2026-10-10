@@ -644,3 +644,66 @@ func TestDoctorNICLineNamesBothFigures(t *testing.T) {
 		}
 	}
 }
+
+// THE FALLBACK VERDICT MUST SAY WHAT ACTUALLY HAPPENED, which it did not after #317 added a
+// second route to `fallback`.
+//
+// Reported from the c8gn.48xlarge this was built for: the row read "no IMDS type" on a mount
+// where IMDS had returned `c8gn.48xlarge`, and the row directly below it named that type and
+// explained that no estimate was offered for network-optimized families. One report, two rows,
+// contradicting each other.
+//
+// Before #317, `fallback` was reached only when IMDS gave nothing, so the fixed parenthetical
+// was true. #317 added the path where IMDS names the type and the size-keyed estimate declines
+// -- and I did not update the message for the path I was adding. #388's shape again.
+func TestFallbackVerdictNamesWhyItFellBack(t *testing.T) {
+	// The #317 route: the type IS known, the estimate declined.
+	_, detail, _ := nicVerdict(nicInfo{InstanceType: "c8gn.48xlarge", Source: "fallback",
+		BaselineGbps: defaultFallbackGbps}, "D")
+	if strings.Contains(detail, "no IMDS type") {
+		t.Errorf("the verdict claims there was no IMDS type while carrying one: %q", detail)
+	}
+	if !strings.Contains(detail, "c8gn.48xlarge") {
+		t.Errorf("the verdict does not name the type IMDS reported: %q", detail)
+	}
+
+	// The original route: nothing answered at all, so the old wording is still correct.
+	_, detail, _ = nicVerdict(nicInfo{Source: "fallback", BaselineGbps: defaultFallbackGbps}, "D")
+	if !strings.Contains(detail, "no IMDS type") {
+		t.Errorf("off-EC2, with no type at all, the verdict should still say so: %q", detail)
+	}
+
+	// Both routes are still WARN with a fix, because both figures are assumptions.
+	for _, ni := range []nicInfo{
+		{InstanceType: "c8gn.48xlarge", Source: "fallback"},
+		{Source: "fallback"},
+	} {
+		st, _, fix := nicVerdict(ni, "D")
+		if st != warn || fix == "" {
+			t.Errorf("type=%q: graded %s with fix %q; an assumption must WARN and say what to "+
+				"do", ni.InstanceType, st.tag(), fix)
+		}
+	}
+}
+
+// The fuse3 install hint has to work on the distro the check actually fires on. It said
+// `apt install fuse3` and the AL2023 AMI it was reported from needs `dnf`.
+func TestFuseInstallHintCoversBothPackageManagers(t *testing.T) {
+	src, err := os.ReadFile("cmd_doctor.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	// Every fuse3 install hint must name both, or it is wrong for half the fleet — and the
+	// half it was wrong for is the one lith is most used on.
+	for _, frag := range []string{"dnf install fuse3", "apt install fuse3"} {
+		if !strings.Contains(s, frag) {
+			t.Errorf("no fuse3 install hint mentions %q; the check fires on AL2023 and on "+
+				"Debian-family images and the fix differs", frag)
+		}
+	}
+	if n := strings.Count(s, "(apt install fuse3)"); n > 0 {
+		t.Errorf("%d hint(s) still name apt alone, which is wrong on the AL2023 AMI this was "+
+			"reported from", n)
+	}
+}

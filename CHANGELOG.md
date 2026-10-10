@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`doctor`'s NIC verdict claimed "no IMDS type" on a box where IMDS had returned one**
+  ([#317](https://github.com/scttfrdmn/lith/issues/317)). Reported from the
+  `c8gn.48xlarge` this was built for, and it is my own regression from #394. Before that
+  change, `source=fallback` was reached only when IMDS gave nothing, so the fixed
+  parenthetical was true. #394 added a second route — IMDS names the type and the size-keyed
+  estimate **declines** because the family is network-optimized — and I did not update the
+  message for the path I was adding. The result was one report contradicting itself two rows
+  apart: `no IMDS type` directly above a row naming `c8gn.48xlarge` and explaining why no
+  estimate was offered for it. The #388 shape again, this time inside a single `doctor` run.
+
+- **`doctor`'s fuse3 install hint named `apt` only** — wrong on the AL2023 AMI the check
+  actually fires on, which needs `dnf`. Also reported from the same run. Both package managers
+  are now named, and a test fails if either is dropped.
+
+
 - **A strided slice reader fetches its extents instead of a whole block per read**
   ([#222](https://github.com/scttfrdmn/lith/issues/222)). A FITS 2-D cutout walking row
   segments at a constant stride is classified `Strided`, and both mechanisms built to stop
