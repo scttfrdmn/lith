@@ -402,3 +402,38 @@ func (i *roInfo) Mode() iofs.FileMode {
 func (i *roInfo) ModTime() time.Time { return i.fi.MTime }
 func (i *roInfo) IsDir() bool        { return i.fi.IsDir }
 func (i *roInfo) Sys() any           { return nil }
+
+// activeReadStreams counts paths READ within cfg.ReadIdle: the gateway's analogue of #311's
+// streamingHandles, and the divisor windowBlocks should be using (#337).
+//
+// The signal was always here. roFS.states is a per-path map carrying a lastTouch that stateFor
+// updates on EVERY read -- NFS's statelessness forces handle resolution per read, so there is
+// no cheaper place it could live. What was missing was anything reading it for this purpose:
+// the divisor counted MOUNTS instead, because the comment at reap is true of go-nfs ("per-op
+// client activity is not visible through go-nfs's stateless read path") and not true of lith's
+// own state.
+//
+// Never returns 0, so the caller cannot divide by zero; a gateway with no reads in flight gives
+// its next reader the whole budget, which is correct.
+func (f *roFS) activeReadStreams() int {
+	idle := f.cfg.ReadIdle
+	if idle <= 0 {
+		idle = readStreamIdleDefault
+	}
+	cutoff := time.Now().Add(-idle)
+	f.mu.Lock()
+	n := 0
+	for _, st := range f.states {
+		// lastTouch is written under stateFor's f.mu, the same lock held here, so this needs
+		// no per-state lock -- and taking seqState.mu here would invert the lock order the
+		// read path uses (f.mu then st.mu).
+		if st.lastTouch.After(cutoff) {
+			n++
+		}
+	}
+	f.mu.Unlock()
+	if n < 1 {
+		return 1
+	}
+	return n
+}
