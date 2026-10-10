@@ -80,6 +80,44 @@ link, so a figure 12× low or 2× high is multiplied across all of them.
 export that previously had no byte gating now acquires a NIC-derived one. Pass
 `--inflight-bytes` explicitly to keep a specific figure.
 
+### The readahead divisor counts readers, not mounts
+
+Until recently `windowBlocks()` divided the prefetch budget by the number of **registered**
+clients — anyone who had sent a MOUNT within `--client-idle`, five minutes by default, whether
+or not they ever read a byte. Measured locally with no client reading anything: 1 mount gave 96
+blocks of readahead, 8 gave 61, 48 gave 10, and 246 reached the 2-block floor. **A 48× collapse
+from registration alone.**
+
+Measured externally on a real gateway, 47 clients that mounted and read nothing against one
+streaming client:
+
+| mounted clients | streaming throughput |
+|---|---|
+| 1 | 1267–1300 MB/s |
+| 8 | 1305–1231 MB/s (no cost) |
+| **48** | **519–558 MB/s — 2.4× slower** |
+
+**Bytes were identical in every arm** — 3.777 GB, 458 GETs, prefetch issued = used — so it was
+purely window depth and nothing was being wasted. No byte or request counter could see it,
+which is the same signature the FUSE-side version of this bug had
+([#301](https://github.com/scttfrdmn/lith/issues/301)).
+
+The divisor now counts **paths read within `--read-idle`** (30 s), using a per-path timestamp
+the read path was already maintaining. One streaming client among 48 mounted ones gets the
+whole budget again ([#337](https://github.com/scttfrdmn/lith/issues/337)).
+
+It still *divides* — the fix changed the divisor's **input**, not whether there is a share.
+Removing the rationing outright costs 13.8–22.4× wall clock with 81–92 % of prefetch evicted
+unread, and replacing the share with a byte-exact total on the same aggregate regressed
+concurrent readers 11× ([#309](https://github.com/scttfrdmn/lith/issues/309)).
+
+**Why this direction is the safe one:** a reader must have mounted, so active read streams can
+never exceed registered clients, so the change can only make a window **larger**. It cannot
+starve anyone — starvation is what #309 did. The opposite risk, over-commitment, is bounded by
+the tier-pressure gate that now defaults on for every export
+([#389](https://github.com/scttfrdmn/lith/issues/389)); the two changes compose, and this one
+would have been materially riskier before that landed.
+
 ### The gateway exports the blockstore's gauges too
 
 Until recently an export published `lith_prefetch_pressure_held_total` — the admission gate's

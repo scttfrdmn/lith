@@ -26,6 +26,7 @@ import (
 )
 
 type serveFlags struct {
+	readIdle         time.Duration
 	noRegionCheck    bool
 	prefetchPressure float64
 	wireTTFB         bool
@@ -106,6 +107,7 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.metrics, "metrics", "", "serve Prometheus metrics on this address (e.g. :9101)")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log verbosity: debug, info, warn, error")
 	fl.DurationVar(&f.clientIdle, "client-idle", 5*time.Minute, "release a client's readahead share after this idle time")
+	fl.DurationVar(&f.readIdle, "read-idle", 30*time.Second, "how long a path counts as an active read stream after its last read, for the readahead divisor (#337). The divisor used to count MOUNTED clients, so a client that mounted and read nothing held a share of the prefetch budget for --client-idle: measured externally, 47 such clients cut one streaming client from ~1280 to ~540 MB/s (2.4x) with BYTE-IDENTICAL transfers, so it was purely window depth. It now counts paths READ within this window. The reported defect is fixed for any value here, because a client that never reads creates no per-path state at all; this governs a second case, a path a still-mounted client read a while ago. Too short and a client pausing between reads is shed and re-granted repeatedly; too long and it becomes the bug it replaces. 30s is ~6x the longest read pause measured on a real HPC workload (a 5.0s ExtData time-slice cadence) and 10x shorter than the default --client-idle")
 	fl.BoolVar(&f.noSign, "no-sign-request", false, "anonymous S3 requests (public buckets)")
 	fl.BoolVar(&f.reqPays, "requester-pays", false, "add the requester-pays header")
 	return cmd
@@ -380,7 +382,8 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 
 	ready.set(true, "gateway serving")
 	return lithnfs.Serve(ctx, ln, lithnfs.Config{
-		Index: reader, Store: bs, RootID: rootID, ClientIdle: f.clientIdle, Metrics: met, Logger: log,
+		Index: reader, Store: bs, RootID: rootID, ClientIdle: f.clientIdle,
+		ReadIdle: f.readIdle, Metrics: met, Logger: log,
 	})
 }
 

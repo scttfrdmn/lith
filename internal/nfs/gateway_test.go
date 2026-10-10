@@ -5,6 +5,7 @@ package nfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -49,10 +50,12 @@ func buildGateway(t *testing.T, objs map[string][]byte, met Metrics) (*handler, 
 		t.Fatalf("blockstore: %v", err)
 	}
 	t.Cleanup(bs.Close)
+	// THROUGH newGateway, not a hand-rolled copy. This harness used to build the three pieces
+	// itself, and when #337 wired the corrected divisor input in Serve the harness did not get
+	// it -- so every test here kept exercising the MOUNT-counting fallback and the suite stayed
+	// green on a change no test covered.
 	cfg := Config{Index: reader, Store: bs, RootID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, ClientIdle: time.Minute, Metrics: met}
-	s := &server{cfg: cfg, clients: map[string]time.Time{}}
-	fs := &roFS{cfg: cfg, srv: s, ctx: context.Background(), states: map[string]*seqState{}}
-	return &handler{cfg: cfg, srv: s, fs: fs}, srv
+	return newGateway(context.Background(), cfg), srv
 }
 
 func TestHandleRoundTripAndStale(t *testing.T) {
@@ -137,13 +140,12 @@ func TestReadOnly(t *testing.T) {
 
 func TestFairShareArithmetic(t *testing.T) {
 	h, _ := testGateway(t, map[string][]byte{"f.txt": []byte("x")})
-	s := h.srv
+	s, fs := h.srv, h.fs
 	budget := s.cfg.Store.PrefetchBudgetBlocks()
 	if budget < 8 {
-		t.Skipf("prefetch budget %d blocks too small for the 8-client assertion", budget)
+		t.Skipf("prefetch budget %d blocks too small for the 8-stream assertion", budget)
 	}
-	// window = min(budget/clients, cap) with a floor of 2. The cap bounds
-	// per-stream readahead dispatch; below it the share divides by client count.
+	// window = clamp(budget/activeReadStreams, 2, 96).
 	const cap, floor = 96, 2
 	want := func(n int64) int64 {
 		w := budget / n
@@ -155,19 +157,29 @@ func TestFairShareArithmetic(t *testing.T) {
 		}
 		return w
 	}
-	s.mountClient("10.0.0.1")
+
+	// ★ THE DIVISOR IS READ STREAMS, NOT MOUNTED CLIENTS (#337). This test used to mount
+	// clients and assert the window shrank; it asserted the defect. Mounting eight clients
+	// that read nothing must now change nothing at all -- that is the 2.4x an external cell
+	// measured on a real gateway (1267-1300 MB/s with one client against 519-558 with 48,
+	// byte-identical transfers in every arm).
+	for i := 1; i <= 8; i++ {
+		s.mountClient(fmt.Sprintf("10.0.0.%d", i))
+	}
 	if w := s.windowBlocks(); w != want(1) {
-		t.Errorf("1 client window = %d, want %d", w, want(1))
+		t.Errorf("8 MOUNTED clients, none reading: window = %d, want %d — mounting must not "+
+			"shrink anyone's readahead (#337)", w, want(1))
 	}
-	s.mountClient("10.0.0.2")
-	if w := s.windowBlocks(); w != want(2) {
-		t.Errorf("2 clients window = %d, want %d", w, want(2))
-	}
-	for i := 3; i <= 8; i++ {
-		s.mountClient("10.0.0." + string(rune('0'+i)))
-	}
-	if w := s.windowBlocks(); w != want(8) {
-		t.Errorf("8 clients window = %d, want %d", w, want(8))
+
+	// Reading paths DO divide it, because the budget is still rationed -- the fix changed the
+	// divisor's INPUT, not whether it divides. Removing the rationing costs 13.8-22.4x wall
+	// with 81-92% of prefetch evicted unread, and #309 is what happens when a total replaces
+	// the share.
+	for n := int64(1); n <= 8; n++ {
+		fs.stateFor(fmt.Sprintf("/reader-%d", n))
+		if w := s.windowBlocks(); w != want(n) {
+			t.Errorf("%d active read streams: window = %d, want %d", n, w, want(n))
+		}
 	}
 }
 

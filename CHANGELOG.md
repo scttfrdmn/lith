@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The NFS gateway's readahead divisor counted MOUNTED clients, not reading ones**
+  ([#337](https://github.com/scttfrdmn/lith/issues/337)). A client that sent one MOUNT held a
+  share of the prefetch budget for `--client-idle` — five minutes — whether or not it ever read
+  a byte. Measured locally with no client reading anything: 1 mount → 96 blocks, 8 → 61,
+  48 → 10, 246 → the 2-block floor. **A 48× collapse from registration alone.**
+
+  Measured externally on a real gateway, 47 namespaced clients that mounted and read nothing
+  against one streaming client: **1267–1300 MB/s with one client, 519–558 with 48 — 2.4×** —
+  with **byte-identical** transfers in every arm (3.777 GB, 458 GETs, prefetch issued = used
+  = 3594). Purely window depth, nothing wasted, and invisible to any byte or request counter.
+  Eight clients cost nothing; the reporter's own prediction of "under 20 %" failed, and it
+  binds at ~15 Gbps, so a fatter NIC can only be worse — and a gateway is the one place a fat
+  NIC is normal, because it funnels a whole cluster through one.
+
+  **The corrected input was always there.** `roFS.states` carries a per-path `lastTouch` that
+  `stateFor` updates on every read. The comment that justified counting mounts — *"per-op
+  client activity is not visible through go-nfs's stateless read path"* — is true of go-nfs and
+  **not** true of lith's own state, and that distinction was the whole bug. This is the
+  gateway's analogue of [#311](https://github.com/scttfrdmn/lith/issues/311)'s
+  `streamingHandles`, and the same shape of one-line input change.
+
+  **It still divides.** The fix changed the divisor's *input*, not whether there is a share:
+  removing the rationing costs 13.8–22.4× wall with 81–92 % of prefetch evicted unread, and
+  #309 is what happens when a total replaces the share.
+
+  **Why this direction is safe:** a reader must have mounted, so read streams can never exceed
+  registered clients, so a window can only get *larger*. It cannot starve anyone — starvation
+  is exactly what #309 did. The opposite risk is bounded by the pressure gate that now defaults
+  on for every export (#389); the two compose, and this would have been riskier a week ago.
+
+  New `--read-idle` (30 s) governs how long a path counts as active. **The reported defect is
+  fixed for any value**, because a client that never reads creates no per-path state at all;
+  the window governs a second case — a path a still-mounted client read a while ago — where the
+  only other bound is the 8192-entry LRU cap, which over a long run is a worse divisor than the
+  client count ever was.
+
+  **And the fix nearly shipped dead.** It was wired in `Serve()`, which no test calls, while
+  the test harness built its own copy of that construction and silently kept the
+  MOUNT-counting fallback — so `TestFairShareArithmetic` went on asserting the old divisor and
+  passing. `newGateway` now exists so there is one place, the harness goes through it, and that
+  test asserts the new semantics: mounting eight clients changes nothing, reading eight paths
+  divides the budget eight ways.
+
+
+### Fixed
+
 - **The NFS gateway exported the pressure gate's hold count but not the pressure itself**
   ([#337](https://github.com/scttfrdmn/lith/issues/337)). `RegisterPrefetchBudget` was called
   from `internal/fuse` and nowhere else, so an export published
