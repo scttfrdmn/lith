@@ -373,6 +373,13 @@ func NewRawFileSystem(cfg Config) fuse.RawFileSystem {
 			return d.Seconds()
 		},
 	)
+	// The idle distribution over the divisor's own population (#312). One walk per scrape
+	// serves all four gauges, so a scrape cannot see three buckets computed at one instant and
+	// a denominator computed at another -- which would let the denominator read smaller than a
+	// bucket and make the pair look impossible.
+	f.met.RegisterStreamIdle(func() (int64, int64, int64, int64) {
+		return f.streamIdleBuckets(time.Now())
+	})
 	// What --prefetch-budget actually bounds, against its own limit (#301). The window
 	// gauges above are the PROXY for this; these two are the quantity itself.
 	f.met.RegisterPrefetchBudget(
@@ -1666,4 +1673,57 @@ func (f *rawFS) budgetBlocks() int64 {
 		return 0
 	}
 	return f.store.PrefetchBudgetBlocks()
+}
+
+// streamIdleBuckets is the cumulative idle distribution over ESTABLISHED STREAMS: how many of
+// the handles in perHandleWindow's divisor have not been read for at least each threshold
+// (#312). Also returns the total number of established streams, so the counts have a
+// denominator at the point of use rather than requiring a second scrape to interpret.
+//
+// CUMULATIVE, AND A DISTRIBUTION RATHER THAN A VERDICT. #312's mechanism needs an idle
+// threshold and that threshold is a tuning constant with no principled value -- too short and
+// a reader pausing on compute loses its window, too long and the mechanism does nothing. So
+// this ships the shape and no decision: an operator (or the next cell) reads which bucket the
+// mass falls in, instead of lith picking one and being wrong in a way nobody can see. Two
+// defaults placed from a plausible-looking constant have already been withdrawn here (#340,
+// #349).
+//
+// THE BUCKETS ARE MEASURED, NOT CHOSEN. The reporting workload's met files are read in a burst
+// and then sit until the next ExtData time slice, measured at a median of 5.0 s. 1 s is below
+// that cadence (a stream idle this long is between reads within a burst), 5 s straddles it, and
+// 30 s is well past any slice -- a stream idle that long on this workload has been abandoned
+// rather than paused.
+//
+// O(handles) PER SCRAPE, which is fine, and O(handles) per READ would not be: #311 maintains
+// the streaming count as deltas from each read's detector transition precisely because a scan
+// there would be O(6229 handles) on the reporting workload. A scrape is seconds apart.
+func (f *rawFS) streamIdleBuckets(now time.Time) (ge1, ge5, ge30, streams int64) {
+	f.mu.RLock()
+	hs := make([]*fileHandle, 0, len(f.handles))
+	for _, h := range f.handles {
+		hs = append(hs, h)
+	}
+	f.mu.RUnlock()
+
+	// The per-handle locks are taken OUTSIDE f.mu, so a scrape cannot block the read path
+	// behind the map lock while it waits on a handle's own mutex.
+	for _, h := range hs {
+		idle, ok := h.pf.idleFor(now)
+		if !ok {
+			continue
+		}
+		streams++
+		switch {
+		case idle >= 30*time.Second:
+			ge30++
+			ge5++
+			ge1++
+		case idle >= 5*time.Second:
+			ge5++
+			ge1++
+		case idle >= time.Second:
+			ge1++
+		}
+	}
+	return ge1, ge5, ge30, streams
 }
