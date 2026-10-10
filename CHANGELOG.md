@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Docs: a root-created mount needs a root-run readiness check.** Reported from a benchmark
+  harness: `mountpoint -q` as a non-root user **cannot stat a root-owned FUSE mount**, so it
+  reports *not mounted* while the mount is in fact serving — a readiness loop times out and, in
+  their case, three mounts stacked up behind one failed check. `lith mounts` does not rescue
+  you either, for a different reason: it reads a **per-user** record directory and deliberately
+  ignores records from a directory it does not own, so a root-created mount is equally
+  invisible to a non-root `lith mounts`. The rule is the same for both tools, and it was in
+  neither the docs nor anyone's head.
+
 ### Fixed
 
 - **`--mem-cache`'s per-daemon arithmetic was wrong by 2×, and the refuted additive claim was

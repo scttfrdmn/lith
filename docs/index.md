@@ -73,6 +73,23 @@ ls -lh /mnt/hg00100
 (`fusermount3` requires write access to the mountpoint, so the user running
 `lith` must own it — hence the `chown` after the `sudo mkdir`.)
 
+!!! warning "Scripting a readiness check: run it as the user that created the mount"
+
+    A FUSE mount created by `root` **cannot be stat'd by another user**, so
+    `mountpoint -q /mnt/…` reports *not mounted* and a readiness loop times out
+    while the mount is in fact serving. Reported from a benchmark harness where
+    this stacked three mounts behind one failed check.
+
+    `lith mounts` does not rescue you, for a different reason: it reads a
+    **per-user** record directory and deliberately ignores records from a
+    directory it does not own, so a root-created mount is equally invisible to a
+    non-root `lith mounts`.
+
+    The rule is the same either way — **a root-created mount needs a root-run
+    readiness check**. `sudo mountpoint -q /mnt/…` or `sudo lith mounts`. Better
+    still, avoid the asymmetry: mount as the user that will read, which is what
+    the `chown` above is for.
+
 `ls` returns immediately and shows a **14 GiB** `…low_coverage…bam.cram` and its
 `.crai` index — real sizes and mtimes, served from the local index without
 touching S3.
