@@ -61,7 +61,11 @@ func TestMemTierHeadroomWarning(t *testing.T) {
 	}
 	// The message has to carry the arithmetic, not just a verdict -- the operator's next
 	// action is choosing a smaller number, and they need the ceiling to choose it.
-	for _, want := range []string{"GOGC", "GOMEMLIMIT", "50%", "TIER, not the process"} {
+	// The message must carry the measured basis and the one constraint on GOMEMLIMIT that is
+	// derivable (it has to exceed the tier, or the collector thrashes on a live set it cannot
+	// shrink). "2.03" is the external figure, three arms differing 3x in outstanding prefetch.
+	for _, want := range []string{"GOGC", "GOMEMLIMIT", "50%", "TIER, not the process",
+		"2.03x the tier", "ABOVE"} {
 		if !strings.Contains(w, want) {
 			t.Errorf("warning omits %q, which is what makes it actionable: %q", want, w)
 		}

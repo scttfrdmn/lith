@@ -84,7 +84,9 @@ export that previously had no byte gating now acquires a NIC-derived one. Pass
 
 `--mem-cache` defaults to **25 % of system RAM for each mount**, so mounts on one host add
 up rather than sharing. A node serving five prefix-scoped mounts — one per input collection,
-which is the normal shape for a model run — defaults to a **125 % cap on the box**. On a
+which is the normal shape for a model run — defaults to a **~250 % cap on the box** — 25 % of RAM each, and each mount's footprint is
+~2× its own tier, because the tier is live Go heap and at the default `GOGC=100` the
+collector grows the heap to about twice the live set (measured: `next_gc` at 2.03 × the tier). On a
 30 GB head node where the application itself wanted 27 GB, that forced the operator to bound
 every mount explicitly; on a 768 GB compute node the default would reserve 192 GB apiece
 ([#242](https://github.com/scttfrdmn/lith/issues/242)).

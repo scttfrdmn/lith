@@ -127,10 +127,14 @@ func memTierHeadroomWarning(tier, total int64) string {
 	}
 	return fmt.Sprintf("--mem-cache %d bytes is %.0f%% of this box's %d bytes of RAM, and the "+
 		"memory tier is live Go heap: at the default GOGC=100 the collector grows the heap to "+
-		"about TWICE the live set, so this tier targets ~%d bytes on a %d-byte box and the "+
-		"process can be OOM-killed before the tier is even full (measured: a 20 GB tier on a "+
-		"33 GB box died at RSS 30.56 GB). --mem-cache bounds the TIER, not the process. Keep it "+
-		"under 50%% of RAM (the default is 25%%), or set GOMEMLIMIT so the collector works "+
-		"harder instead of the kernel killing the process (#314)",
-		tier, 100*float64(tier)/float64(total), total, 2*tier, total)
+		"about TWICE the live set, so expect this process to reach ~%d bytes on a %d-byte box "+
+		"and to be OOM-killed before the tier is even full. --mem-cache bounds the TIER, not "+
+		"the process. MEASURED, three arms differing 3x in outstanding prefetch: next_gc came "+
+		"in at 2.03x the tier every time, with RSS within 1%% of next_gc -- so the doubling is "+
+		"not an estimate. Either keep --mem-cache under 50%% of RAM (the default is 25%%), or "+
+		"set GOMEMLIMIT to the footprint you can actually afford on this box: it makes the "+
+		"collector work harder instead of letting the kernel kill the process, and it must be "+
+		"comfortably ABOVE %d bytes (the tier itself) or the collector will thrash trying to "+
+		"reclaim a live set it cannot shrink (#314)",
+		tier, 100*float64(tier)/float64(total), total, 2*tier, total, tier)
 }
