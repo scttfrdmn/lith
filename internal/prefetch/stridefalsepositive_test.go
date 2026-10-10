@@ -102,7 +102,7 @@ func TestStrideRunDoesNotAccumulateAcrossAnInterruption(t *testing.T) {
 	p.SetGapMax(blockSize)
 	p.SetCoverage(16, 0.5)
 
-	obs := func(blk int64) []int64 {
+	obs := func(blk int64) []Dispatch {
 		return p.Observe(blk, blk*blockSize, 4096, blk*blockSize)
 	}
 	obs(0)

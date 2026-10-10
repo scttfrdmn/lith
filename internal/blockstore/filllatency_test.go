@@ -162,3 +162,164 @@ func TestPrefetchFillsAreLabelledWhole(t *testing.T) {
 		t.Fatalf("fixture produced %d GETs", gets)
 	}
 }
+
+// #222's fix must be OBSERVABLE: an extent-granular strided prefetch is labelled
+// `prefetch-range`, distinct from the `whole` that a block prefetch reports. The point of the
+// separate label is that the bytes MOVE from one to the other when the fix engages, so a
+// shared label would hide it -- and a label nothing emits is a label that lies by omission.
+func TestPrefetchRangeIsLabelledDistinctly(t *testing.T) {
+	srv := fake.New()
+	const objSize = 16 << 20
+	body := make([]byte, objSize)
+	for i := range body {
+		body[i] = byte(i * 17 % 253)
+	}
+	srv.Put("obj", body, time.Unix(1_700_000_000, 0))
+
+	rec := &fillSecRec{}
+	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, Recorder: rec})
+	k := keyFor(t, srv, "obj")
+
+	// Eight extent-granular prefetches, one per distinct chunk — the shape the strided
+	// branch now dispatches.
+	for i := int64(0); i < 8; i++ {
+		bs.PrefetchRange(context.Background(), k, i*(2<<20)+1234, 4<<10, objSize)
+	}
+
+	byKind, gets := rec.got()
+	if byKind["prefetch-range"] == 0 {
+		t.Fatalf("PrefetchRange produced %v with no kind=prefetch-range: #222's fix would be "+
+			"invisible in lith_fill_bytes_total and lith_fill_seconds", byKind)
+	}
+	if byKind["whole"] != 0 {
+		t.Errorf("an extent prefetch was labelled whole: %v — the two would be "+
+			"indistinguishable and the byte movement #222 is about could not be seen", byKind)
+	}
+	total := 0
+	for _, n := range byKind {
+		total += n
+	}
+	if int64(total) != gets {
+		t.Errorf("observed %d labelled latencies against %d GETs (by kind: %v)", total, gets, byKind)
+	}
+
+	// AND IT MUST ACTUALLY FETCH LESS THAN A BLOCK PREFETCH WOULD. The same eight chunks
+	// through Prefetch, measured on the SAME server with before/after snapshots so the two
+	// phases cannot contaminate each other -- one server shared by two stores would pool the
+	// byte counts and this comparison would be meaningless.
+	rangeBytes := srv.GetByteCount()
+
+	rec2 := &fillSecRec{}
+	bs2 := newStore(t, srv, Config{BlockSize: 1 << 20, MaxRange: 64 << 20, Recorder: rec2})
+	for i := int64(0); i < 8; i++ {
+		bs2.Prefetch(context.Background(), k, i*2, objSize)
+	}
+	wholeBytes := srv.GetByteCount() - rangeBytes
+	if wholeBytes == 0 {
+		t.Fatal("the whole-block control fetched nothing")
+	}
+	t.Logf("eight chunks: PrefetchRange %d B, Prefetch %d B (%.1fx)", rangeBytes, wholeBytes,
+		float64(wholeBytes)/float64(rangeBytes))
+	if rangeBytes >= wholeBytes {
+		t.Errorf("PrefetchRange fetched %d B against the whole-block path's %d B — it is not "+
+			"bounding anything", rangeBytes, wholeBytes)
+	}
+}
+
+// THE ACCOUNTING CLAIM, which is load-bearing for the pressure gate (#313) and was only a
+// comment until now: PrefetchRange commits the WANTED EXTENT SPAN, not a whole chunk per
+// chunk. Charging a full chunk for a 64 KiB extent would over-report committed by up to 16x,
+// and committed is exactly what --prefetch-pressure-max admits against — so the error would
+// make the gate refuse prefetch on a mount that had committed almost nothing.
+func TestPrefetchRangeCommitsOnlyItsExtents(t *testing.T) {
+	srv := fake.New()
+	const objSize = 16 << 20
+	srv.Put("obj", make([]byte, objSize), time.Unix(1_700_000_000, 0))
+	bs := newStore(t, srv, Config{BlockSize: 1 << 20, MemCache: 256 << 20, MaxRange: 64 << 20})
+	k := keyFor(t, srv, "obj")
+
+	const probes = int64(8)
+	for i := int64(0); i < probes; i++ {
+		bs.PrefetchRange(context.Background(), k, i*(2<<20)+1234, 4<<10, objSize)
+	}
+	committed := bs.PrefetchCommittedBytes()
+
+	// One extent per probe is the expected commitment; a whole chunk per probe is the bug.
+	wantMax := probes * int64(ExtentSize)
+	chunkCharge := probes * int64(ChunkSize)
+	t.Logf("%d extent prefetches committed %d B (one extent each would be %d, one chunk each %d)",
+		probes, committed, wantMax, chunkCharge)
+	if committed > wantMax {
+		t.Errorf("committed %d B for %d extent prefetches, above %d B (one extent each) — the "+
+			"charge is chunk-granular, which over-reports the quantity the #313 pressure gate "+
+			"admits against by up to %.0fx", committed, probes, wantMax,
+			float64(chunkCharge)/float64(wantMax))
+	}
+	if committed <= 0 {
+		t.Errorf("committed %d B — an extent prefetch must still be charged, or the pressure "+
+			"gate cannot see it at all", committed)
+	}
+}
+
+// THE PRESSURE GATE MUST COVER PrefetchRange TOO (#313 + #222), and nothing caught it when I
+// first wrote the function without it — found by a revert sweep, not by reading.
+//
+// An extent prefetch is still speculation committed against the tier. A second prefetch entry
+// point that skipped the gate would be an admission-control hole scaling with however many
+// strided readers a mount has, and the gauge the gate reads would look fine throughout,
+// because the bypassing path still charges `committed`.
+//
+// IT DRIVES `committed` DIRECTLY RATHER THAN RACING TO RAISE IT. The first version of this
+// test dispatched 64 prefetches concurrently behind a GET delay and asserted some were held:
+// it got 31 holds locally and ZERO in CI, because whether commitment accumulates depends on
+// how many dispatches overlap before any lands, which is the scheduler's business. That is a
+// tight assertion on a load-sensitive quantity — the same mistake as the #313 gate test that
+// asserted the gate HALVES peak pressure and then flaked in the full-tree run. The question
+// here is narrow and deserves a narrow test: does PrefetchRange CONSULT the gate?
+func TestPrefetchRangeObeysThePressureGate(t *testing.T) {
+	run := func(t *testing.T, pressureMax float64) (held int64, gets int) {
+		t.Helper()
+		srv := fake.New()
+		const objSize = 16 << 20
+		srv.Put("obj", make([]byte, objSize), time.Unix(1_700_000_000, 0))
+		rec := &pressureRec{}
+		bs := newStore(t, srv, Config{
+			BlockSize: 1 << 20, MemCache: 8 << 20, MaxRange: 64 << 20,
+			PrefetchPressureMax: pressureMax, Recorder: rec,
+		})
+		k := keyFor(t, srv, "obj")
+		// Pressure 0.9, above the 0.85 threshold, set outright. Nothing has to race.
+		if cap := bs.MemCap(); cap > 0 {
+			bs.pfCommittedBytes.Add(int64(0.9 * float64(cap)))
+		} else {
+			t.Fatal("fixture has no memory tier, so the gate's denominator is zero")
+		}
+		start := srv.GetCallCount()
+		bs.PrefetchRange(context.Background(), k, 1234, 4<<10, objSize)
+		return rec.held.Load(), srv.GetCallCount() - start
+	}
+
+	held, gets := run(t, 0.85)
+	t.Logf("gate at 0.85 with pressure pre-set to 0.90: held=%d, GETs=%d", held, gets)
+	if held != 1 {
+		t.Errorf("held %d dispatches, want 1 — PrefetchRange is bypassing #313's admission "+
+			"control, which is a hole that scales with the number of strided readers on the "+
+			"mount", held)
+	}
+	if gets != 0 {
+		t.Errorf("the refused prefetch still issued %d GET(s); the gate must drop the "+
+			"dispatch, not merely count it", gets)
+	}
+
+	// THE CONTROL, without which the assertion above could pass for an unrelated reason: with
+	// the gate off, the identical fixture holds nothing and does fetch.
+	offHeld, offGets := run(t, 0)
+	t.Logf("gate off, same pressure: held=%d, GETs=%d", offHeld, offGets)
+	if offHeld != 0 {
+		t.Errorf("the gate held %d dispatches with PrefetchPressureMax=0", offHeld)
+	}
+	if offGets == 0 {
+		t.Error("with the gate off the prefetch fetched nothing, so the comparison above " +
+			"measures something other than the gate")
+	}
+}

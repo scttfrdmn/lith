@@ -11,7 +11,7 @@ import "testing"
 const cbs = 8 << 20 // block size used to map offsets to block indices in these tests
 
 // stream reads block i as a contiguous cbs-byte read at offset i*cbs.
-func streamRead(p *Prefetcher, i int64) []int64 {
+func streamRead(p *Prefetcher, i int64) []Dispatch {
 	return p.Observe(i, i*cbs, cbs, 0)
 }
 
@@ -119,7 +119,7 @@ func TestCoverage_WalkBecomesStreamTransitions(t *testing.T) {
 	}
 	// Then a contiguous stream from block 100. Once the window refills with tiling
 	// reads, coverage recovers and the handle returns to Sequential.
-	var got []int64
+	var got []Dispatch
 	for i := int64(100); i < 130; i++ {
 		got = p.Observe(i, i*cbs, cbs, 0)
 	}
@@ -146,7 +146,7 @@ func TestCoverage_SeekReanchorSuppressedOnLowCoverage(t *testing.T) {
 		t.Fatalf("setup: expected Sequential, got %v", p.State())
 	}
 	// A cluster of far, tiny reads that drags coverage under threshold.
-	var last []int64
+	var last []Dispatch
 	for _, o := range []int64{200 * cbs, 260 * cbs, 230 * cbs, 290 * cbs, 210 * cbs} {
 		last = p.Observe(o/cbs, o, 4<<10, o)
 	}

@@ -171,7 +171,7 @@ func globalScore(perHandle []handleScore, cfg traceConfig, rows []row, byteExact
 			d.SetMax(r.maxWindow)
 		}
 		for _, b := range d.Observe(r.blk, r.off, r.length, r.gap) {
-			dispatches = append(dispatches, dispatch{at: i, block: b, fh: r.fh, key: r.key})
+			dispatches = append(dispatches, dispatch{at: i, block: b.Block, fh: r.fh, key: r.key})
 		}
 	}
 	// EOF clamp per KEY. Same rule as objSizeOf: the recorded size if the trace has one,
