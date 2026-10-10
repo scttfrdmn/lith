@@ -327,7 +327,7 @@ func doctorFUSE(d *doctor, f *doctorFlags) {
 	}
 	if fh, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0); err != nil {
 		if os.IsNotExist(err) {
-			d.add(fail, "fuse device", "/dev/fuse is missing", "install fuse3 (apt install fuse3) or load the fuse kernel module")
+			d.add(fail, "fuse device", "/dev/fuse is missing", "install fuse3 — `dnf install fuse3` on AL2023/RHEL, `apt install fuse3` on Debian/Ubuntu — or load the fuse kernel module")
 		} else {
 			d.add(fail, "fuse device", "/dev/fuse not openable: "+err.Error(), "add your user to a group with /dev/fuse access, or run via a container with --device /dev/fuse")
 		}
@@ -336,7 +336,7 @@ func doctorFUSE(d *doctor, f *doctorFlags) {
 		d.add(pass, "fuse device", "/dev/fuse present and openable", "")
 	}
 	if p, err := exec.LookPath("fusermount3"); err != nil {
-		d.add(fail, "fusermount3", "not on PATH", "install fuse3 (apt install fuse3)")
+		d.add(fail, "fusermount3", "not on PATH", "install fuse3 — `dnf install fuse3` on AL2023/RHEL, `apt install fuse3` on Debian/Ubuntu")
 	} else {
 		d.add(pass, "fusermount3", p, "")
 	}
