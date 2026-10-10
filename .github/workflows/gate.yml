@@ -76,16 +76,53 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      # Build the binary into the same os/arch layout goreleaser (dockers_v2)
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      # Build the binaries into the same os/arch layout goreleaser (dockers_v2)
       # hands the Dockerfile, then build the image without pushing — a PR that
       # breaks the image (bad COPY, base bump) fails here, before any tag is cut.
-      - name: build binary into context
+      #
+      # BOTH ARCHITECTURES, and deliberately WITHOUT docker/setup-qemu-action.
+      # Two reasons, and the second is the point:
+      #
+      #  1. The gate built only linux/amd64 while the release publishes a
+      #     two-platform manifest, so an arm64-only image problem could not fail
+      #     until a tag was already cut.
+      #  2. THIS IS THE EXPERIMENT THAT DECIDES WHETHER THE RELEASE NEEDS QEMU AT
+      #     ALL. v1.12.0's release failed TWICE on Docker Hub's unauthenticated
+      #     pull rate limit, at setup-qemu-action, before goreleaser did any work.
+      #     But the Dockerfile has NO `RUN` instruction — it copies a prebuilt
+      #     static binary into distroless — so BuildKit never has to execute
+      #     target-architecture code, and emulation should be unnecessary. If this
+      #     step passes on a runner with no binfmt handlers installed, that is
+      #     proof, measured on the same runner image the release uses, and the
+      #     release can drop its QEMU step and the Docker Hub pull with it.
+      #
+      # TARGETPLATFORM IS NOT PASSED AS A BUILD-ARG. BuildKit sets it automatically,
+      # once per platform, which is what makes `COPY ${TARGETPLATFORM}/lith` pick the
+      # right binary for each. Passing it explicitly -- as the old single-platform
+      # step had to, because the classic builder does not set it -- would pin BOTH
+      # images to the amd64 binary and the arm64 half of this check would prove
+      # nothing.
+      #
+      # No --load either, so nothing has to be exported to the local image store,
+      # which is single-platform.
+      #
+      # WHAT A PASS DOES AND DOES NOT PROVE: it proves setup-qemu-action is not
+      # needed to build this image on this runner image -- either because no
+      # emulation is required, or because the handlers are already ambient. Both
+      # answer the question the release cares about. The binfmt listing above is
+      # printed so the reason is visible rather than assumed.
+      - name: build binaries into context
         env:
           GOOS: linux
-          GOARCH: amd64
           CGO_ENABLED: "0"
         run: |
-          mkdir -p linux/amd64
-          go build -trimpath -o linux/amd64/lith ./cmd/lith
-      - name: docker build (no push)
-        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t lith:ci .
+          for arch in amd64 arm64; do
+            mkdir -p "linux/$arch"
+            GOARCH="$arch" go build -trimpath -o "linux/$arch/lith" ./cmd/lith
+          done
+      - name: show installed binfmt handlers (expect none for arm64)
+        run: ls -1 /proc/sys/fs/binfmt_misc/ 2>/dev/null || echo "no binfmt_misc entries"
+      - name: docker build, both platforms, no QEMU (no push)
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 -t lith:ci .
