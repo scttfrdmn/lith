@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Docs: a root-created mount needs a root-run readiness check.** Reported from a benchmark
+  harness: `mountpoint -q` as a non-root user **cannot stat a root-owned FUSE mount**, so it
+  reports *not mounted* while the mount is in fact serving — a readiness loop times out and, in
+  their case, three mounts stacked up behind one failed check. `lith mounts` does not rescue
+  you either, for a different reason: it reads a **per-user** record directory and deliberately
+  ignores records from a directory it does not own, so a root-created mount is equally
+  invisible to a non-root `lith mounts`. The rule is the same for both tools, and it was in
+  neither the docs nor anyone's head.
+
+### Fixed
+
+- **`--mem-cache`'s per-daemon arithmetic was wrong by 2×, and the refuted additive claim was
+  still in the same docs row** ([#314](https://github.com/scttfrdmn/lith/issues/314)). The GC
+  model #392 proposed is now **measured**, externally, in three arms that differ 3× in
+  outstanding prefetch:
+
+  | arm | peak RSS | `next_gc` | RSS / `next_gc` | `next_gc` / tier |
+  |---|---|---|---|---|
+  | default | 20.38 GB | 20.30 | 1.00 | **2.03** |
+  | evidence gate forced off (pressure gate on) | 20.43 | 20.31 | 1.01 | **2.03** |
+  | both gates off (pre-#389) | 20.41 | 20.31 | 1.00 | **2.03** |
+
+  `next_gc` is 2.03 × the tier every time and RSS lands within 1 % of it. **The additive model
+  is excluded, not merely unsupported:** `committed − unread_resident` varied 3× across those
+  arms (3.8 → 8.0 → 11.3 GB) while RSS stayed flat at 20.4 GB. RSS never exceeded `next_gc`,
+  so it is not the allocator holding pages either.
+
+  Two things were wrong in the docs as a result. **`--mem-cache` is per-daemon and the
+  footprint is ~2× the tier, so those compound:** five mounts at the default 25 % are a
+  **~250 %** cap on the box, not the 125 % the page claimed. And the `--mem-cache` row still
+  ended with the additive sentence — *"the footprint is the tier plus outstanding prefetch,
+  measured additive to 0.2%"* — which #392 had already refuted at the **start** of the same
+  row. Exactly the drift that #388 was about: the correction went in one place and the stale
+  claim stayed in another, inside one table cell.
+
+  The startup warning now states the measured basis rather than deriving the doubling, and
+  names the one constraint on `GOMEMLIMIT` that follows from it: the limit must sit
+  **comfortably above the tier**, or the collector thrashes trying to reclaim a live set it
+  cannot shrink.
+
+### Added
+
 - **`lith_fill_seconds{kind}`: what a fault costs, as a scrape rather than a judgement**
   ([#362](https://github.com/scttfrdmn/lith/issues/362), condition 2). An operator mounted a
   1.206 TB kraken2 database, ran a tool that classified **zero reads in eleven minutes**, and
