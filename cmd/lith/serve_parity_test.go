@@ -235,3 +235,82 @@ func TestBothCommandsValidateInflightBytes(t *testing.T) {
 		}
 	}
 }
+
+// metricsInapplicable documents every metrics registration `lith mount` makes that
+// `lith serve nfs` intentionally does not, with the reason.
+var metricsInapplicable = map[string]string{
+	// Per-HANDLE shares of the prefetch budget. The gateway rations per CLIENT instead
+	// (server.windowBlocks), so a handle-derived window, open-handle count and streaming-handle
+	// count have no meaning on an export.
+	"RegisterReadaheadWindow": "per-handle readahead shares; the gateway rations per client",
+	"RegisterStreamIdle":      "idle distribution over per-handle streams (#312); internal/nfs has no per-handle detector",
+}
+
+// ★ METRIC-REGISTRATION PARITY, the third form of this gate and the one #337 needed.
+//
+// TestServeMountFlagParity checks a mount FLAG exists on both commands.
+// TestServeMountBlockStoreConfigParity checks a blockstore.Config FIELD is set by both.
+// Neither sees a gauge the mount EXPORTS and the gateway does not — and that is how an export
+// came to expose `lith_prefetch_pressure_held_total`, the pressure gate's hold count, while
+// exposing neither the pressure it gates on nor the tier it is a fraction of. An external cell
+// trying to answer whether the 0.85 band transfers to a gateway found it could not read a
+// gateway's peak pressure at all (#337 Q3).
+//
+// Three gates now, each catching what the previous one could not: the flag exists, the config
+// field is set, the metric is exported. All three are the same underlying shape — a second
+// consumer of shared machinery with its own wiring, tests covering only the first.
+func TestServeMountMetricsParity(t *testing.T) {
+	registrations := func(path string) map[string]bool {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, name := range []string{
+			"RegisterReadaheadWindow", "RegisterPrefetchBudget", "RegisterStreamIdle",
+		} {
+			if strings.Contains(string(src), "."+name+"(") {
+				out[name] = true
+			}
+		}
+		return out
+	}
+	// THE TWO SIDES REGISTER FROM DIFFERENT FILES, which is itself part of why the gap was
+	// invisible: `lith mount` registers from inside internal/fuse (it needs the FUSE layer's
+	// own state), while `lith serve nfs` registers from the command. A check that compared
+	// the two COMMAND files would find nothing on the mount side and pass vacuously — which
+	// is what the first version of this test did, caught by the precondition below.
+	mount := registrations("../../internal/fuse/fs.go")
+	serve := registrations("serve.go")
+	// The mount side is the reference; if it registers nothing the walk is broken.
+	if len(mount) == 0 {
+		t.Fatal("found no metrics registrations in internal/fuse/fs.go; the check is broken, not the code")
+	}
+
+	var missing []string
+	for name := range mount {
+		if serve[name] {
+			continue
+		}
+		if _, documented := metricsInapplicable[name]; documented {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("metrics the FUSE mount registers and `lith serve nfs` does not: %s\n"+
+			"A gauge the mount exports and the gateway does not is a gateway an operator "+
+			"cannot diagnose — and the counters that DO appear make it look instrumented "+
+			"(#337). Register them on serve, or add a reason to metricsInapplicable.",
+			strings.Join(missing, ", "))
+	}
+	for name := range metricsInapplicable {
+		if !mount[name] {
+			t.Errorf("metricsInapplicable lists %q, which internal/fuse does not register", name)
+		}
+		if serve[name] {
+			t.Errorf("metricsInapplicable lists %q, but serve.go actually registers it", name)
+		}
+	}
+}
