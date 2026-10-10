@@ -80,6 +80,19 @@ link, so a figure 12× low or 2× high is multiplied across all of them.
 export that previously had no byte gating now acquires a NIC-derived one. Pass
 `--inflight-bytes` explicitly to keep a specific figure.
 
+### The gateway exports the blockstore's gauges too
+
+Until recently an export published `lith_prefetch_pressure_held_total` — the admission gate's
+*hold count* — while publishing neither `lith_prefetch_pressure`, the quantity it gates on, nor
+`lith_prefetch_committed_bytes` and `lith_prefetch_unread_resident_bytes`, the tier figures that
+make it readable. The counters that *did* appear made the gateway look instrumented, so the gap
+was invisible until an external cell tried to answer whether the pressure gate's measured band
+transfers to a gateway and found a gateway's peak pressure could not be read at all
+([#337](https://github.com/scttfrdmn/lith/issues/337)).
+
+All four are now registered on both commands. The **readahead-window** gauges stay FUSE-only on
+purpose: they describe per-*handle* shares, and the gateway rations per *client* instead.
+
 ### Several mounts on one host: `--mem-cache` is per-daemon
 
 `--mem-cache` defaults to **25 % of system RAM for each mount**, so mounts on one host add

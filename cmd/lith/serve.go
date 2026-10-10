@@ -313,6 +313,26 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		return err
 	}
 	defer bs.Close()
+	// THE BLOCKSTORE'S OWN GAUGES, which the gateway did not have (#337 Q3). These four are
+	// registered from internal/fuse and nowhere else, so an export exposed
+	// lith_prefetch_pressure_held_total -- the gate's hold COUNT -- while exposing neither
+	// the pressure it gates on nor the tier it is a fraction of. An external cell trying to
+	// answer "does the 0.85 band transfer to a gateway" found it could not read a gateway's
+	// peak pressure at all.
+	//
+	// Nothing here is FUSE-specific: all four read the blockstore, which both commands build
+	// the same way. The readahead-window gauges stay FUSE-only because they are about per-
+	// HANDLE shares and the gateway rations per client instead. Seventh instance of this
+	// project's most repeated shape -- a second consumer of shared machinery with its own
+	// wiring (#240, #242, #346, #239, #393, #337).
+	if met != nil {
+		met.RegisterPrefetchBudget(
+			func() float64 { return float64(bs.PrefetchCommittedBytes()) },
+			func() float64 { return float64(bs.PrefetchBudgetBytes()) },
+			func() float64 { return float64(bs.PrefetchUnreadResidentBytes()) },
+			bs.PrefetchPressure,
+		)
+	}
 	if w := pressureMaxWarning(f.prefetchPressure); w != "" {
 		log.Warn("prefetch pressure gate", "warning", w)
 	}

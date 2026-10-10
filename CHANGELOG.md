@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The NFS gateway exported the pressure gate's hold count but not the pressure itself**
+  ([#337](https://github.com/scttfrdmn/lith/issues/337)). `RegisterPrefetchBudget` was called
+  from `internal/fuse` and nowhere else, so an export published
+  `lith_prefetch_pressure_held_total` while publishing neither `lith_prefetch_pressure` — the
+  quantity it gates on — nor the two tier figures that make it readable. The counters that
+  *did* appear made the gateway look instrumented, which is why nobody noticed until an
+  external cell tried to answer whether the 0.85 band transfers to a gateway and **found a
+  gateway's peak pressure could not be read at all.**
+
+  All four gauges are now registered on both commands. The readahead-window gauges stay
+  FUSE-only on purpose: they describe per-*handle* shares and the gateway rations per *client*.
+
+  **Seventh instance of this project's most repeated shape** — a second consumer of shared
+  machinery with its own wiring, tests covering only the first (#240, #242, #346, #239, #393,
+  #337). So the gate gets a third form: `TestServeMountMetricsParity` asserts every metrics
+  registration the FUSE mount makes is also made by `serve nfs` or documented inapplicable
+  with a reason. The three gates now cover *the flag exists* (`TestServeMountFlagParity`),
+  *the config field is set* (`TestServeMountBlockStoreConfigParity`) and *the metric is
+  exported* — each catching what the previous one structurally could not.
+
+
 ### Added
 
 - **`lith_streaming_handles_idle_{1s,5s,30s}`: the idle distribution over the readahead
