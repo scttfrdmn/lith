@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`lith_streaming_handles_idle_{1s,5s,30s}`: the idle distribution over the readahead
+  divisor's own population** ([#312](https://github.com/scttfrdmn/lith/issues/312)). An
+  instrument, not a mechanism — nothing reads these.
+
+  **Because the measurement I asked for could not answer the question.** I asked for
+  `lith_streaming_handles` against `lith_open_handles`, and it came back 49 against 160. That
+  says #311's divisor input is working — it excludes 111 descriptors, 69 % of them — and says
+  **nothing about idleness**, because a stream is counted whether it read a microsecond ago or
+  a minute ago. Both pre-registered rows on that issue were really about #311.
+
+  A follow-up timeline cell established that the idleness is real: on the dominant mount, 7 of
+  12 keys had gaps ≥ 2 s carrying **91 %** of demand events, median long gap **5.0 s**, and
+  **72 %** of those gaps contained no re-open of the key — so a held descriptor sat through
+  them. What it could not establish is magnitude, because the timeline is per **key** and
+  cannot see reads the kernel serves from the shared page cache. These gauges are per
+  **handle**, and see exactly the reads the divisor's input is computed from.
+
+  **A distribution rather than a verdict, for a stated reason:** #312's mechanism needs an idle
+  threshold, and that threshold is a tuning constant with no principled value — too short and a
+  reader pausing on compute loses its window, too long and the mechanism does nothing.
+  Exporting the shape lets the next measurement choose it. **The buckets themselves are
+  measured, not chosen:** 1 s sits inside a read burst, 5 s straddles the ExtData time-slice
+  cadence, 30 s is past any slice.
+
+  One walk of the handle map per scrape, through a single collector rather than four
+  `GaugeFunc`s — with four, one scrape could observe three buckets at one instant and the
+  denominator at another, and a stream going idle in between would make the denominator read
+  *smaller* than a bucket it contains.
+
 ### Fixed
 
 - **A strided slice reader fetches its extents instead of a whole block per read**

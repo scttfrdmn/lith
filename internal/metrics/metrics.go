@@ -447,6 +447,83 @@ func (m *Metrics) RegisterReadaheadWindow(window, openHandles, streamingHandles,
 	}, evidenceRatio))
 }
 
+// RegisterStreamIdle registers the cumulative idle distribution over established streams: how
+// many of the handles in the readahead divisor have not been read for at least 1 s, 5 s and
+// 30 s (#312).
+//
+// WHY A DISTRIBUTION AND NOT AN "IDLE HANDLES" GAUGE. #312's defect is that an established
+// stream which stops reading keeps its share of the prefetch budget, and the fix needs an idle
+// THRESHOLD -- a tuning constant with no principled value, where too short costs a reader that
+// pauses on compute its window and too long does nothing. Exporting the shape lets the next
+// measurement choose it; exporting one number would require lith to have chosen already. Two
+// defaults placed from a plausible-looking constant have been withdrawn from this project
+// (#340, #349) and neither was visible from the code.
+//
+// WHY lith_streaming_handles WAS NOT ENOUGH, which is the thing I got wrong when I asked for
+// the measurement: it counts a stream whether it read a microsecond ago or a minute ago, so
+// its gap against lith_open_handles answers "is #311's divisor input working" -- measured at
+// 49 streams against 160 descriptors, so yes -- and says NOTHING about idleness. Both of the
+// pre-registered rows I offered on that issue were really about #311.
+//
+// THE BUCKETS COME FROM A MEASUREMENT. The reporting workload reads a met file in a burst and
+// then leaves it until the next ExtData time slice, measured at a median gap of 5.0 s with 72%
+// of those gaps containing no re-open of the key. 1 s sits inside a burst, 5 s straddles the
+// cadence, 30 s is past any slice.
+//
+// NOTHING READS THESE. They are an instrument for deciding whether #312's mechanism is worth
+// its risk -- shedding a share on idleness makes the divisor change on every idle-out AND every
+// re-establish, and the divisor merely DROPPING as handles closed already produced eleven
+// dispatch bursts in one 16-reader cell.
+func (m *Metrics) RegisterStreamIdle(read func() (ge1, ge5, ge30, streams int64)) {
+	if m == nil {
+		return
+	}
+	m.reg.MustRegister(&streamIdleCollector{read: read})
+}
+
+// streamIdleCollector emits all four stream-idle series from ONE call to the FUSE layer per
+// scrape.
+//
+// A COLLECTOR RATHER THAN FOUR GaugeFuncs, and the reason is a bug I wrote first: four
+// GaugeFuncs each call the walk separately, so a single scrape can observe three buckets at
+// one instant and the denominator at another. A stream that goes idle between two of those
+// calls makes the denominator read SMALLER than a bucket it is supposed to contain -- an
+// impossible pair, arriving in a scrape an operator would then have to distrust. It also walks
+// the handle map four times for one scrape.
+//
+// I had written "one walk per scrape, so a scrape cannot see three buckets computed at one
+// instant and a denominator computed at another" in the comment at the call site while the
+// code did exactly that. The comment was the specification; this is it implemented.
+type streamIdleCollector struct {
+	read func() (ge1, ge5, ge30, streams int64)
+}
+
+var (
+	streamIdle1Desc = prometheus.NewDesc("lith_streaming_handles_idle_1s",
+		"Established streams (the readahead divisor) not read for at least 1 second. Inside a read burst on the workload this was measured against, so a nonzero value here alone is normal (#312).", nil, nil)
+	streamIdle5Desc = prometheus.NewDesc("lith_streaming_handles_idle_5s",
+		"Established streams not read for at least 5 seconds. 5 s is the measured ExtData time-slice cadence on the reporting workload -- a median long gap of 5.0 s, with 72% of those gaps containing no re-open of the key -- so mass HERE rather than at 1 s is the signature of held-idle descriptors, which is what #312 is about.", nil, nil)
+	streamIdle30Desc = prometheus.NewDesc("lith_streaming_handles_idle_30s",
+		"Established streams not read for at least 30 seconds: past any time slice on the workload measured, so a stream idle this long has been abandoned rather than paused (#312).", nil, nil)
+	streamIdleTotalDesc = prometheus.NewDesc("lith_streaming_handles_measured",
+		"Established streams the idle buckets were computed over, in the SAME walk as the buckets. The denominator for the three lith_streaming_handles_idle_* series, exported so they can be read without a second scrape; it should track lith_streaming_handles.", nil, nil)
+)
+
+func (c *streamIdleCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- streamIdle1Desc
+	ch <- streamIdle5Desc
+	ch <- streamIdle30Desc
+	ch <- streamIdleTotalDesc
+}
+
+func (c *streamIdleCollector) Collect(ch chan<- prometheus.Metric) {
+	ge1, ge5, ge30, streams := c.read()
+	ch <- prometheus.MustNewConstMetric(streamIdle1Desc, prometheus.GaugeValue, float64(ge1))
+	ch <- prometheus.MustNewConstMetric(streamIdle5Desc, prometheus.GaugeValue, float64(ge5))
+	ch <- prometheus.MustNewConstMetric(streamIdle30Desc, prometheus.GaugeValue, float64(ge30))
+	ch <- prometheus.MustNewConstMetric(streamIdleTotalDesc, prometheus.GaugeValue, float64(streams))
+}
+
 // RegisterPrefetchBudget registers gauges for what --prefetch-budget actually bounds:
 // bytes prefetch has committed and nothing has consumed, against the budget's own limit
 // (#301).

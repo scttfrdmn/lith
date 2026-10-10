@@ -5,6 +5,7 @@ package fuse
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/scttfrdmn/lith/internal/metrics"
 	"github.com/scttfrdmn/lith/internal/prefetch"
@@ -15,6 +16,23 @@ import (
 type pfWrapper struct {
 	mu sync.Mutex
 	pf *prefetch.Prefetcher
+	// lastRead is when the detector last saw a read on this handle, kept under the same mutex
+	// as the decision it belongs to -- for the same reason lastReadEnd is (#278): read outside
+	// the lock it could describe a different read.
+	//
+	// It exists to make #312's population MEASURABLE. An established stream that stops reading
+	// keeps its share of the prefetch budget, because the detector only transitions on reads
+	// and nothing collapses a handle that merely stops. lith_streaming_handles counts such a
+	// stream whether it read a microsecond ago or a minute ago, so its gap against
+	// lith_open_handles answers "did #311 work" (it did) and says nothing about idleness.
+	//
+	// An external timeline cell established that the idleness is REAL -- on the dominant mount
+	// 7 of 12 keys had gaps >= 2 s carrying 91% of demand events, median 5.0 s, and 72% of
+	// those gaps contained no re-open of the key, so a held descriptor sat through them. What
+	// it could not establish is MAGNITUDE: the timeline is per KEY, and it cannot see reads the
+	// kernel serves from the shared page cache. This is per HANDLE and sees exactly the reads
+	// the divisor's input is computed from.
+	lastRead time.Time
 	// lastReadEnd is the byte offset just past the previous read the prefetcher was
 	// driven with. It lives here, under the same mutex that serializes the handle's
 	// decisions, because the byte gap is an INPUT to Observe and has to be computed and
@@ -122,6 +140,7 @@ func (w *pfWrapper) observe(block, off, end, maxWindow int64, evRatio float64, s
 	defer w.mu.Unlock()
 	gap := off - w.lastReadEnd
 	w.lastReadEnd = end
+	w.lastRead = time.Now()
 	w.pf.SetMax(maxWindow)
 	// Per read, exactly like SetMax: the ratio is latency-derived and the endpoint's measured
 	// latency changes as fills complete. Applied under this lock, with the Observe it governs.
@@ -149,6 +168,7 @@ func (w *pfWrapper) observeContiguous(block, off, end, maxWindow int64, evRatio 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.lastReadEnd = end
+	w.lastRead = time.Now()
 	w.pf.SetMax(maxWindow)
 	w.pf.SetEvidence(evRatio, w.blockSize)
 	before := w.counterSnapshot()
@@ -289,4 +309,20 @@ func (w *pfWrapper) setHoleDemanded(fn func(off, end int64) bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pf.SetHoleDemanded(fn)
+}
+
+// idleFor reports how long since the detector last saw a read on this handle, and whether the
+// handle is an established stream — which is the only case #312 is about, because only an
+// established stream is in the divisor.
+//
+// ok is false for a handle that has never been read (its idle time would be measured from a
+// zero timestamp) and for one that is not streaming (it is not in the divisor, so its idleness
+// costs nobody anything).
+func (w *pfWrapper) idleFor(now time.Time) (time.Duration, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.lastRead.IsZero() || !w.pf.Established() {
+		return 0, false
+	}
+	return now.Sub(w.lastRead), true
 }
