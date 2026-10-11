@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-11
+
 ### Added
 
 - **`--readahead-subblock-dispatch`: a readahead dispatch can be shorter than one block**
@@ -50,22 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A finished run was not counted, so arm B was inert on every shape.** `deEstablish` cleared
-  `established` *before* calling `endRun`, and `endRun` reads that flag to decide whether there
-  was a run to end at all — so it always saw `false`, no run was ever counted, and the
-  precondition above could never be met. Found by instrumenting a walk fixture that
-  re-established four times and reported zero finished runs; **every decision-level test for the
-  arm was green while it could not fire end to end**, which is the `ttfbRecorder` shape again.
-
-- **The two-block dispatch floor was documented as 17 MiB; it is 16 MiB.** 2 × 8 MiB is 16 MiB
-  (≈17 **MB**), and the wrong unit had propagated into `--readahead-evidence-per-run`'s help,
-  `docs/knobs.md` and two places in v1.13.0's changelog section. Corrected in all four,
-  **including the released section** — a wrong figure where people read it is worse than an
-  edited historical entry — so that section now differs from the v1.13.0 release body as
-  published. Same class as #340's 5 ms, which was the wrong unit rather than the wrong value.
-
-### Fixed
-
 - **`--readahead-evidence-per-run`'s help motivated it with figures from a ratio that is no
   longer the default** ([#407](https://github.com/scttfrdmn/lith/issues/407)). The flag's help
   and its `knobs.md` row quoted "48 chunks prefetched and 2 used on GRIB ... a peak window of
@@ -86,6 +72,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 2. Both the help and the row now state the boundary, and a test pins it, because the only
   test of this arm's mechanism ran at ratio 4 and so kept passing while the default moved out
   from under it.
+
+- **A finished run was not counted, so arm B was inert on every shape.** `deEstablish` cleared
+  `established` *before* calling `endRun`, and `endRun` reads that flag to decide whether there
+  was a run to end at all — so it always saw `false`, no run was ever counted, and the
+  precondition above could never be met. Found by instrumenting a walk fixture that
+  re-established four times and reported zero finished runs; **every decision-level test for the
+  arm was green while it could not fire end to end**, which is the `ttfbRecorder` shape again.
+
+- **The two-block dispatch floor was documented as 17 MiB; it is 16 MiB.** 2 × 8 MiB is 16 MiB
+  (≈17 **MB**), and the wrong unit had propagated into `--readahead-evidence-per-run`'s help,
+  `docs/knobs.md` and two places in v1.13.0's changelog section. Corrected in all four,
+  **including the released section** — a wrong figure where people read it is worse than an
+  edited historical entry — so that section now differs from the v1.13.0 release body as
+  published. Same class as #340's 5 ms, which was the wrong unit rather than the wrong value.
 
 ## [1.13.0] - 2026-10-10
 
@@ -3422,7 +3422,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/scttfrdmn/lith/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/scttfrdmn/lith/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/scttfrdmn/lith/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/scttfrdmn/lith/compare/v1.10.0...v1.11.0
