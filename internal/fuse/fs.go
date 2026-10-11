@@ -47,6 +47,9 @@ type Config struct {
 	// handles advancing in order whose sibling reads the shared page cache absorbed.
 	CoverageMin float64
 
+	// ReadaheadEvidencePerRun makes the evidence gate read the CURRENT RUN's consumption
+	// instead of the handle's lifetime total (#407). Experimental, off by default.
+	ReadaheadEvidencePerRun bool
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
@@ -746,7 +749,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:   blockstore.Key{Key: f.objectKey(n.path), ETagHash: ix.ETagHashOf("/" + n.path)},
 		size:  fi.Size,
-		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin()),
+		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin(), f.cfg.ReadaheadEvidencePerRun),
 		pfMet: f.met.PrefetchHandleFor(sizeClass(fi.Size)),
 	}
 	f.mu.Lock()

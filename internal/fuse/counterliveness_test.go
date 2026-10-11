@@ -25,7 +25,7 @@ func TestCountersAreProducedPerReadNotAtRelease(t *testing.T) {
 	// A handle whose own stream is punctate — the #316 shape, where the shared page cache has
 	// absorbed the sibling reads of a dense scan. Irregular holes, because a CONSTANT stride
 	// lands in the Strided branch instead.
-	w := newPFWrapper(223, blockSize, 0, coverageMin)
+	w := newPFWrapper(223, blockSize, 0, coverageMin, false)
 	steps := []int64{4, 3, 5, 4, 2, 6, 4, 3}
 	var off int64
 	var total int64
@@ -41,7 +41,7 @@ func TestCountersAreProducedPerReadNotAtRelease(t *testing.T) {
 
 	// A seeking handle moves the other coverage counter and the reset counter, again from the
 	// read itself.
-	w2 := newPFWrapper(223, blockSize, 0, coverageMin)
+	w2 := newPFWrapper(223, blockSize, 0, coverageMin, false)
 	var seeks, resets int64
 	for i := int64(0); i < 48; i++ {
 		// Dense enough to establish, then a far jump, repeatedly.
@@ -62,7 +62,7 @@ func TestCountersAreProducedPerReadNotAtRelease(t *testing.T) {
 	// phase is plumbing: if the gate's default is ever flipped, its action has to be visible
 	// on a running job or there is no way to tell a window the gate refused from one the
 	// detector never wanted.
-	w3 := newPFWrapper(223, blockSize, 0, coverageMin)
+	w3 := newPFWrapper(223, blockSize, 0, coverageMin, false)
 	var held, withheld int64
 	for i := int64(0); i < 32; i++ {
 		o := i * blockSize
@@ -92,7 +92,7 @@ func TestCountersAreProducedPerReadNotAtRelease(t *testing.T) {
 func TestCountersAreDeltasNotTotals(t *testing.T) {
 	const blockSize = int64(8) << 20
 	var seq atomic.Int64
-	w := newPFWrapper(223, blockSize, 0, coverageMin)
+	w := newPFWrapper(223, blockSize, 0, coverageMin, false)
 
 	// Ratio 4 and a dense scan: the handle establishes and then under-earns for its first ~56
 	// reads, so the cumulative total climbs steadily and a delta must stay small and bounded.

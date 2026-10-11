@@ -72,7 +72,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64, perRunEvidence bool) *pfWrapper {
 	// blockSize is retained so the evidence ratio can be re-applied per read: the gate's
 	// ratio is now latency-derived and so time-varying, where it used to be latched here
 	// from the flag (#284/#292).
@@ -88,6 +88,10 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64) 
 	// ~384 KiB of contiguous evidence cannot buy a NIC-sized bet (#256). Off by
 	// default; ratio <= 0 is a no-op.
 	pf.SetEvidence(evidenceRatio, blockSize)
+	// Which consumption figure that gate reads: the handle's lifetime total, or the current
+	// contiguous run's (#407). Experimental and off by default -- it is the first arm of a 2x2
+	// whose other arm is not built, and the shapes it targets are measured externally.
+	pf.SetPerRunEvidence(perRunEvidence)
 	return &pfWrapper{pf: pf, blockSize: blockSize}
 }
 

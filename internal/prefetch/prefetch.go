@@ -122,8 +122,27 @@ type Prefetcher struct {
 	evidenceRatio float64
 	evidenceBlock int64 // block size in bytes, to convert the byte bound to blocks
 	consumed      int64 // cumulative bytes this handle has read
-	evidenceHeld  int64 // times the gate held the window below maxReadahead
-	evidenceCut   int64 // cumulative blocks withheld by those holds
+	// runConsumed is bytes read since this RUN began, where a run ends when the handle stops
+	// making contiguous progress -- a seek out of an established pattern, a scattered
+	// landing, or a de-establishment (#407).
+	//
+	// WHY IT EXISTS. `consumed` is cumulative over the handle's whole life and is never
+	// reset, so windowCap authorizes a window from LIFETIME consumption. On a
+	// scattered-but-locally-sequential walk -- a GRIB .idx field sweep, an HDF5 chunk walk,
+	// a FITS cutout's row bands -- every run is 0.5-2 MB, and by the third one the handle has
+	// earned a window no single run can justify, then re-places that bet at every
+	// re-establishment. An external sweep measured the consequence: 48 chunks prefetched and
+	// 2 used on GRIB, 71/11 on HEMCO, 47/13 on FITS.
+	//
+	// The arithmetic reproduces it exactly: 91 reads of 128 KiB is 11.9 MB consumed, which at
+	// ratio 4 over an 8 MiB block earns 5.69 -> 5 blocks, and the measured peak window was 5.
+	runConsumed int64
+	// perRunEvidence makes windowCap read runConsumed instead of consumed. OFF by default:
+	// this is the first arm of a 2x2 that has not been measured, and the second arm
+	// (sub-block dispatch) is not built. See windowCap for why one arm may not be enough.
+	perRunEvidence bool
+	evidenceHeld   int64 // times the gate held the window below maxReadahead
+	evidenceCut    int64 // cumulative blocks withheld by those holds
 
 	// deEstablished (#256) counts losses of an establishment that existed — the
 	// oscillation establish -> commit -> jump -> de-establish. It is deliberately
@@ -224,6 +243,11 @@ func (p *Prefetcher) SetEvidence(ratio float64, blockSize int64) {
 	p.evidenceBlock = blockSize
 }
 
+// SetPerRunEvidence selects which consumption figure the evidence gate reads: the handle's
+// LIFETIME total (false, today's behaviour) or the CURRENT RUN's (true, #407). See the
+// runConsumed field for why the distinction matters and what it cannot fix on its own.
+func (p *Prefetcher) SetPerRunEvidence(on bool) { p.perRunEvidence = on }
+
 // EvidenceHeld reports how many times the evidence gate held a window below the
 // configured maximum (#256). Zero when the gate is disabled.
 func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
@@ -247,7 +271,18 @@ func (p *Prefetcher) deEstablish() {
 		p.deEstablished++
 	}
 	p.established = false
+	p.endRun()
 }
+
+// endRun marks the current contiguous run as over, so per-run evidence starts again from zero
+// (#407). Called from deEstablish and from the seek re-anchor -- which keeps the handle
+// Sequential and therefore does NOT de-establish, and is exactly the branch a GRIB field sweep
+// takes between fields.
+//
+// A genuine sequential copy never reaches either, so its run is the whole file and this is a
+// no-op for it. That is the witness #231 refuted three cold-start fixes against, and the reason
+// the reset is placed at run boundaries rather than on a timer.
+func (p *Prefetcher) endRun() { p.runConsumed = 0 }
 
 // windowCap is the largest window, in blocks, this handle's demonstrated
 // consumption justifies. It is maxReadahead when the gate is off, and never
@@ -257,7 +292,11 @@ func (p *Prefetcher) windowCap() int64 {
 	if p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
 		return p.maxReadahead
 	}
-	earned := int64(float64(p.consumed)*p.evidenceRatio) / p.evidenceBlock
+	basis := p.consumed
+	if p.perRunEvidence {
+		basis = p.runConsumed
+	}
+	earned := int64(float64(basis)*p.evidenceRatio) / p.evidenceBlock
 	if earned < initialWindow {
 		earned = initialWindow
 	}
@@ -462,6 +501,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 	// whether the coverage gate is enabled (#256).
 	if length > 0 {
 		p.consumed += length
+		p.runConsumed += length
 	}
 	cov := p.recordRead(off, length)
 	if !p.haveLast {
@@ -671,6 +711,10 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		p.pending = true
 		p.cursor = blockIdx
 		p.frontier = blockIdx
+		// The run ended here even though the handle stays Sequential (#407). This is the branch
+		// a field-at-a-time walk takes between fields, and leaving runConsumed alone would make
+		// per-run evidence identical to cumulative evidence for the exact shape it exists for.
+		p.endRun()
 		return p.advance(blockIdx + initialWindow)
 	}
 	// From Cold/Random with no pending jump: tentative — wait to see if this is
