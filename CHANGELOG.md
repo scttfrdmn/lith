@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--readahead-evidence-per-run`'s help motivated it with figures from a ratio that is no
+  longer the default** ([#407](https://github.com/scttfrdmn/lith/issues/407)). The flag's help
+  and its `knobs.md` row quoted "48 chunks prefetched and 2 used on GRIB ... a peak window of
+  5 blocks", all measured at **ratio 4** — and v1.13.0 moved the in-region default to **2**, at
+  which point **the flag does nothing at all on that shape**. 11.9 MB at ratio 2 over an 8 MiB
+  block earns 2.84 blocks, which floors to the same 2 blocks a 0.5–2 MB run earns, so both
+  bases return the identical window.
+
+  **Caught by an external null result that was structural rather than informative.** A sweep on
+  the v1.13.0 artifact measured this flag identical to the default on all three walk shapes and
+  recommended retiring it. The arms were identical **by arithmetic** on that shape, so the cell
+  had no power to separate them — the same reading that made ratio 1's tie with ratio 2
+  uninformative, pointed the other way. The flag is kept.
+
+  Discrimination starts at a lifetime consumption of `3 × block ÷ ratio` = **12.6 MB** at the
+  defaults, and the measured shape sits **5.2% below it**. Above the boundary the cumulative
+  basis grows without bound — 4 blocks at 20 MB, 23 at 100 MB — while a short run stays pinned
+  at 2. Both the help and the row now state the boundary, and a test pins it, because the only
+  test of this arm's mechanism ran at ratio 4 and so kept passing while the default moved out
+  from under it.
+
 ## [1.13.0] - 2026-10-10
 
 ### Added
