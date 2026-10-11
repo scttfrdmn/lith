@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-10-10
+
 ### Added
 
 - **`--readahead-evidence-per-run`: the evidence gate can measure the current run instead of
@@ -44,6 +46,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no operator can see it. Keyed on the help text rather than a list, so a new experimental flag
   is covered the moment it is written.
 
+- **`lith_streaming_handles_idle_{1s,5s,30s}`: the idle distribution over the readahead
+  divisor's own population** ([#312](https://github.com/scttfrdmn/lith/issues/312)). An
+  instrument, not a mechanism — nothing reads these.
+
+  **Because the measurement I asked for could not answer the question.** I asked for
+  `lith_streaming_handles` against `lith_open_handles`, and it came back 49 against 160. That
+  says #311's divisor input is working — it excludes 111 descriptors, 69 % of them — and says
+  **nothing about idleness**, because a stream is counted whether it read a microsecond ago or
+  a minute ago. Both pre-registered rows on that issue were really about #311.
+
+  A follow-up timeline cell established that the idleness is real: on the dominant mount, 7 of
+  12 keys had gaps ≥ 2 s carrying **91 %** of demand events, median long gap **5.0 s**, and
+  **72 %** of those gaps contained no re-open of the key — so a held descriptor sat through
+  them. What it could not establish is magnitude, because the timeline is per **key** and
+  cannot see reads the kernel serves from the shared page cache. These gauges are per
+  **handle**, and see exactly the reads the divisor's input is computed from.
+
+  **A distribution rather than a verdict, for a stated reason:** #312's mechanism needs an idle
+  threshold, and that threshold is a tuning constant with no principled value — too short and a
+  reader pausing on compute loses its window, too long and the mechanism does nothing.
+  Exporting the shape lets the next measurement choose it. **The buckets themselves are
+  measured, not chosen:** 1 s sits inside a read burst, 5 s straddles the ExtData time-slice
+  cadence, 30 s is past any slice.
+
+  One walk of the handle map per scrape, through a single collector rather than four
+  `GaugeFunc`s — with four, one scrape could observe three buckets at one instant and the
+  denominator at another, and a stream going idle in between would make the denominator read
+  *smaller* than a bucket it contains.
+
+- **Docs: a root-created mount needs a root-run readiness check.** Reported from a benchmark
+  harness: `mountpoint -q` as a non-root user **cannot stat a root-owned FUSE mount**, so it
+  reports *not mounted* while the mount is in fact serving — a readiness loop times out and, in
+  their case, three mounts stacked up behind one failed check. `lith mounts` does not rescue
+  you either, for a different reason: it reads a **per-user** record directory and deliberately
+  ignores records from a directory it does not own, so a root-created mount is equally
+  invisible to a non-root `lith mounts`. The rule is the same for both tools, and it was in
+  neither the docs nor anyone's head.
+
+  **Both directions, because the note cost a measurement in the other one.** The first version
+  of this warned only about a non-root check against a root-owned mount. A later harness ran
+  `sudo mountpoint` against a **user-owned** mount, which fails the same way — every cell in
+  that sweep sat idle for its full 60 s timeout, and the run initially read as a 1.17×
+  speed-up that the reporter then withdrew. The note now says the check and the mount must be
+  run by the same user, rather than naming one of the two mismatches.
+
+- **`lith_fill_seconds{kind}`: what a fault costs, as a scrape rather than a judgement**
+  ([#362](https://github.com/scttfrdmn/lith/issues/362), condition 2). An operator mounted a
+  1.206 TB kraken2 database, ran a tool that classified **zero reads in eleven minutes**, and
+  spent three instances and most of a day establishing that **the mount was working
+  correctly** — it was in [#232](https://github.com/scttfrdmn/lith/issues/232)'s regime, a
+  serial fault stream at ~141 ms per 4 KiB probe, which lith has no lever to speed up. In
+  their words: *"the per-fault latency, the fill kind, and the random-vs-sequential
+  classification are all things lith knows and I couldn't see."*
+
+  Fill first-byte latency is now exported under the same `kind` label as
+  `lith_fill_bytes_total`. `kind="demand"` is a fill **no prediction covered**, which is the
+  fault-stream shape: its quantiles answer *what is a fault costing me*, its `_count` answers
+  *how many faults*, and its share against `kind="whole"` answers *is this mount streaming or
+  faulting*. Those are the three things they could not see.
+
+  **Labelled by fill kind rather than by detector state**, which is what the issue's framing
+  suggested. The kind is already decided at every call site of the fetch seam, where the
+  prefetch detector's state lives in `internal/fuse` and would have to be plumbed down through
+  the blockstore; and the kind is the more direct answer, because it says what lith *did*
+  rather than what it predicted.
+
+  **No threshold and no verdict.** Read it with `lith_ttfb_floor_seconds`, which is
+  load-invariant by construction, and the diagnosis reads itself: demand fills at ~141 ms
+  against a ~19 ms endpoint floor is one round trip per miss. `docs/copy-or-mount.md` now
+  carries the three queries and how to read them, including the case that is *not* this
+  regime — demand latency far above the floor is queueing, not S3. Two defaults placed from a
+  plausible-looking constant have already had to be withdrawn here
+  ([#340](https://github.com/scttfrdmn/lith/issues/340),
+  [#349](https://github.com/scttfrdmn/lith/issues/349)), and "is my workload in this regime"
+  is a question about the workload.
 
 ### Changed
 
@@ -116,9 +193,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test asserts the new semantics: mounting eight clients changes nothing, reading eight paths
   divides the budget eight ways.
 
-
-### Fixed
-
 - **The NFS gateway exported the pressure gate's hold count but not the pressure itself**
   ([#337](https://github.com/scttfrdmn/lith/issues/337)). `RegisterPrefetchBudget` was called
   from `internal/fuse` and nowhere else, so an export published
@@ -139,40 +213,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *the config field is set* (`TestServeMountBlockStoreConfigParity`) and *the metric is
   exported* — each catching what the previous one structurally could not.
 
-
-### Added
-
-- **`lith_streaming_handles_idle_{1s,5s,30s}`: the idle distribution over the readahead
-  divisor's own population** ([#312](https://github.com/scttfrdmn/lith/issues/312)). An
-  instrument, not a mechanism — nothing reads these.
-
-  **Because the measurement I asked for could not answer the question.** I asked for
-  `lith_streaming_handles` against `lith_open_handles`, and it came back 49 against 160. That
-  says #311's divisor input is working — it excludes 111 descriptors, 69 % of them — and says
-  **nothing about idleness**, because a stream is counted whether it read a microsecond ago or
-  a minute ago. Both pre-registered rows on that issue were really about #311.
-
-  A follow-up timeline cell established that the idleness is real: on the dominant mount, 7 of
-  12 keys had gaps ≥ 2 s carrying **91 %** of demand events, median long gap **5.0 s**, and
-  **72 %** of those gaps contained no re-open of the key — so a held descriptor sat through
-  them. What it could not establish is magnitude, because the timeline is per **key** and
-  cannot see reads the kernel serves from the shared page cache. These gauges are per
-  **handle**, and see exactly the reads the divisor's input is computed from.
-
-  **A distribution rather than a verdict, for a stated reason:** #312's mechanism needs an idle
-  threshold, and that threshold is a tuning constant with no principled value — too short and a
-  reader pausing on compute loses its window, too long and the mechanism does nothing.
-  Exporting the shape lets the next measurement choose it. **The buckets themselves are
-  measured, not chosen:** 1 s sits inside a read burst, 5 s straddles the ExtData time-slice
-  cadence, 30 s is past any slice.
-
-  One walk of the handle map per scrape, through a single collector rather than four
-  `GaugeFunc`s — with four, one scrape could observe three buckets at one instant and the
-  denominator at another, and a stream going idle in between would make the denominator read
-  *smaller* than a bucket it contains.
-
-### Fixed
-
 - **`doctor`'s NIC verdict claimed "no IMDS type" on a box where IMDS had returned one**
   ([#317](https://github.com/scttfrdmn/lith/issues/317)). Reported from the
   `c8gn.48xlarge` this was built for, and it is my own regression from #394. Before that
@@ -186,7 +226,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`doctor`'s fuse3 install hint named `apt` only** — wrong on the AL2023 AMI the check
   actually fires on, which needs `dnf`. Also reported from the same run. Both package managers
   are now named, and a test fails if either is dropped.
-
 
 - **A strided slice reader fetches its extents instead of a whole block per read**
   ([#222](https://github.com/scttfrdmn/lith/issues/222)). A FITS 2-D cutout walking row
@@ -235,19 +274,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   landing, so a strided reader that occasionally jumps out of band still pays that path. It is
   the third of #222's three over-fetch paths and it needs its own measurement.
 
-### Added
-
-- **Docs: a root-created mount needs a root-run readiness check.** Reported from a benchmark
-  harness: `mountpoint -q` as a non-root user **cannot stat a root-owned FUSE mount**, so it
-  reports *not mounted* while the mount is in fact serving — a readiness loop times out and, in
-  their case, three mounts stacked up behind one failed check. `lith mounts` does not rescue
-  you either, for a different reason: it reads a **per-user** record directory and deliberately
-  ignores records from a directory it does not own, so a root-created mount is equally
-  invisible to a non-root `lith mounts`. The rule is the same for both tools, and it was in
-  neither the docs nor anyone's head.
-
-### Fixed
-
 - **`--mem-cache`'s per-daemon arithmetic was wrong by 2×, and the refuted additive claim was
   still in the same docs row** ([#314](https://github.com/scttfrdmn/lith/issues/314)). The GC
   model #392 proposed is now **measured**, externally, in three arms that differ 3× in
@@ -276,40 +302,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names the one constraint on `GOMEMLIMIT` that follows from it: the limit must sit
   **comfortably above the tier**, or the collector thrashes trying to reclaim a live set it
   cannot shrink.
-
-### Added
-
-- **`lith_fill_seconds{kind}`: what a fault costs, as a scrape rather than a judgement**
-  ([#362](https://github.com/scttfrdmn/lith/issues/362), condition 2). An operator mounted a
-  1.206 TB kraken2 database, ran a tool that classified **zero reads in eleven minutes**, and
-  spent three instances and most of a day establishing that **the mount was working
-  correctly** — it was in [#232](https://github.com/scttfrdmn/lith/issues/232)'s regime, a
-  serial fault stream at ~141 ms per 4 KiB probe, which lith has no lever to speed up. In
-  their words: *"the per-fault latency, the fill kind, and the random-vs-sequential
-  classification are all things lith knows and I couldn't see."*
-
-  Fill first-byte latency is now exported under the same `kind` label as
-  `lith_fill_bytes_total`. `kind="demand"` is a fill **no prediction covered**, which is the
-  fault-stream shape: its quantiles answer *what is a fault costing me*, its `_count` answers
-  *how many faults*, and its share against `kind="whole"` answers *is this mount streaming or
-  faulting*. Those are the three things they could not see.
-
-  **Labelled by fill kind rather than by detector state**, which is what the issue's framing
-  suggested. The kind is already decided at every call site of the fetch seam, where the
-  prefetch detector's state lives in `internal/fuse` and would have to be plumbed down through
-  the blockstore; and the kind is the more direct answer, because it says what lith *did*
-  rather than what it predicted.
-
-  **No threshold and no verdict.** Read it with `lith_ttfb_floor_seconds`, which is
-  load-invariant by construction, and the diagnosis reads itself: demand fills at ~141 ms
-  against a ~19 ms endpoint floor is one round trip per miss. `docs/copy-or-mount.md` now
-  carries the three queries and how to read them, including the case that is *not* this
-  regime — demand latency far above the floor is queueing, not S3. Two defaults placed from a
-  plausible-looking constant have already had to be withdrawn here
-  ([#340](https://github.com/scttfrdmn/lith/issues/340),
-  [#349](https://github.com/scttfrdmn/lith/issues/349)), and "is my workload in this regime"
-  is a question about the workload.
-
 
 ## [1.12.0] - 2026-10-09
 
@@ -3350,7 +3342,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/scttfrdmn/lith/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/scttfrdmn/lith/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/scttfrdmn/lith/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/scttfrdmn/lith/compare/v1.9.0...v1.10.0
