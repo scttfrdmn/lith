@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--readahead-subblock-dispatch`: a readahead dispatch can be shorter than one block**
+  ([#407](https://github.com/scttfrdmn/lith/issues/407), arm B). Experimental, off by default.
+
+  The evidence gate is denominated in **blocks** and floors at 2, so the smallest window any
+  established handle can be given is **16 MiB** at the default 8 MiB block — while a GRIB `.idx`
+  field sweep, an HDF5 chunk walk and a FITS cutout's row bands all read **0.5–2 MB per run**.
+  This converts that residual from blocks into bytes: a handle that has earned less than the
+  floor is dispatched a contiguous span of exactly what it earned, placed immediately after the
+  read that earned it, and fetched through the same extent path a strided prediction uses.
+
+  **This is what makes `--readahead-evidence-per-run` able to do anything.** That arm shipped in
+  v1.13.0 and an external sweep then measured it identical to the default on all three walk
+  shapes. The null was structural — arm A correctly shrinks the earned window and the block floor
+  hands the same dispatch straight back. Measured locally on a 7-field walk fixture, dispatched
+  bytes over the 2×2:
+
+  | | arm B off | arm B on |
+  |---|---|---|
+  | **per-run off** | baseline | decays to **1.03×** |
+  | **per-run on** | **1.00×** (exactly inert) | **12.1×** |
+
+  **Neither arm alone holds up, and they fail for different reasons** — which is why they are two
+  flags rather than one default. Arm A is *exactly* inert, to the byte. Arm B alone is not inert
+  but **decays**: it reads lifetime consumption, which grows past the floor's worth within a few
+  runs, after which it switches itself off — its span count pins at 13 whether the walk is 8
+  fields or 64, while the pair issues one per landing indefinitely. This is [#222](https://github.com/scttfrdmn/lith/issues/222)'s
+  precedent repeating, where each half alone made bytes *worse* and only both together gave 16×.
+
+  End to end against a fake S3, the pair takes a walk from **7.20× to 3.55×** over-fetch —
+  **2.03× fewer bytes** — moving fills from `kind="whole"` to `kind="prefetch-range"`, which is
+  how the change is visible from outside.
+
+  **It cannot reach a streaming reader, and that is a precondition rather than a threshold.** The
+  arm engages only for a handle that has finished an *established* run, which a sequential copy
+  never does. Today the 2-block floor is what protects that reader, so an arm that removes the
+  floor has to carry the protection itself — [#233](https://github.com/scttfrdmn/lith/issues/233)
+  says a cold sequential read should fetch *more*, and [#231](https://github.com/scttfrdmn/lith/issues/231)
+  refuted three attempts to make it fetch sooner.
+
+### Fixed
+
+- **A finished run was not counted, so arm B was inert on every shape.** `deEstablish` cleared
+  `established` *before* calling `endRun`, and `endRun` reads that flag to decide whether there
+  was a run to end at all — so it always saw `false`, no run was ever counted, and the
+  precondition above could never be met. Found by instrumenting a walk fixture that
+  re-established four times and reported zero finished runs; **every decision-level test for the
+  arm was green while it could not fire end to end**, which is the `ttfbRecorder` shape again.
+
+- **The two-block dispatch floor was documented as 17 MiB; it is 16 MiB.** 2 × 8 MiB is 16 MiB
+  (≈17 **MB**), and the wrong unit had propagated into `--readahead-evidence-per-run`'s help,
+  `docs/knobs.md` and two places in v1.13.0's changelog section. Corrected in all four,
+  **including the released section** — a wrong figure where people read it is worse than an
+  edited historical entry — so that section now differs from the v1.13.0 release body as
+  published. Same class as #340's 5 ms, which was the wrong unit rather than the wrong value.
+
 ### Fixed
 
 - **`--readahead-evidence-per-run`'s help motivated it with figures from a ratio that is no
@@ -58,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a read count.
 
   **Necessary and not sufficient, which is why it is a flag and not a fix.** The dispatch floor
-  is 2 blocks — **17 MiB** at the default block size — so a 1 MB run still floors far above what
+  is 2 blocks — **16 MiB** at the default block size — so a 1 MB run still floors far above what
   it wants. Closing the rest needs **sub-block dispatch**, which is not built. The one precedent
   for this pair (#222) found each half alone made bytes *worse* and only both together gave 16×,
   so the halves have to be measurable separately.
@@ -165,7 +222,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a constant per concurrency level.
 
   **Ratio 1 is not better than 2**, measured identical on all three walk shapes (GRIB, HEMCO,
-  FITS): by then every window is pinned at the 2-block dispatch floor — **17 MiB** at the default
+  FITS): by then every window is pinned at the 2-block dispatch floor — **16 MiB** at the default
   block size — and the ratio has stopped being the binding constraint. That residual is
   sub-block dispatch's to close, not this default's. The test records 4, 2 and 1 as the three
   values anyone has measured and **fails on any other**, so the next person to move it has to
