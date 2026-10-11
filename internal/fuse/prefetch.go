@@ -72,7 +72,7 @@ const (
 	coverageMin    = 0.5
 )
 
-func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64, perRunEvidence bool) *pfWrapper {
+func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64, perRunEvidence, subBlock bool) *pfWrapper {
 	// blockSize is retained so the evidence ratio can be re-applied per read: the gate's
 	// ratio is now latency-derived and so time-varying, where it used to be latched here
 	// from the flag (#284/#292).
@@ -92,6 +92,11 @@ func newPFWrapper(maxReadahead, blockSize int64, evidenceRatio, covMin float64, 
 	// contiguous run's (#407). Experimental and off by default -- it is the first arm of a 2x2
 	// whose other arm is not built, and the shapes it targets are measured externally.
 	pf.SetPerRunEvidence(perRunEvidence)
+	// Whether a dispatch may be SHORTER THAN ONE BLOCK when that is all the evidence earns
+	// (#407 arm B). Experimental and off by default. It is the other arm of the same 2x2,
+	// and the one that makes the first arm able to do anything -- windowCap floors at 2
+	// blocks, so arm A alone reduces a window it is then handed back.
+	pf.SetSubBlockDispatch(subBlock)
 	return &pfWrapper{pf: pf, blockSize: blockSize}
 }
 

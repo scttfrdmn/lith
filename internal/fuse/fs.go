@@ -50,6 +50,11 @@ type Config struct {
 	// ReadaheadEvidencePerRun makes the evidence gate read the CURRENT RUN's consumption
 	// instead of the handle's lifetime total (#407). Experimental, off by default.
 	ReadaheadEvidencePerRun bool
+	// ReadaheadSubBlock lets a dispatch be shorter than one block when that is all the
+	// handle's evidence earns (#407 arm B). Experimental, off by default. It is what makes
+	// ReadaheadEvidencePerRun able to change anything: the window is denominated in blocks
+	// and floors at 2, so the first arm alone reduces a window the floor then hands back.
+	ReadaheadSubBlock bool
 	// ReadaheadEvidenceRatio bounds a committed readahead window to this multiple
 	// of the bytes a handle has actually read (#256). 0 disables (default).
 	ReadaheadEvidenceRatio float64
@@ -749,7 +754,7 @@ func (f *rawFS) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenO
 	h := &fileHandle{
 		key:   blockstore.Key{Key: f.objectKey(n.path), ETagHash: ix.ETagHashOf("/" + n.path)},
 		size:  fi.Size,
-		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin(), f.cfg.ReadaheadEvidencePerRun),
+		pf:    newPFWrapper(f.maxReadahead(), f.blockSize, f.cfg.ReadaheadEvidenceRatio, f.coverageMin(), f.cfg.ReadaheadEvidencePerRun, f.cfg.ReadaheadSubBlock),
 		pfMet: f.met.PrefetchHandleFor(sizeClass(fi.Size)),
 	}
 	f.mu.Lock()
@@ -1053,6 +1058,16 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// A strided BULK reader reports a whole-chunk ReadLen, fails the threshold, and keeps
 		// whole blocks -- its next block genuinely is wanted whole.
 		for _, pd := range obs.dispatch {
+			// #407 arm B: a Span is an amount the handle's evidence has ALREADY EARNED, so it
+			// is fetched as given and no threshold is consulted. Putting it through ReadLen's
+			// small-read threshold would drop every span above that threshold back to a whole
+			// block -- which is most of them, and precisely the shapes this arm exists for.
+			// The detector says how MUCH; this layer owns the byte offsets, so it places the
+			// span immediately after the read that earned it.
+			if pd.Span > 0 {
+				go f.store.PrefetchRange(f.ctx, h.key, end, pd.Span, h.size)
+				continue
+			}
 			if t := f.byteExactThreshold(); pd.ReadLen > 0 && t > 0 && pd.ReadLen <= t {
 				// The predicted read sits at the same offset WITHIN its block as the read
 				// that predicted it, which is what a constant stride means.

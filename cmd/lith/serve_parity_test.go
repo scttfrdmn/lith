@@ -29,16 +29,17 @@ var serveInapplicable = map[string]string{
 	// FUSE read-path / prefetch-policy features. The NFS gateway read path uses its
 	// own per-path concurrent block prefetch, not the FUSE prefetch policy, so these
 	// have no effect on it.
-	"small-file":                 "FUSE prefetch policy (#69); gateway read path does not use it",
-	"parts-max":                  "FUSE small-file parts (#69); gateway read path does not use it",
-	"footer-tier2":               "FUSE footer projection (#108); gateway read path does not use it",
-	"sibling-readahead":          "FUSE sibling readahead (#63); gateway read path does not use it",
-	"sibling-window":             "FUSE sibling detection (#63); gateway read path does not use it",
-	"max-readahead":              "FUSE per-handle readahead window; gateway uses its per-client window",
-	"readahead-evidence-ratio":   "FUSE per-handle window evidence gate (#256); internal/nfs has no prefetcher at all",
-	"readahead-evidence-per-run": "which consumption figure that same gate reads (#407); internal/nfs has no prefetcher at all",
-	"prefetch-coverage-min":      "FUSE per-handle coverage gate (#221/#316); internal/nfs has no prefetcher at all",
-	"bgzf-whole-file-max":        "FUSE bgzf prefetch (#107); gateway read path does not use it",
+	"small-file":                  "FUSE prefetch policy (#69); gateway read path does not use it",
+	"parts-max":                   "FUSE small-file parts (#69); gateway read path does not use it",
+	"footer-tier2":                "FUSE footer projection (#108); gateway read path does not use it",
+	"sibling-readahead":           "FUSE sibling readahead (#63); gateway read path does not use it",
+	"sibling-window":              "FUSE sibling detection (#63); gateway read path does not use it",
+	"max-readahead":               "FUSE per-handle readahead window; gateway uses its per-client window",
+	"readahead-evidence-ratio":    "FUSE per-handle window evidence gate (#256); internal/nfs has no prefetcher at all",
+	"readahead-evidence-per-run":  "which consumption figure that same gate reads (#407); internal/nfs has no prefetcher at all",
+	"readahead-subblock-dispatch": "the same gate's sub-block residual (#407 arm B); internal/nfs has no prefetcher at all, so it has no block-denominated window to bound",
+	"prefetch-coverage-min":       "FUSE per-handle coverage gate (#221/#316); internal/nfs has no prefetcher at all",
+	"bgzf-whole-file-max":         "FUSE bgzf prefetch (#107); gateway read path does not use it",
 	// Diagnostics / internal.
 	"timeline-csv": "FUSE per-chunk diagnostic (#70)",
 	"pf-trace":     "FUSE access-pattern detector trace (#262); internal/nfs has no prefetcher at all",

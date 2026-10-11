@@ -138,11 +138,26 @@ type Prefetcher struct {
 	// ratio 4 over an 8 MiB block earns 5.69 -> 5 blocks, and the measured peak window was 5.
 	runConsumed int64
 	// perRunEvidence makes windowCap read runConsumed instead of consumed. OFF by default:
-	// this is the first arm of a 2x2 that has not been measured, and the second arm
-	// (sub-block dispatch) is not built. See windowCap for why one arm may not be enough.
+	// this is the first arm of a 2x2, and it is INERT ON ITS OWN at the current default ratio
+	// -- see subBlockSpan, which is the other arm and the reason.
 	perRunEvidence bool
-	evidenceHeld   int64 // times the gate held the window below maxReadahead
-	evidenceCut    int64 // cumulative blocks withheld by those holds
+	// subBlock lets a dispatch be SHORTER THAN ONE BLOCK when that is all the handle's
+	// evidence earns -- the second arm of #407's 2x2. OFF by default. See subBlockSpan.
+	subBlock bool
+	// runsEnded counts contiguous runs this handle has finished: a seek out of an established
+	// pattern, a scattered landing, or a de-establishment. It is the EVIDENCE THAT A HANDLE
+	// TAKES SHORT RUNS AT ALL, and subBlockSpan requires it to be non-zero.
+	//
+	// Without that requirement sub-block dispatch would fire on every handle's FIRST reads,
+	// where consumption is small for the ordinary reason that the handle has barely started --
+	// and #233 establishes that a cold SEQUENTIAL read should fetch MORE, not less, with three
+	// ways of making it fetch sooner refuted in #231. A genuine sequential copy never ends a
+	// run, so this is zero for it forever and the arm cannot reach it. That is the same witness
+	// perRunEvidence is built on, used here as a precondition rather than a basis.
+	runsEnded    int64
+	spansIssued  int64 // dispatches bounded to a sub-block span
+	evidenceHeld int64 // times the gate held the window below maxReadahead
+	evidenceCut  int64 // cumulative blocks withheld by those holds
 
 	// deEstablished (#256) counts losses of an establishment that existed — the
 	// oscillation establish -> commit -> jump -> de-establish. It is deliberately
@@ -248,6 +263,17 @@ func (p *Prefetcher) SetEvidence(ratio float64, blockSize int64) {
 // runConsumed field for why the distinction matters and what it cannot fix on its own.
 func (p *Prefetcher) SetPerRunEvidence(on bool) { p.perRunEvidence = on }
 
+// SetSubBlockDispatch allows a dispatch shorter than one block when that is all the handle's
+// evidence earns (#407 arm B). Off by default; see subBlockSpan.
+func (p *Prefetcher) SetSubBlockDispatch(on bool) { p.subBlock = on }
+
+// SpansIssued is how many dispatches this handle bounded to a sub-block span rather than
+// whole blocks. Zero on every handle that is not a short-run walk, by construction.
+func (p *Prefetcher) SpansIssued() int64 { return p.spansIssued }
+
+// RunsEnded is how many contiguous runs this handle has finished. Zero for a sequential copy.
+func (p *Prefetcher) RunsEnded() int64 { return p.runsEnded }
+
 // EvidenceHeld reports how many times the evidence gate held a window below the
 // configured maximum (#256). Zero when the gate is disabled.
 func (p *Prefetcher) EvidenceHeld() int64 { return p.evidenceHeld }
@@ -270,8 +296,13 @@ func (p *Prefetcher) deEstablish() {
 	if p.established {
 		p.deEstablished++
 	}
-	p.established = false
+	// END THE RUN BEFORE DROPPING ESTABLISHMENT, because endRun reads `established` to decide
+	// whether there was a run to end at all (#407 arm B). With the clear first, it always saw
+	// false, so no run was ever counted and arm B's precondition could never be met -- the arm
+	// was inert on every shape, through a green test run of its own decision-level tests. Found
+	// by instrumenting a walk fixture that re-established four times and reported runsEnded=0.
 	p.endRun()
+	p.established = false
 }
 
 // endRun marks the current contiguous run as over, so per-run evidence starts again from zero
@@ -282,7 +313,25 @@ func (p *Prefetcher) deEstablish() {
 // A genuine sequential copy never reaches either, so its run is the whole file and this is a
 // no-op for it. That is the witness #231 refuted three cold-start fixes against, and the reason
 // the reset is placed at run boundaries rather than on a timer.
-func (p *Prefetcher) endRun() { p.runConsumed = 0 }
+func (p *Prefetcher) endRun() {
+	// ★ COUNT ONLY A RUN THERE ACTUALLY WAS ONE OF, which is narrower than "endRun was called"
+	// and the distinction is load-bearing for arm B.
+	//
+	// deEstablish calls endRun, and the #221 coverage gate de-establishes on the first reads of
+	// EVERY handle -- coverageOK needs covReads=3 trailing spans before it can judge, so reads
+	// 1 and 2 of a plain sequential copy take the coverage-held branch. Incrementing on every
+	// call therefore gave a copy runsEnded=2 before it had established anything, which would
+	// let subBlockSpan bound its opening ramp from a consumption that is small only because the
+	// handle has barely started. That is the #233 regression the precondition exists to prevent,
+	// and the precondition would have introduced it.
+	//
+	// A run requires an establishment to end and bytes to have been read in it. `established`
+	// is false through the warm-up above, so a copy's pre-establishment reads are not runs.
+	if p.established && p.runConsumed > 0 {
+		p.runsEnded++
+	}
+	p.runConsumed = 0
+}
 
 // windowCap is the largest window, in blocks, this handle's demonstrated
 // consumption justifies. It is maxReadahead when the gate is off, and never
@@ -306,6 +355,75 @@ func (p *Prefetcher) windowCap() int64 {
 	p.evidenceHeld++
 	p.evidenceCut += p.maxReadahead - earned
 	return earned
+}
+
+// evidenceBasis is the consumption figure the gate reads: the handle's lifetime total, or the
+// current run's when per-run evidence is on (#407 arm A). One place, so the two arms cannot
+// disagree about what "consumed" means.
+func (p *Prefetcher) evidenceBasis() int64 {
+	if p.perRunEvidence {
+		return p.runConsumed
+	}
+	return p.consumed
+}
+
+// subBlockSpan is the second arm of #407: a dispatch SHORTER THAN ONE BLOCK, for a handle whose
+// evidence does not earn even the minimum whole-block window.
+//
+// ★ WHY THE FIRST ARM IS INERT WITHOUT THIS ONE, which is the whole reason there are two.
+// windowCap is denominated in BLOCKS and floors at initialWindow, so the smallest window any
+// established handle can be given is 2 blocks = 16 MiB at the default 8 MiB block. A GRIB .idx
+// field sweep reads 0.5-2 MB per run. Per-run evidence correctly reduces that handle's earned
+// window from 5 blocks to 0 -- and the floor then hands it 2 blocks anyway, so the dispatch is
+// unchanged and the arm does nothing. An external sweep measured exactly that: arm A identical
+// to the default on all three walk shapes at ratio 2, which is a null with no information in it
+// (the two arms are equal BY ARITHMETIC there). The floor, not the ratio, is what binds.
+//
+// So this arm converts the residual below the floor from blocks into BYTES: a handle that has
+// earned less than the floor gets a span of exactly what it earned. At ratio 2, a 1 MB run
+// earns 2 MB against the floor's 16 MiB.
+//
+// The 2x2 the two arms span, on the measured GRIB handle (ratio 2, 8 MiB blocks, lifetime
+// 11.9 MB, runs ~1 MB) -- note that only the last row moves, and that neither arm alone does:
+//
+//	A off, B off -> window floors at 2 blocks            -> 16 MiB
+//	A on,  B off -> window floors at 2 blocks            -> 16 MiB   (the measured null)
+//	A off, B on  -> basis 11.9 MB earns 23.8 MB >= floor -> 16 MiB
+//	A on,  B on  -> basis 1 MB earns 2 MB < floor        ->  2 MiB
+//
+// That is #222's precedent repeating: there, too, each half alone made bytes WORSE and only
+// both together gave 16x. It is why these ship as two flags rather than one default.
+//
+// ★ THE PRECONDITION IS NOT A THRESHOLD. It requires runsEnded > 0 -- the handle has actually
+// finished a run. Without it this fires on every handle's opening reads, where consumption is
+// small because the handle has barely started, and #233 establishes that a cold sequential read
+// should fetch MORE rather than less (#231 refuted three ways of making it fetch sooner). A
+// sequential copy ends no runs, so it can never reach this. Today windowCap's floor is what
+// protects that reader; this arm removes the floor, so it has to carry the protection itself.
+//
+// Returns ok=true when the bound is IN FORCE, so the caller must not fall through to a
+// whole-block dispatch. The span's start offset is deliberately not expressed here: the
+// detector reports how MUCH, and the FUSE layer -- which owns the read's byte offsets -- places
+// it immediately after the read that produced it. Same split as Dispatch.ReadLen.
+func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
+	if !p.subBlock || p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
+		return nil, false
+	}
+	if p.runsEnded == 0 {
+		return nil, false
+	}
+	basis := p.evidenceBasis()
+	if basis <= 0 {
+		return nil, false
+	}
+	earned := int64(float64(basis) * p.evidenceRatio)
+	if earned >= initialWindow*p.evidenceBlock {
+		// The floor is not what binds for this handle, so there is no residual to convert and
+		// the normal whole-block path is already no larger than the evidence allows.
+		return nil, false
+	}
+	p.spansIssued++
+	return []Dispatch{{Block: blockIdx, Span: earned}}, true
 }
 
 // recordRead pushes a read's byte range into the trailing ring and returns the
@@ -482,6 +600,15 @@ type Dispatch struct {
 	// is every sequential-ramp and seek-re-anchor dispatch: there, the reader has demonstrated
 	// contiguous progress and the whole block is what it is going to consume.
 	ReadLen int64
+	// Span, when > 0, is a number of bytes to prefetch CONTIGUOUSLY FROM THE END OF THE READ
+	// that produced this dispatch, in place of any whole block (#407 arm B). It is an amount
+	// the handle's evidence has already earned, NOT a read length to be judged against a
+	// threshold -- which is the difference from ReadLen, and the reason it is a separate field.
+	// Applying ReadLen's small-read threshold to it would silently drop every span above that
+	// threshold back to a whole-block fetch, i.e. exactly the shapes this arm is for.
+	//
+	// Block is still set, for tracing and so a dispatch always says where it is.
+	Span int64
 }
 
 // Observe records a demand read at blockIdx, byteGap bytes from the end of the
@@ -656,6 +783,12 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		if p.frontier < first {
 			p.frontier = first
 		}
+		// #407 arm B: a handle that has proved it takes short runs gets a span of what it
+		// earned rather than the floor's two whole blocks. Inert unless the flag is on AND the
+		// handle has ended a run AND the floor is what binds -- see subBlockSpan.
+		if ds, ok := p.subBlockSpan(p.cursor); ok {
+			return ds
+		}
 		return p.advance(p.cursor + 1 + p.window)
 	}
 
@@ -714,7 +847,18 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		// The run ended here even though the handle stays Sequential (#407). This is the branch
 		// a field-at-a-time walk takes between fields, and leaving runConsumed alone would make
 		// per-run evidence identical to cumulative evidence for the exact shape it exists for.
+		//
+		// ARM B IS EVALUATED BEFORE endRun, DELIBERATELY. endRun zeroes runConsumed, which is
+		// arm A's basis, so computing the span afterwards would read a basis of 0 and fall
+		// through to two whole blocks on exactly the landing this arm exists to bound -- the
+		// two arms would then compose to nothing on the branch where they matter most. The
+		// evidence for this landing is the run that just finished, which is what runConsumed
+		// still holds here.
+		ds, bounded := p.subBlockSpan(blockIdx)
 		p.endRun()
+		if bounded {
+			return ds
+		}
 		return p.advance(blockIdx + initialWindow)
 	}
 	// From Cold/Random with no pending jump: tentative — wait to see if this is
