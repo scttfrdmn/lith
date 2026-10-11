@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--readahead-evidence-per-run`: the evidence gate can measure the current run instead of
+  the handle's lifetime** ([#407](https://github.com/scttfrdmn/lith/issues/407)). Experimental,
+  off by default. **The first arm of a 2×2 that has not been measured yet.**
+
+  `--readahead-evidence-ratio` bounds a committed window by the bytes a handle has read — but
+  that figure is **cumulative and never reset**. On a scattered-but-locally-sequential walk
+  every run is 0.5–2 MB, so by the third run the handle has earned a window no single run can
+  justify, and it re-places that bet at every re-establishment. An external shape sweep measured
+  the consequence across three shapes: **48 chunks prefetched and 2 used** on a GRIB `.idx`
+  field sweep, 71/11 on a HEMCO time-slice read, 47/13 on a FITS cutout — one mechanism, three
+  findings (#407, #409, #222).
+
+  The arithmetic reproduces their measurement exactly: 11.9 MB consumed × 4 ÷ 8 MiB = 5.69 → 5
+  blocks, against a measured peak window of **5**. A test asserts that correspondence, so if
+  either the arithmetic or the measurement moves, the mechanism has to be re-derived rather than
+  assumed.
+
+  A run ends at a seek out of an established pattern, a scattered landing, or a
+  de-establishment. **A genuine sequential copy never reaches any of those**, so its run is the
+  whole file and this is a no-op for it — that is the witness three cold-start fixes were
+  refuted against (#231), and the reason the reset sits at run boundaries rather than on a timer
+  or a read count.
+
+  **Necessary and not sufficient, which is why it is a flag and not a fix.** The dispatch floor
+  is 2 blocks — **17 MiB** at the default block size — so a 1 MB run still floors far above what
+  it wants. Closing the rest needs **sub-block dispatch**, which is not built. The one precedent
+  for this pair (#222) found each half alone made bytes *worse* and only both together gave 16×,
+  so the halves have to be measurable separately.
+
+- **A guard that experimental flags default off.** Found by a revert sweep: flipping this flag's
+  default to `true` left the entire suite green. "EXPERIMENTAL" in a flag's help is a promise
+  that the behaviour is unmeasured, and a binary that ships it on contradicts its own help where
+  no operator can see it. Keyed on the help text rather than a list, so a new experimental flag
+  is covered the moment it is written.
+
+
 ### Fixed
 
 - **The NFS gateway's readahead divisor counted MOUNTED clients, not reading ones**

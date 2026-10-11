@@ -11,6 +11,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // A flag can be declared, documented, and silently never read — which is what
@@ -136,4 +139,41 @@ func TestCheckPFTracePathFailsFast(t *testing.T) {
 	if !strings.Contains(err.Error(), "pf-trace") {
 		t.Errorf("error should name the flag so the cause is obvious: %v", err)
 	}
+}
+
+// AN EXPERIMENTAL FLAG MUST DEFAULT OFF, and nothing asserted it until a revert sweep flipped
+// one to `true` and the whole suite stayed green.
+//
+// "EXPERIMENTAL" in a flag's help is a promise that the behaviour behind it has not been
+// measured enough to be anyone's default. This project has withdrawn two defaults that were
+// placed from a plausible-looking constant (#340, #349) and has a standing rule that a default
+// needs a measurement behind it, so a flag that says EXPERIMENTAL and ships on is a
+// contradiction an operator cannot see.
+//
+// Keyed on the help text rather than a list, so a new experimental flag is covered the moment
+// it is written — a list would need maintaining and the thing being guarded is exactly the kind
+// of change that forgets to maintain lists.
+func TestExperimentalFlagsDefaultOff(t *testing.T) {
+	checked := 0
+	for _, cmd := range []*cobra.Command{newMountCmd(), newServeNFSCmd()} {
+		name := cmd.Name()
+		cmd.Flags().VisitAll(func(fl *pflag.Flag) {
+			if !strings.Contains(strings.ToUpper(fl.Usage), "EXPERIMENTAL") {
+				return
+			}
+			checked++
+			switch fl.DefValue {
+			case "false", "0", "", "0s":
+				return
+			}
+			t.Errorf("%s --%s says EXPERIMENTAL in its help but defaults to %q. An "+
+				"experimental default is a contradiction: the help tells an operator the "+
+				"behaviour is unmeasured while the binary ships it on. Either measure it and "+
+				"drop the word, or default it off.", name, fl.Name, fl.DefValue)
+		})
+	}
+	if checked == 0 {
+		t.Fatal("found no flags whose help says EXPERIMENTAL; the check is broken, not the code")
+	}
+	t.Logf("checked %d experimental flag(s)", checked)
 }
