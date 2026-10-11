@@ -53,9 +53,9 @@ package fuse
 //  3. REGION UNKNOWN -> off. IMDS is blocked on plenty of hardened images and a custom
 //     --endpoint has no AWS region at all. Off is correct in every case measured: off-EC2 is
 //     far, and R2 and other non-AWS endpoints cost 1.6-2.8x at every ratio tested. An on-prem
-//     MinIO is near and loses the saving, which is what --readahead-evidence-ratio 4 is for.
+//     MinIO is near and loses the saving, which is what an explicit --readahead-evidence-ratio is for.
 //     Erring off costs only the saving; erring on is the measured ~2x at distance.
-//  4. Same region -> ratio 4. Different region -> off.
+//  4. Same region -> defaultEvidenceRatio. Different region -> off.
 //
 // EXPORTED BECAUSE A SECOND GATE'S DEFAULT READS IT (#313). The tier-pressure gate
 // (--prefetch-pressure-max) covers exactly the mounts this one does not, so cmd/lith derives
@@ -75,8 +75,42 @@ func EvidenceRatioFor(configured float64, nearRegion, regionKnown bool) float64 
 	return defaultEvidenceRatio
 }
 
-// defaultEvidenceRatio is 4 because every cell that decided this used 4; no other value has
-// been measured on any shape.
+// defaultEvidenceRatio is 2.
+//
+// IT WAS 4 FOR THREE WEEKS, on the honest grounds that 4 was the only value any cell had used.
+// That is no longer true: a 2-vs-4 sweep across nine shapes, including the one the ratio was
+// originally set on, found 2 free or better everywhere (#407).
+//
+//	shape                      ratio 4      ratio 2    note
+//	#284 single var1 reader     59.8 MB      51.4 MB   0.86x bytes; 2.66x -> 2.28x amp
+//	#284 six concurrent         358.6 MB     308.3 MB  0.86x; exactly 6x the single at either
+//	GRIB .idx field sweep       5.07x        3.02x     window 5 -> 2
+//	FITS header+cutout          3.66x        2.20x     window 5 -> 2
+//	HEMCO time-slice            1.93x        1.79x     window 3 -> 2
+//	netcdf4 hyperslab           1.35x        1.35x     unchanged
+//	webdataset / concurrent     1.00x        1.00x     unchanged
+//	single-stream dd (3.78 GB)  bytes/size 1.000 at either ratio; wall within noise
+//
+// THE CONTROL IS EXACT, which is what makes this safe: ratio 4 reproduced #284's historical
+// figures to 0.1 MB -- 59.8 MB and 24 GETs single, 358.6 MB concurrent -- so the arms differ in
+// the ratio and nothing else. And the six-reader cell stayed exactly 6x the single-reader cell
+// at BOTH ratios, which rules out the one interaction worth fearing: the ratio does not compose
+// with the per-handle divisor.
+//
+// WHY LOWER IS BETTER ON THE SHAPE IT WAS SET ON, rather than merely harmless: the gate bounds
+// a window at ratio x consumed, so the ratio IS the over-fetch ceiling for a reader that never
+// wants its whole window. #284's reader wants 1.8% of a 1.2 GB object; halving what it may
+// commit halves the tail it never reads. The cost would be a reader that genuinely wants depth
+// sooner, and no measured shape does -- a single-stream dd fetched byte-identically at both.
+//
+// RATIO 1 IS NOT BETTER THAN 2. Measured on all three walk shapes: identical to 2, because by
+// then every window is at the 2-block dispatch floor and the ratio has stopped being the
+// binding constraint (#407). Below 2 there is nothing left to win and the floor is the residual.
+//
+// A CORRECTION TO SOMETHING THIS COMMENT USED TO IMPLY: the window being "earned" is not the
+// same as it being wanted. Ratio 4 authorized four times demonstrated consumption on the theory
+// that a sequential copy earns the full window within a few reads -- true, and the copy turned
+// out not to need it.
 //
 // THE LATENCY BOUND IS GONE, and its history is worth keeping because it cost three releases.
 // v1.4.0 shipped it as 5 ms, derived from a 2.2 ms network ROUND TRIP, against a quantity that
@@ -95,4 +129,4 @@ func EvidenceRatioFor(configured float64, nearRegion, regionKnown bool) float64 
 // what it wanted, and six such readers concurrently go from 5-9x to 1.00x. What it costs is a
 // fixed ~0.07-0.18 s on the one shape that pays, a fast consumer reading most of an object:
 // r = 1.047 to 1.206 in-region across a 14.5x size range and two boxes.
-const defaultEvidenceRatio = 4.0
+const defaultEvidenceRatio = 2.0

@@ -85,10 +85,15 @@ ls -lh /mnt/hg00100
     directory it does not own, so a root-created mount is equally invisible to a
     non-root `lith mounts`.
 
-    The rule is the same either way — **a root-created mount needs a root-run
-    readiness check**. `sudo mountpoint -q /mnt/…` or `sudo lith mounts`. Better
-    still, avoid the asymmetry: mount as the user that will read, which is what
-    the `chown` above is for.
+    **It is symmetric, and the other direction bites too:** `sudo mountpoint -q`
+    cannot see a *user-owned* FUSE mount either, so a root-run check against a
+    user-created mount also reports *not mounted*. That one cost a benchmark
+    harness 60 seconds of idle wait per cell before anyone noticed.
+
+    The rule, both ways: **run the readiness check as the same user that created
+    the mount.** `mountpoint -q` or `lith mounts`, as that user. Better still,
+    avoid the asymmetry entirely — mount as the user that will read, which is
+    what the `chown` above is for.
 
 `ls` returns immediately and shows a **14 GiB** `…low_coverage…bam.cram` and its
 `.crai` index — real sizes and mtimes, served from the local index without
