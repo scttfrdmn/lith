@@ -90,10 +90,20 @@ func TestEvidenceRatioEncodesTheMeasuredSplit(t *testing.T) {
 		t.Errorf("cross-region default = %v, want 0: this is the measured ~2x ramp penalty "+
 			"at distance", got)
 	}
-	// And the ratio itself is 4 because every cell that decided it used 4. A change here is
-	// a change to an unmeasured value, which is how two bad defaults shipped already.
-	if defaultEvidenceRatio != 4.0 {
-		t.Errorf("defaultEvidenceRatio = %v; no other value has been measured on any shape",
+	// THE RATIO ITSELF IS 2, and this guard is the reason that change took a measurement.
+	// It asserted 4 for three weeks on the grounds that 4 was the only value any cell had
+	// used -- and it is what stopped the value being nudged on reasoning. A 2-vs-4 sweep
+	// across nine shapes then found 2 free or better everywhere, including #284's own shape
+	// (59.8 -> 51.4 MB single, 358.6 -> 308.3 MB concurrent, 0.86x in both), with ratio 4
+	// reproducing #284's historical figures to 0.1 MB as the control (#407).
+	//
+	// The same rule still applies to the NEXT change: 1 was measured and is identical to 2
+	// (every window is already at the 2-block dispatch floor), and nothing above 4 or between
+	// 2 and 4 has been measured on any shape.
+	if defaultEvidenceRatio != 2.0 {
+		t.Errorf("defaultEvidenceRatio = %v. Measured: 4 (the old default), 2 (the current "+
+			"one, free or better on nine shapes) and 1 (identical to 2, floor-bound). Any "+
+			"other value is unmeasured, which is how two bad defaults shipped already",
 			defaultEvidenceRatio)
 	}
 }

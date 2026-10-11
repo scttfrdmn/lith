@@ -45,6 +45,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is covered the moment it is written.
 
 
+### Changed
+
+- **The in-region evidence-gate ratio is 2, not 4** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
+  `--readahead-evidence-ratio`'s region-derived default now bounds a committed window to **twice**
+  the bytes a handle has actually read. Over-fetch on the shape the ratio was originally set
+  for — #284's single-variable NetCDF-4 read — goes **2.66× → 2.28×**; nothing measured got
+  worse.
+
+  **This is a smaller default, not a new mechanism**, and it was decided by a sweep rather than
+  by argument. An external 2-vs-4 run across nine shapes found ratio 2 free or better on every
+  one: the single `var1` reader 59.8 → **51.4 MB**, six concurrent readers 358.6 → **308.3 MB**
+  (2.62× → 2.26×), **0.86× bytes in both repetitions**, with ratio 4 reproducing the historical
+  figures to 0.1 MB as the control. `netcdf4_hyperslab`, `webdataset`, `concurrent_handles` and
+  a single-stream `dd` came out byte-identical at either value.
+
+  **The ratio does not interact with the per-handle divisor.** The six-reader cell stayed exactly
+  6× the single-reader cell at *both* ratios, which is the property that makes this one constant
+  rather than a constant per concurrency level.
+
+  **Ratio 1 is not better than 2**, measured identical on all three walk shapes (GRIB, HEMCO,
+  FITS): by then every window is pinned at the 2-block dispatch floor — **17 MiB** at the default
+  block size — and the ratio has stopped being the binding constraint. That residual is
+  sub-block dispatch's to close, not this default's. The test records 4, 2 and 1 as the three
+  values anyone has measured and **fails on any other**, so the next person to move it has to
+  bring a cell rather than an intuition.
+
 ### Fixed
 
 - **The NFS gateway's readahead divisor counted MOUNTED clients, not reading ones**

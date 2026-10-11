@@ -27,7 +27,7 @@ import "fmt"
 // deliberate. Two policies over the same booleans are two policies that can drift; one reading
 // the other's answer cannot. It also composes correctly for cases no region pair describes:
 //
-//   - an operator who forces --readahead-evidence-ratio 4 on a cross-region mount has bounded
+//   - an operator who forces a positive --readahead-evidence-ratio on a cross-region mount has bounded
 //     their windows by consumption, so this gate correctly stands down;
 //   - an operator who forces --readahead-evidence-ratio -1 in-region has removed that bound,
 //     so this gate correctly engages;
