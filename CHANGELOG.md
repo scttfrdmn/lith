@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--readahead-subblock-dispatch`'s help and docs row claimed a benefit no measured shape
+  shows** ([#407](https://github.com/scttfrdmn/lith/issues/407)). An external 2×2 on the v1.14.0
+  artifact found **all four arms identical** on a GRIB `.idx` sweep (3.02×), a FITS cutout
+  (2.20×) and a HEMCO time-slice read (1.79×) — with **zero** `prefetch-range` fills attributable
+  to the arm, GETs unchanged, and a clean `dd` witness. The flags were verified present on the
+  live process before the null was reported.
+
+  **The precondition is why.** The arm requires a *finished established run*, and the real tools
+  finish roughly none: a GRIB handle establishes **once**, in its last 12 of 90 reads, and
+  finishes none — 67 of its 90 reads are `random`→`random`; a FITS handle is a *single* 130-read
+  run that ends only at close and never enters `Random`. The synthetic fixture the arm's 12.1×
+  comes from re-establishes once per field, which is not how these tools read; at a *regular*
+  field spacing the same walk classifies as `Strided`, a third branch again.
+
+  **The span machinery is kept and the trigger is what is refuted** — bounding a dispatch in
+  bytes, fetching it through the extent path and labelling it `prefetch-range` are all
+  fixture-proven. Both texts now say the arm is measured inert and why, rather than quoting the
+  fixture's figure as if it were a shape anyone reads. Second time this issue has needed that
+  correction, which is the #388 drift.
+
+  Also records what GRIB's 3.02× actually is, now that the external per-handle trace makes it
+  attributable: **one** establishment dispatching `window + 1` blocks — the +1 being #233's rule
+  that a handle prefetches the block it is *in* — so 24 MiB for 2 of 24 chunks used, with
+  `windowCap` already sitting at its 2-block floor. That is a single over-wide dispatch, not an
+  accumulation of bounded short runs, so a mechanism aimed at repeated runs cannot reach it.
+
 ## [1.14.0] - 2026-10-11
 
 ### Added
