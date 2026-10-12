@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-10-12
+
 ### Changed
 
 - **`--readahead-subblock-dispatch` is on by default** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
@@ -30,26 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged**, and the arm cannot fire where the evidence gate is off, so cross-region and
   region-unknown mounts are unaffected. The default reaches exactly the in-region regime the
   measurement covers.
-
-### Fixed
-
-- **My bytes-for-faults model was a fixture artifact, and it is now pinned as one.** A fixture at
-  8 MiB field spacing showed the arm halving bytes while **tripling** uncovered demand misses,
-  from which I published a break-even implying the arm would be a wall *loss* at any realistic
-  bandwidth. The external cell then measured faults flat on both real shapes.
-
-  The cause is the spacing: the default dispatches `window + 1` blocks, which at that spacing
-  **overshoots into the next field**, so the default's over-fetch was accidentally prefetching it
-  and the arm's shorter span was not. At wider spacings the fault counts are identical and the
-  byte saving is *larger* — and a scattered walk jumps farther than the window by definition. A
-  test now measures both sides of that boundary, so the artifact cannot return disguised as a
-  regression.
-
-  It asserts the **delta between arms across two spacings**, not an absolute count: `UncoveredMiss`
-  fires when a demand read finds its chunk neither cached nor in flight, so it races the prefetch
-  goroutine and picks up extra misses under load. The first version asserted equality, passed
-  alone, and failed twice in three package runs — the same mistake as the #313 gate test that
-  asserted the gate *halves* peak pressure.
 
 ### Added
 
@@ -105,6 +87,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   move. The arm bounds prefetch, so its risk is latency rather than bytes — fetching 0.46× the
   bytes could be faster, neutral or slower, and a byte count cannot separate those. #309's 11×
   regression came from a prefetch-depth change that looked clean on totals.
+
+- **My bytes-for-faults model was a fixture artifact, and it is now pinned as one.** A fixture at
+  8 MiB field spacing showed the arm halving bytes while **tripling** uncovered demand misses,
+  from which I published a break-even implying the arm would be a wall *loss* at any realistic
+  bandwidth. The external cell then measured faults flat on both real shapes.
+
+  The cause is the spacing: the default dispatches `window + 1` blocks, which at that spacing
+  **overshoots into the next field**, so the default's over-fetch was accidentally prefetching it
+  and the arm's shorter span was not. At wider spacings the fault counts are identical and the
+  byte saving is *larger* — and a scattered walk jumps farther than the window by definition. A
+  test now measures both sides of that boundary, so the artifact cannot return disguised as a
+  regression.
+
+  It asserts the **delta between arms across two spacings**, not an absolute count: `UncoveredMiss`
+  fires when a demand read finds its chunk neither cached nor in flight, so it races the prefetch
+  goroutine and picks up extra misses under load. The first version asserted equality, passed
+  alone, and failed twice in three package runs — the same mistake as the #313 gate test that
+  asserted the gate *halves* peak pressure.
 
 ## [1.15.0] - 2026-10-12
 
@@ -3614,7 +3614,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.15.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/scttfrdmn/lith/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/scttfrdmn/lith/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/scttfrdmn/lith/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/scttfrdmn/lith/compare/v1.12.0...v1.13.0
