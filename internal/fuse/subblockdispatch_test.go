@@ -266,10 +266,15 @@ func TestSubBlockDispatchFetchesARangeNotBlocks(t *testing.T) {
 	}
 }
 
-// Arm B must not change a mount that does not enable it. Asserted on BYTES through the whole
-// stack rather than on the detector's flag, because Config-to-detector plumbing is exactly
-// what has shipped dead in this repo before.
-func TestSubBlockDispatchIsOffByDefaultEndToEnd(t *testing.T) {
+// A PLAIN SEQUENTIAL READER IS UNAFFECTED EITHER WAY. Asserted on BYTES through the whole stack
+// rather than on the detector's flag, because Config-to-detector plumbing is exactly what has
+// shipped dead in this repo before.
+//
+// This was named ...IsOffByDefaultEndToEnd while the flag defaulted off, which is no longer what
+// it tests or what the flag does: it drives both settings explicitly and asserts a streaming
+// reader sees identical bytes. That is the #233/#231 witness, and it matters MORE now that the
+// flag is on by default -- a mount with no flags set takes the `on` path here.
+func TestSequentialReaderUnaffectedBySubBlockDispatch(t *testing.T) {
 	const objBytes = int64(16) << 20
 	const read = int64(128) << 10
 

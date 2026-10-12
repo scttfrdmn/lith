@@ -169,3 +169,107 @@ func TestAWalkThatDeEstablishesCountsItsFinishedRuns(t *testing.T) {
 			"route into subBlockSpan is dead and only the Random-history route works")
 	}
 }
+
+// ★★ THE FAULT MODEL THAT DID NOT TRANSFER, pinned as an artifact so it cannot come back.
+//
+// A fixture at 8 MiB field spacing showed this arm halving bytes while TRIPLING uncovered demand
+// misses (4-7 -> 12). I published a bytes-for-faults break-even from that figure -- around
+// 100 MB/s of bandwidth at a 30 ms first byte -- which implied the arm would be a wall LOSS at
+// any rate a real instance reaches. An external wall-clock cell then measured NEUTRAL on both
+// real shapes with uncovered misses FLAT in every arm (69 in all three arms on one row,
+// 331-333 on the other).
+//
+// THE REASON IS THE SPACING, and it is a property of the fixture rather than of the arm. The
+// default dispatches window+1 blocks; at 8 MiB spacing against a 4 MiB block that reach is
+// 12 MiB, which OVERSHOOTS INTO THE NEXT FIELD. So the default's over-fetch was accidentally
+// prefetching the next field, and the arm's shorter span was not -- a saving on the current
+// field paid for with a fault on the next. A real scattered walk jumps farther than the window,
+// by definition of being scattered, so nothing is accidentally covered either way.
+//
+// This asserts that: inside the default's reach the fault counts differ, beyond it they are
+// EQUAL and the byte saving is larger. If a future change makes the arm add faults at wide
+// spacing too, that is a real regression rather than this artifact, and this test separates them.
+func TestSubBlockAddsNoFaultsOnceFieldsOutrunTheDefaultDispatch(t *testing.T) {
+	const blockSz = int64(4) << 20
+	const read = int64(32) << 10
+	const preCross = int64(1) << 20
+	const field = preCross + 256<<10
+	const fields = 5
+	// The default dispatches window+1 blocks at the 2-block floor, so its reach is 3 blocks.
+	reach := 3 * blockSz
+
+	measure := func(spacing int64, sub bool) (bytes int64, uncovered int) {
+		objBytes := spacing*(fields+1) + (16 << 20)
+		raw, srv, rec := newWalkFS(t, objBytes, blockSz, 2.0, false, sub)
+		node, fh := openBig(t, raw)
+		before := quiesce(srv)
+		for f := int64(0); f < fields; f++ {
+			base := f*spacing + blockSz - preCross
+			for off := base; off < base+field; off += read {
+				readAt(t, raw, node, fh, off, read)
+			}
+		}
+		u, _, _ := rec.coverage()
+		return quiesce(srv) - before, u
+	}
+
+	type row struct {
+		spacing int64
+		dB, bB  int64
+		dU, bU  int
+	}
+	var inside, beyond []row
+	for _, spacing := range []int64{reach - blockSz, 4 * blockSz, 8 * blockSz} {
+		dB, dU := measure(spacing, false)
+		bB, bU := measure(spacing, true)
+		r := row{spacing, dB, bB, dU, bU}
+		t.Logf("spacing %2d MiB (default reach %d MiB): bytes %7.1f -> %7.1f MB (%.2fx) | uncovered %2d -> %2d",
+			spacing>>20, reach>>20, float64(dB)/1e6, float64(bB)/1e6,
+			float64(bB)/float64(dB), dU, bU)
+		if spacing < reach {
+			inside = append(inside, r)
+		} else {
+			beyond = append(beyond, r)
+		}
+	}
+
+	if len(inside) == 0 || len(beyond) == 0 {
+		t.Fatalf("need spacings on both sides of the %d MiB reach; got %d inside and %d beyond",
+			reach>>20, len(inside), len(beyond))
+	}
+
+	// ★ ASSERTED AS A CONTRAST BETWEEN CELLS, NOT AS AN ABSOLUTE COUNT -- and the first version
+	// of this test got that wrong, passing alone and failing twice in three package runs.
+	//
+	// UncoveredMiss fires when a demand read finds its chunk neither cached nor in flight, so it
+	// RACES the prefetch goroutine: under concurrent load a few extra misses appear in any arm.
+	// An exact equality on it is a tight bound on a load-sensitive quantity, which is the same
+	// mistake as the #313 gate test that asserted the gate HALVES peak pressure and then flaked
+	// in the full-tree run. What is load-invariant is the DELTA BETWEEN THE TWO ARMS, compared
+	// across the two spacings measured in the same run.
+	insideDelta := inside[0].bU - inside[0].dU
+	t.Logf("extra faults from the arm: %+d inside the reach (%d MiB spacing)",
+		insideDelta, inside[0].spacing>>20)
+	if insideDelta <= 0 {
+		t.Errorf("at %d MiB spacing (inside the %d MiB reach) the arm added %+d faults; the "+
+			"artifact this test exists to explain is gone, so either the default's reach or "+
+			"the explanation has changed and the comment above is now wrong",
+			inside[0].spacing>>20, reach>>20, insideDelta)
+	}
+	for _, r := range beyond {
+		delta := r.bU - r.dU
+		t.Logf("extra faults from the arm: %+d beyond the reach (%d MiB spacing)",
+			delta, r.spacing>>20)
+		if delta >= insideDelta {
+			t.Errorf("at %d MiB spacing (beyond the %d MiB reach) the arm added %+d faults, "+
+				"against %+d inside it. Once fields outrun the default dispatch neither arm "+
+				"covers the next field, so the arm's extra faults must fall away; a delta as "+
+				"large as the inside one is the real fault regression the external cell "+
+				"measured as flat", r.spacing>>20, reach>>20, delta, insideDelta)
+		}
+		if r.bB >= r.dB {
+			t.Errorf("at %d MiB spacing the arm fetched %d B against the default's %d B",
+				r.spacing>>20, r.bB, r.dB)
+		}
+	}
+}

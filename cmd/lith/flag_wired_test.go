@@ -177,3 +177,38 @@ func TestExperimentalFlagsDefaultOff(t *testing.T) {
 	}
 	t.Logf("checked %d experimental flag(s)", checked)
 }
+
+// THE SUB-BLOCK DISPATCH DEFAULT IS ON, AND SOMETHING HAS TO PIN IT.
+//
+// Found by a revert sweep: flipping this default back to off left the entire suite green. A
+// default nothing asserts can revert in a refactor and nobody learns until an operator's bytes
+// change, which is the shape #389's sweep caught for the pressure gate's default.
+//
+// It is on because it was measured, externally, on a release artifact: byte amplification
+// 3.02x -> 1.39x on a GRIB .idx sweep and 1.79x -> 1.48x on a HEMCO time-slice read, with WALL
+// CLOCK NEUTRAL on both (median B/D 1.005 over 11 kept reps and 0.974 over 5, each flagged run
+// bracketed by two default runs) and UNCOVERED DEMAND MISSES FLAT in every arm. A whole-object
+// dd, a scatter-then-stream handle, a FITS cutout and three control shapes were unchanged.
+//
+// If that evidence is ever withdrawn, this test is the place to change -- deliberately, with the
+// reason -- rather than letting the default drift.
+func TestSubBlockDispatchDefaultsOn(t *testing.T) {
+	fl := newMountCmd().Flags().Lookup("readahead-subblock-dispatch")
+	if fl == nil {
+		t.Fatal("mount has no --readahead-subblock-dispatch flag")
+	}
+	if fl.DefValue != "true" {
+		t.Errorf("--readahead-subblock-dispatch defaults to %q, want \"true\". It is on because "+
+			"an external wall-clock cell measured it neutral on both shapes whose bytes it "+
+			"improves, with faults flat; turning it off silently discards that measurement.",
+			fl.DefValue)
+	}
+	// AND IT MUST NOT CLAIM TO BE EXPERIMENTAL WHILE ON. TestExperimentalFlagsDefaultOff covers
+	// the general rule; this asserts the specific pairing stayed consistent when the word was
+	// dropped, because the two edits are in the same string and one can be made without the other.
+	if strings.Contains(strings.ToUpper(fl.Usage), "EXPERIMENTAL") {
+		t.Error("--readahead-subblock-dispatch defaults on and still says EXPERIMENTAL in its " +
+			"help; an operator reading that is told the behaviour is unmeasured while the " +
+			"binary ships it on")
+	}
+}

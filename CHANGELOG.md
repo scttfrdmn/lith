@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--readahead-subblock-dispatch` is on by default** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
+  Pass `=false` to disable. This was pre-registered: wall clock neutral on both moving rows with
+  faults flat meant the default moves on.
+
+  | | GRIB | HEMCO |
+  |---|---|---|
+  | byte amplification | 3.02× → **1.39×** | 1.79× → **1.48×** |
+  | wall, median B/D | **1.005** (11 kept reps) | **0.974** (5 kept reps) |
+  | uncovered demand misses | 69 in every arm | 331–333 in every arm |
+  | GETs | 71–74 | 339–341 |
+
+  Each flagged run was bracketed by two default runs, with a rep discarded when the brackets
+  disagreed by more than 10% — necessary because GRIB's ~3 s wall drifts 15–24% between brackets,
+  which is larger than the effect. The tester disclosed that the flagged arm *looked* faster in
+  the first six reps and that the impression did not survive the rule: the high-drift reps were
+  exactly the ones it discards.
+
+  **FITS, three control shapes, a whole-object `dd` and a scatter-then-stream handle are all
+  unchanged**, and the arm cannot fire where the evidence gate is off, so cross-region and
+  region-unknown mounts are unaffected. The default reaches exactly the in-region regime the
+  measurement covers.
+
+### Fixed
+
+- **My bytes-for-faults model was a fixture artifact, and it is now pinned as one.** A fixture at
+  8 MiB field spacing showed the arm halving bytes while **tripling** uncovered demand misses,
+  from which I published a break-even implying the arm would be a wall *loss* at any realistic
+  bandwidth. The external cell then measured faults flat on both real shapes.
+
+  The cause is the spacing: the default dispatches `window + 1` blocks, which at that spacing
+  **overshoots into the next field**, so the default's over-fetch was accidentally prefetching it
+  and the arm's shorter span was not. At wider spacings the fault counts are identical and the
+  byte saving is *larger* — and a scattered walk jumps farther than the window by definition. A
+  test now measures both sides of that boundary, so the artifact cannot return disguised as a
+  regression.
+
+  It asserts the **delta between arms across two spacings**, not an absolute count: `UncoveredMiss`
+  fires when a demand read finds its chunk neither cached nor in flight, so it races the prefetch
+  goroutine and picks up extra misses under load. The first version asserted equality, passed
+  alone, and failed twice in three package runs — the same mistake as the #313 gate test that
+  asserted the gate *halves* peak pressure.
+
 ### Added
 
 - **The sub-block arm's test now reports uncovered demand misses, which is the mechanism by
