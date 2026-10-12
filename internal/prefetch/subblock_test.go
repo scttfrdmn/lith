@@ -84,28 +84,25 @@ func walkArms(t *testing.T, perRun, subBlock bool, fieldBytes, readBytes, spacin
 	return bytes, spans
 }
 
-// ★★ THE 2x2, AND THE POINT IS THAT ONLY ONE CELL MOVES.
+// ★★ ARM B BOUNDS A WALK ON ITS OWN, AND --readahead-evidence-per-run IS ORTHOGONAL TO IT.
 //
-// This is the measurement that justifies two flags instead of one default, and it is the
-// second time this project has needed it: #222's fix had the same structure, where each half
-// alone made bytes WORSE (+1.1%, +5.5%) and only both together gave 16x.
+// THIS USED TO BE A 2x2 AND THE MEASUREMENT COLLAPSED IT. The arm originally read
+// evidenceBasis(), so it needed per-run evidence to have a run-sized basis, and the four cells
+// were the point. An external 2x2 on v1.14.0 then found all four arms identical on every real
+// shape, because the arm's TRIGGER ("has finished an established run") described the fixture
+// below and not the tools: a GRIB handle establishes once, in its last 12 of 90 reads, and
+// finishes no runs at all.
 //
-// Here the two halves are inert for DIFFERENT reasons, which is why neither was enough:
+// Fixing the trigger (a Random history also qualifies) forced the basis question too: at such a
+// handle's establishment, LIFETIME consumption is evidence about scattered reading rather than
+// contiguous appetite -- GRIB's 11.8 MB earns 23.6 MB, above the floor, so a lifetime basis
+// declines on the exact shape this exists for. So the basis at this site is always the current
+// run, and the second flag drops out of the mechanism entirely.
 //
-//   - per-run evidence alone (arm A) correctly shrinks the earned window, and windowCap then
-//     floors it at initialWindow blocks and hands back the same dispatch. An external sweep
-//     measured exactly this -- arm A identical to the default on all three walk shapes at
-//     ratio 2 -- and that null has no information in it, because the two arms are equal BY
-//     ARITHMETIC there.
-//   - sub-block dispatch alone (arm B) reads LIFETIME consumption, which on a walk grows past
-//     the floor within a few fields; after that the floor is not what binds and the arm
-//     correctly declines to act.
-//
-// Only together does a short run get a dispatch sized to it.
-func TestSubBlockOnlyTheBothCellMoves(t *testing.T) {
-	// The real shape's proportions: ~1 MB fields read in 128 KiB pieces, fields far enough
-	// apart that the jump is a seek by the byte-gap rule (gap > seqGapMax, which the FUSE
-	// layer sets to the block size).
+// What remains to assert is therefore not a 2x2 but two things: the arm works alone, and the
+// other flag neither helps nor hinders it. The second half is what stops the two from being
+// quietly re-coupled.
+func TestSubBlockBoundsAWalkAloneAndIsIndependentOfPerRun(t *testing.T) {
 	const field = int64(1) << 20
 	const read = int64(128) << 10
 	const spacing = 3 * testBlock
@@ -121,12 +118,12 @@ func TestSubBlockOnlyTheBothCellMoves(t *testing.T) {
 		{false, true, "A off, B on"},
 		{true, true, "A on,  B on"},
 	}
-	got := map[string]int64{}
-	spansBy := map[string]int64{}
+	got, spansBy := map[string]int64{}, map[string]int64{}
 	for _, a := range arms {
 		b, sp := walkArms(t, a.perRun, a.subBlock, field, read, spacing, fields)
 		got[a.name], spansBy[a.name] = b, sp
-		t.Logf("%-30s dispatched %9d B (%6.2f MiB), %d spans", a.name, b, float64(b)/float64(1<<20), sp)
+		t.Logf("%-30s dispatched %9d B (%6.2f MiB), %d spans", a.name, b,
+			float64(b)/float64(1<<20), sp)
 	}
 
 	base := got["A off, B off (shipped default)"]
@@ -134,89 +131,71 @@ func TestSubBlockOnlyTheBothCellMoves(t *testing.T) {
 		t.Fatal("the baseline dispatched nothing, so this fixture measures no branch at all")
 	}
 
-	// CELL 2: ARM A ALONE IS INERT, AND EXACTLY SO. windowCap is denominated in blocks and
-	// floors at initialWindow, so the arm reduces an earned window the floor hands straight
-	// back. This is the external null result, reproduced locally and explained: the two arms
-	// are equal BY ARITHMETIC on this shape, which is why that sweep could not discriminate.
+	// ARM A ALONE REMAINS EXACTLY INERT, which is the external null reproduced locally:
+	// windowCap floors at initialWindow blocks, so the arm reduces an earned window the floor
+	// hands straight back.
 	if got["A on,  B off"] != base {
-		t.Errorf("arm A alone dispatched %d B against the baseline's %d B. It is supposed to "+
-			"be exactly inert, because windowCap floors at %d blocks -- a difference here "+
-			"means that explanation of the measured null is wrong",
+		t.Errorf("arm A alone dispatched %d B against the baseline's %d B; it is inert because "+
+			"windowCap floors at %d blocks, and a difference means that explanation is wrong",
 			got["A on,  B off"], base, initialWindow)
 	}
-	if spansBy["A on,  B off"] != 0 {
-		t.Errorf("arm A alone issued %d spans; it cannot issue any", spansBy["A on,  B off"])
+
+	// ARM B ALONE DOES THE WORK.
+	bAlone := got["A off, B on"]
+	if bAlone >= base {
+		t.Fatalf("arm B alone dispatched %d B against the baseline's %d B — it must bound a "+
+			"walk without needing the other flag, which is the whole point of reading the "+
+			"current run at this site", bAlone, base)
+	}
+	if spansBy["A off, B on"] == 0 {
+		t.Fatal("arm B alone issued no spans, so the reduction came from somewhere else")
+	}
+	t.Logf("arm B alone: %d B vs %d B = %.2fx less dispatch", bAlone, base,
+		float64(base)/float64(bAlone))
+
+	// ★ AND THE INDEPENDENCE, asserted as EQUALITY. If adding per-run evidence changes the
+	// result, the span is reading something other than the current run and the two mechanisms
+	// have been re-coupled -- which is what the v1.14.0 null cost four cells to discover.
+	if both := got["A on,  B on"]; both != bAlone {
+		t.Errorf("arm B gave %d B alone and %d B with per-run evidence added; the span's basis "+
+			"is the current run at this site, so the two flags must be independent",
+			bAlone, both)
+	}
+	if spansBy["A on,  B on"] != spansBy["A off, B on"] {
+		t.Errorf("span count changed with per-run evidence: %d vs %d",
+			spansBy["A on,  B on"], spansBy["A off, B on"])
 	}
 
-	// CELL 3: ARM B ALONE IS NOT INERT -- IT DECAYS. This corrects a prediction of mine that
-	// this fixture refuted. I expected B alone to be inert because the measured handle's
-	// LIFETIME consumption (11.9 MB) earns more than the floor; but consumption starts at zero
-	// and grows, so B alone engages early and stops once the handle has accumulated a floor's
-	// worth -- 8.39 MB at ratio 2. It is a transient, not a null.
-	bOnly := got["A off, B on"]
-	if bOnly >= base {
-		t.Errorf("arm B alone dispatched %d B, no better than the baseline's %d B — it should "+
-			"act on a handle's early reads, before lifetime consumption passes the floor",
-			bOnly, base)
-	}
-	both := got["A on,  B on"]
-	if both >= bOnly {
-		t.Fatalf("both arms (%d B) did no better than arm B alone (%d B), so arm A contributes "+
-			"nothing and the pair is not a pair", both, bOnly)
-	}
-	t.Logf("both arms: %d B vs baseline %d B = %.2fx less dispatch", both, base,
-		float64(base)/float64(both))
-
-	// ★★ AND THE MECHANICAL DIFFERENCE, which is sharper than any byte ratio: arm B alone
-	// STOPS, arm A+B does not. Doubling the walk must not increase B-alone's span count at all
-	// -- the basis has outgrown the floor and the arm has switched itself off -- while A+B
-	// issues one per landing forever, because each run resets the basis.
-	//
-	// This is the assertion to keep. A byte comparison at one walk length cannot tell a
-	// mechanism that bounds a handle from one that merely delays it.
+	// ★★ AND THE PROPERTY THAT REPLACED THE OLD DECAY ASSERTION. When the basis was lifetime
+	// consumption, arm B alone switched ITSELF off as a handle accumulated -- its span count
+	// pinned at 13 whether the walk was 8 fields or 64. With a per-run basis it must do the
+	// opposite: one span per landing, indefinitely. That reversal is the mechanical signature
+	// of the basis change, and asserting it stops a future edit from silently restoring the
+	// lifetime basis (which would pass every other assertion in this file).
 	const longFields = 64
-	_, bLongSpans := walkArms(t, false, true, field, read, spacing, longFields)
-	bLongBytes, _ := walkArms(t, false, true, field, read, spacing, longFields)
-	abLongBytes, abLongSpans := walkArms(t, true, true, field, read, spacing, longFields)
+	longBytes, longSpans := walkArms(t, false, true, field, read, spacing, longFields)
 	longBase, _ := walkArms(t, false, false, field, read, spacing, longFields)
-	t.Logf("at %d fields: baseline %d B | B alone %d B / %d spans | A+B %d B / %d spans",
-		longFields, longBase, bLongBytes, bLongSpans, abLongBytes, abLongSpans)
-	t.Logf("  B alone %.2fx, A+B %.2fx", float64(longBase)/float64(bLongBytes),
-		float64(longBase)/float64(abLongBytes))
-
-	if bLongSpans != spansBy["A off, B on"] {
-		t.Errorf("arm B alone issued %d spans over %d fields against %d over %d — it must "+
-			"switch ITSELF off once lifetime consumption passes the floor, and a count that "+
-			"grows with the walk means it is still acting on a basis that should have "+
-			"outgrown the bound", bLongSpans, longFields, spansBy["A off, B on"], fields)
+	t.Logf("at %d fields: baseline %d B, arm B alone %d B / %d spans (%.2fx)", longFields,
+		longBase, longBytes, longSpans, float64(longBase)/float64(longBytes))
+	if longSpans <= spansBy["A off, B on"] {
+		t.Errorf("arm B issued %d spans over %d fields against %d over %d — with the basis "+
+			"reset every run it must issue one per landing indefinitely, and a count that "+
+			"stops growing means the basis has reverted to lifetime consumption",
+			longSpans, longFields, spansBy["A off, B on"], fields)
 	}
-	if abLongSpans <= spansBy["A on,  B on"] {
-		t.Errorf("both arms issued %d spans over %d fields against %d over %d — with the basis "+
-			"reset every run it must issue one per landing indefinitely",
-			abLongSpans, longFields, spansBy["A on,  B on"], fields)
-	}
-	// The consequence: B alone converges on the baseline, A+B diverges from it.
-	if float64(longBase)/float64(bLongBytes) > 1.15 {
-		t.Errorf("arm B alone still saved %.2fx over a %d-field walk; it is supposed to decay "+
-			"to nothing as the handle accumulates",
-			float64(longBase)/float64(bLongBytes), longFields)
-	}
-	if float64(longBase)/float64(abLongBytes) < float64(base)/float64(both) {
-		t.Errorf("the pair's advantage shrank as the walk grew (%.2fx over %d fields against "+
-			"%.2fx over %d); it must hold or grow, since every run is bounded",
-			float64(longBase)/float64(abLongBytes), longFields, float64(base)/float64(both), fields)
+	if r, rLong := float64(base)/float64(bAlone), float64(longBase)/float64(longBytes); rLong < r {
+		t.Errorf("the advantage shrank as the walk grew (%.2fx over %d fields against %.2fx "+
+			"over %d); with every run bounded it must hold or grow", rLong, longFields, r, fields)
 	}
 
-	// AND THE SPAN SIZE IS THE ARITHMETIC, not just "smaller". Pinned so a change to either
-	// constant has to be re-derived rather than absorbed.
+	// The span size is the arithmetic, pinned so a constant change must be re-derived.
 	wantSpan := int64(float64(field) * testRatio)
 	floorBytes := initialWindow * testBlock
 	t.Logf("one run of %d B earns %d B at ratio %g, against the %d B floor (%.1fx)",
 		field, wantSpan, testRatio, floorBytes, float64(floorBytes)/float64(wantSpan))
 	if wantSpan >= floorBytes {
-		t.Fatalf("the fixture's field earns %d B, at or above the %d B floor — this fixture "+
-			"cannot exercise arm B at all and every comparison above means nothing",
-			wantSpan, floorBytes)
+		t.Fatalf("the fixture's field earns %d B, at or above the %d B floor — it cannot "+
+			"exercise this arm and every comparison above is meaningless", wantSpan, floorBytes)
 	}
 }
 
@@ -232,7 +211,7 @@ func TestSubBlockOnlyTheBothCellMoves(t *testing.T) {
 //
 // It carries it by requiring a FINISHED ESTABLISHED RUN, which a copy never has.
 func TestSubBlockCannotReachASequentialCopy(t *testing.T) {
-	run := func(subBlock bool) (bytes, spans, runsEnded int64) {
+	run := func(subBlock bool) (bytes, spans, runsEnded, resets int64) {
 		p := New(64)
 		p.SetCoverage(16, coverageMinForTest)
 		p.SetEvidence(testRatio, testBlock)
@@ -249,11 +228,11 @@ func TestSubBlockCannotReachASequentialCopy(t *testing.T) {
 				bytes += testBlock
 			}
 		}
-		return bytes, spans, p.RunsEnded()
+		return bytes, spans, p.RunsEnded(), p.Resets()
 	}
 
-	offB, offSpans, _ := run(false)
-	onB, onSpans, ended := run(true)
+	offB, offSpans, _, _ := run(false)
+	onB, onSpans, ended, reset := run(true)
 	t.Logf("sequential copy, 400 contiguous reads: arm B off %d B / %d spans, on %d B / %d spans",
 		offB, offSpans, onB, onSpans)
 	t.Logf("runs ended on the copy: %d", ended)
@@ -284,6 +263,17 @@ func TestSubBlockCannotReachASequentialCopy(t *testing.T) {
 			"pre-establishment coverage warm-up, so the precondition no longer excludes a "+
 			"cold streaming reader and the bytes above are equal by luck of ordering", ended)
 	}
+	// ★ AND THE SECOND ROUTE, which the trigger gained after an external null showed the first
+	// one almost never fires on real tools: a Random history also admits a handle. A copy must
+	// satisfy NEITHER. It does not, for a reason worth keeping explicit -- the #221 coverage
+	// gate holds a copy's first reads provisional as COLD, and its Sequential-to-Cold demotion
+	// never passes through Random. If that ever changes, every streaming reader becomes a
+	// candidate for a bounded dispatch and #233 is back.
+	if reset != 0 {
+		t.Errorf("a sequential copy collapsed to Random %d times, want 0. The Random-history "+
+			"route into subBlockSpan would then admit a cold streaming reader, which is the "+
+			"#233 regression this precondition exists to prevent", reset)
+	}
 }
 
 // coverageMinForTest is the shipped coverage threshold. Spelled out here rather than imported
@@ -306,6 +296,18 @@ func TestSubBlockRequiresAFinishedRun(t *testing.T) {
 	p := newP()
 	if ds, ok := p.subBlockSpan(7); ok {
 		t.Errorf("a handle with runsEnded=0 was given %v; the cold-ramp protection is gone", ds)
+	}
+
+	// ★ EITHER ROUTE ADMITS, and both are tested, because the second one is the whole reason
+	// this arm is not inert: an external 2x2 found the arm dead on every real shape because
+	// only the finished-run route existed, and the real tools finish ~no runs.
+	pr := newP()
+	pr.resetRandom = 1
+	if dsr, okr := pr.subBlockSpan(7); !okr {
+		t.Error("a handle with a Random history was refused a span; that route is what makes " +
+			"this arm reach the measured shapes at all")
+	} else if len(dsr) != 1 || dsr[0].Span <= 0 {
+		t.Errorf("Random-history route produced %v, want one span dispatch", dsr)
 	}
 
 	p = newP()
