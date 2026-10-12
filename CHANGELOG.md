@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The sub-block arm's test now reports uncovered demand misses, which is the mechanism by
+  which it could cost wall clock** ([#407](https://github.com/scttfrdmn/lith/issues/407)). Bytes
+  a reader never wanted are pure waste; bytes it did want and now has to fault for are a stall,
+  and a byte count cannot tell those apart — which is the whole reason the default decision is
+  open after a clean byte result.
+
+  On the walk fixture the arm halves bytes and **triples uncovered misses (4 → 12)** while
+  prefetch hits fall 6 → 1. Treated as a bytes-for-faults trade, break-even is around
+  **100 MB/s** of effective bandwidth at a 30 ms first byte, and ~30 MB/s at 100 ms — so if that
+  fault increase transferred to a real workload, the arm would be a wall *loss* at any bandwidth
+  those instances actually reach. **An external run measured the GET count flat (72 → 71) on the
+  real shape**, which argues it does not transfer. The two signals disagree, and only a
+  wall-clock cell on the real workload settles it.
+
+  **Logged, not asserted.** Any bound on this ratio would be a tuned constant on a
+  fixture-specific quantity, which is how both #340's and #349's withdrawn defaults were placed.
+  The figures are in the test output so a future change to this arm shows its effect on faults
+  and not only on bytes.
+
 ### Fixed
 
 - **`--readahead-subblock-dispatch`'s help and docs row carried fixture figures and a stale
