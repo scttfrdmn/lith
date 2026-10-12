@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--readahead-subblock-dispatch` now engages for a handle with a `Random` history, and reads
+  the current run at that site** ([#407](https://github.com/scttfrdmn/lith/issues/407)). Still
+  experimental, still off by default.
+
+  The arm shipped in v1.14.0 requiring a *finished established run*, and an external 2×2 then
+  found it inert on every measured shape. The per-handle trace said why: a GRIB handle
+  establishes **once**, in its last 12 of 90 reads, and finishes **no** runs at all, while 67 of
+  its 90 reads are `random`→`random`. The finished-run trigger described a fixture, not the
+  tools. A handle that has collapsed to `Random` at least once now qualifies too.
+
+  **The basis at this site is always the current run**, not `--readahead-evidence-per-run`'s
+  choice, because at such a handle's establishment lifetime consumption is evidence about
+  *scattered* reading rather than contiguous appetite — GRIB's 11.8 MB lifetime earns 23.6 MB,
+  above the floor, so a lifetime basis declines on exactly the shape the arm exists for. **This
+  collapses the former 2×2 to one flag**: the arm now works alone (measured 3.82× less dispatch
+  on an 8-field walk fixture, 12.1× at 64 fields) and is independent of the per-run flag, which
+  a test asserts as equality so the two cannot be quietly re-coupled.
+
+  **Why a span is the only lever that can reach this shape.** GRIB's 3.02× is **one**
+  establishment dispatching `window + 1` blocks — the +1 being
+  [#233](https://github.com/scttfrdmn/lith/issues/233)'s rule that a handle prefetches the block
+  it is *in* — so 24 MiB for 2 of 24 chunks used, with the window already at its **2-block floor
+  at every ratio** (11.8 MB consumed earns 1.41 blocks at ratio 1 and 2.81 at ratio 2; both land
+  on 2). Neither a ratio change nor per-run evidence can move that, which an external ratio-1
+  null independently confirms.
+
+  **The risk was measured, not argued.** The shape that makes a `Random`-history trigger
+  dangerous is a handle that scatters and *then* streams — an index read followed by the payload
+  — since the trigger fires exactly when it starts wanting a lot. A witness fixture written
+  before the change measures the cost to such a stream at **zero, and non-scaling**: one span at
+  establishment whether the stream is 16 MiB or 48 MiB, with the window ramping back. Part of the
+  protection is arithmetic rather than policy: establishment requires a block advance, so a dense
+  stream starting at a block boundary has consumed a full block by then, earns exactly the floor
+  at ratio 2, and the span declines on its own.
+
+  A plain sequential copy satisfies **neither** route — the #221 coverage gate holds its first
+  reads provisional as `Cold` and it never passes through `Random` — which is what keeps #233's
+  cold streaming reader out, and is now asserted on both counters rather than one.
+
+### Added
+
+- **`docs/knobs.md` prices what stopping early costs**, which turns out to be the yardstick the
+  last three over-fetch reports were missing. A plain sequential reader that simply stops pays
+  **≈ `1 + ratio`** — measured 2.94–3.29× at ratio 2 and 2.00–2.35× at ratio 1, stable across
+  stop points, against 3.8–15.1× with the gate off. That is the designed trade: the lead is what
+  makes a stream fast and a reader that abandons it pays for it.
+
+  **It reframes three rows that had been grouped as one family for weeks.** Two are at or below
+  the line and are not defects (a FITS cutout at 2.20×, a HEMCO time-slice read at 1.79×); only
+  the GRIB `.idx` sweep at 3.02× exceeds it, and for the specific floor-bound reason above. A
+  shape fetching ~3× at ratio 2 is paying the price of stopping early; only one fetching
+  materially more has something else wrong.
+
+### Fixed
+
+- **Nothing asserted that a finished run was ever counted.** Found by a revert sweep: once the
+  `Random`-history route existed, reverting the `deEstablish`/`endRun` ordering bug stopped
+  failing anything, because the arm still fired through the other route. `runsEnded` could have
+  been permanently zero — a dead route behind a green suite, the `ttfbRecorder` shape. The new
+  test runs through the FUSE layer deliberately: at the prefetch level the coverage gate cannot
+  be disabled, and with it off the jumps take the seek re-anchor and call `endRun` *directly*
+  with `established` still true, so the ordering bug is invisible there.
+
 ### Fixed
 
 - **`--readahead-subblock-dispatch`'s help and docs row claimed a benefit no measured shape

@@ -341,11 +341,7 @@ func (p *Prefetcher) windowCap() int64 {
 	if p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
 		return p.maxReadahead
 	}
-	basis := p.consumed
-	if p.perRunEvidence {
-		basis = p.runConsumed
-	}
-	earned := int64(float64(basis)*p.evidenceRatio) / p.evidenceBlock
+	earned := int64(float64(p.evidenceBasis())*p.evidenceRatio) / p.evidenceBlock
 	if earned < initialWindow {
 		earned = initialWindow
 	}
@@ -357,9 +353,12 @@ func (p *Prefetcher) windowCap() int64 {
 	return earned
 }
 
-// evidenceBasis is the consumption figure the gate reads: the handle's lifetime total, or the
-// current run's when per-run evidence is on (#407 arm A). One place, so the two arms cannot
-// disagree about what "consumed" means.
+// evidenceBasis is the consumption figure the WINDOW gate reads: the handle's lifetime total,
+// or the current run's when per-run evidence is on (#407 arm A).
+//
+// subBlockSpan deliberately does NOT use this -- it always reads the current run, because it
+// fires on handles whose lifetime consumption is evidence about scattered reading rather than
+// contiguous appetite. The two are separate on purpose; see subBlockSpan's basis note.
 func (p *Prefetcher) evidenceBasis() int64 {
 	if p.perRunEvidence {
 		return p.runConsumed
@@ -409,10 +408,33 @@ func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
 	if !p.subBlock || p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
 		return nil, false
 	}
-	if p.runsEnded == 0 {
+	// EVIDENCE THAT THIS HANDLE IS NOT A STRAIGHT STREAM. Either reading is enough:
+	//
+	//   runsEnded > 0   -- it has finished an established run
+	//   resetRandom > 0 -- it has collapsed to Random at least once
+	//
+	// The second was added because the first is almost never true of the real tools. An
+	// external 2x2 on v1.14.0 found this arm inert on every measured shape, and the per-handle
+	// trace said why: a GRIB handle establishes ONCE, in its last 12 of 90 reads, and finishes
+	// no runs at all; 67 of its 90 reads are random->random. So "has finished a run" described
+	// a fixture, and "has been Random" describes the tools.
+	//
+	// A plain sequential copy satisfies NEITHER. Verified in the detector: a copy reaches only
+	// Cold then Sequential, with resetRandom 0 -- the #221 coverage gate holds its first reads
+	// provisional as Cold, never Random. That is what keeps #233's cold streaming reader out.
+	if p.runsEnded == 0 && p.resetRandom == 0 {
 		return nil, false
 	}
-	basis := p.evidenceBasis()
+	// ★ THE BASIS HERE IS ALWAYS THE CURRENT RUN, not evidenceBasis(), and that is deliberate.
+	//
+	// This arm fires where a handle has demonstrated scattered reading, and at such a handle's
+	// establishment its LIFETIME consumption is evidence about scattering rather than about
+	// contiguous appetite -- GRIB's 11.8 MB lifetime earns 23.6 MB, above the floor, so a
+	// lifetime basis declines on exactly the shape this exists for. The claim being bounded is
+	// "how much contiguous reading has this handle shown in THIS stretch", so the basis has to
+	// be the stretch. It also means this arm no longer depends on --readahead-evidence-per-run,
+	// which is what made the earlier 2x2 need four cells to say nothing.
+	basis := p.runConsumed
 	if basis <= 0 {
 		return nil, false
 	}
