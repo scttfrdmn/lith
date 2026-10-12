@@ -23,6 +23,14 @@ import (
 type kindRec struct {
 	mu     sync.Mutex
 	byKind map[string]int
+	// uncovered counts demand reads whose chunk was neither cached nor in flight -- a read the
+	// readahead frontier did not lead far enough to cover. It is the LEADING INDICATOR for
+	// whether bounding a dispatch costs wall clock: bytes a reader never wanted are pure
+	// waste, but bytes it did want and now has to fault for are a stall. The byte count alone
+	// cannot tell those apart, which is why the wall-clock question is open at all.
+	uncovered int
+	pfHit     int
+	pfIssued  int
 }
 
 func (r *kindRec) MemHit()           {}
@@ -31,9 +39,9 @@ func (r *kindRec) Miss()             {}
 func (r *kindRec) StartInflight()    {}
 func (r *kindRec) EndInflight()      {}
 func (r *kindRec) StaleKey(string)   {}
-func (r *kindRec) PrefetchIssued()   {}
-func (r *kindRec) PrefetchHit()      {}
-func (r *kindRec) UncoveredMiss()    {}
+func (r *kindRec) PrefetchIssued()   { r.mu.Lock(); r.pfIssued++; r.mu.Unlock() }
+func (r *kindRec) PrefetchHit()      { r.mu.Lock(); r.pfHit++; r.mu.Unlock() }
+func (r *kindRec) UncoveredMiss()    { r.mu.Lock(); r.uncovered++; r.mu.Unlock() }
 func (r *kindRec) S3Get(int64, bool) {}
 
 func (r *kindRec) FillSeconds(kind string, _ time.Duration) {
@@ -43,6 +51,12 @@ func (r *kindRec) FillSeconds(kind string, _ time.Duration) {
 		r.byKind = map[string]int{}
 	}
 	r.byKind[kind]++
+}
+
+func (r *kindRec) coverage() (uncovered, hit, issued int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uncovered, r.pfHit, r.pfIssued
 }
 
 func (r *kindRec) counts() map[string]int {
@@ -174,6 +188,21 @@ func TestSubBlockDispatchFetchesARangeNotBlocks(t *testing.T) {
 				readAt(t, raw, node, fh, off, read)
 			}
 		}
+		// THE LEADING INDICATOR FOR THE WALL-CLOCK QUESTION, logged and deliberately NOT
+		// asserted. Bytes a reader never wanted are pure waste; bytes it did want and now has
+		// to fault for are a stall, and the byte count cannot tell those apart. On this
+		// fixture the arm halves bytes and TRIPLES uncovered misses (4 -> 12) while prefetch
+		// hits fall 6 -> 1, so it is a bytes-for-faults trade whose sign depends on bandwidth
+		// and first-byte latency -- break-even is around 100 MB/s at a 30 ms first byte if the
+		// faults serialise. An external run measured the GET count FLAT (72 -> 71) on the real
+		// shape, which argues the fault increase does not transfer; the two disagree and only
+		// a wall-clock cell on the real workload settles it.
+		//
+		// No assertion, because any bound here would be a tuned constant on a fixture-specific
+		// ratio -- the mistake #340 and #349 both shipped. The figures are logged so a future
+		// change to this arm shows its effect on faults, not only on bytes.
+		unc, hit, iss := rec.coverage()
+		t.Logf("    subBlock=%-5v uncovered=%d prefetchHit=%d prefetchIssued=%d", subBlock, unc, hit, iss)
 		return quiesce(srv) - before, h.pf.pf.SpansIssued(), rec.counts(), h.pf.state()
 	}
 
