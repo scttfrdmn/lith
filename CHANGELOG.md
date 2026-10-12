@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-10-12
+
 ### Changed
 
 - **`--readahead-subblock-dispatch` now engages for a handle with a `Random` history, and reads
@@ -64,16 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Nothing asserted that a finished run was ever counted.** Found by a revert sweep: once the
-  `Random`-history route existed, reverting the `deEstablish`/`endRun` ordering bug stopped
-  failing anything, because the arm still fired through the other route. `runsEnded` could have
-  been permanently zero — a dead route behind a green suite, the `ttfbRecorder` shape. The new
-  test runs through the FUSE layer deliberately: at the prefetch level the coverage gate cannot
-  be disabled, and with it off the jumps take the seek re-anchor and call `endRun` *directly*
-  with `established` still true, so the ordering bug is invisible there.
-
-### Fixed
-
 - **`--readahead-subblock-dispatch`'s help and docs row claimed a benefit no measured shape
   shows** ([#407](https://github.com/scttfrdmn/lith/issues/407)). An external 2×2 on the v1.14.0
   artifact found **all four arms identical** on a GRIB `.idx` sweep (3.02×), a FITS cutout
@@ -99,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that a handle prefetches the block it is *in* — so 24 MiB for 2 of 24 chunks used, with
   `windowCap` already sitting at its 2-block floor. That is a single over-wide dispatch, not an
   accumulation of bounded short runs, so a mechanism aimed at repeated runs cannot reach it.
+
+- **Nothing asserted that a finished run was ever counted.** Found by a revert sweep: once the
+  `Random`-history route existed, reverting the `deEstablish`/`endRun` ordering bug stopped
+  failing anything, because the arm still fired through the other route. `runsEnded` could have
+  been permanently zero — a dead route behind a green suite, the `ttfbRecorder` shape. The new
+  test runs through the FUSE layer deliberately: at the prefetch level the coverage gate cannot
+  be disabled, and with it off the jumps take the seek re-anchor and call `endRun` *directly*
+  with `established` still true, so the ordering bug is invisible there.
 
 ## [1.14.0] - 2026-10-11
 
@@ -3515,7 +3515,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.14.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.15.0...HEAD
+[1.15.0]: https://github.com/scttfrdmn/lith/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/scttfrdmn/lith/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/scttfrdmn/lith/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/scttfrdmn/lith/compare/v1.11.0...v1.12.0
