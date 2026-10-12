@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--readahead-subblock-dispatch`'s help and docs row carried fixture figures and a stale
+  "measured inert" note** ([#407](https://github.com/scttfrdmn/lith/issues/407)). Both now carry
+  the external v1.15.0 measurement, two arms and two reps with the default arm reproducing the
+  previous release exactly as the control:
+
+  | shape | default | with the flag | GETs | `prefetch-range` |
+  |---|---|---|---|---|
+  | GRIB `.idx` sweep | 3.02× | **1.39×** | 72 → 71 | 0 → 5.05 MB |
+  | HEMCO time-slice | 1.79× | **1.48×** | 340 → 339 | 0.26 → 4.98 MB |
+  | FITS cutout | 2.20× | 2.20× | 12 → 12 | 0 |
+
+  All of GRIB's `whole` fills become `prefetch-range` and its used:issued goes 2:24 → 2:5, so the
+  change is attributable rather than inferred. **The GET count does not rise**, which settles the
+  [#124](https://github.com/scttfrdmn/lith/issues/124) concern that a byte win would arrive as a
+  GET explosion: the span replaces whole-block fetches rather than fanning out.
+
+  **Two shapes qualify, not one, and the docs now say so.** I predicted only GRIB would move, on
+  the premise that HEMCO handles never enter `Random`; a trace I had already quoted showed one of
+  them at 129 consecutive `random`→`random` transitions. The trigger is a property of the *access
+  pattern*, not of a file format — any handle that reads scattered and then reads a short
+  contiguous stretch meets it. Recorded so the next reader does not inherit the wrong premise.
+
+  **And the pre-registration it broke was badly written.** Its failure condition — "if FITS or
+  HEMCO move at all, the mechanism is not as described" — conflated whether the *trigger behaves
+  as specified* with *which shapes meet it*. Only the first is a claim about the code. A falsifier
+  that depends on a guess about someone else's workload tests the guess.
+
+  **Still off by default, and the row now says what is missing:** wall clock on the two rows that
+  move. The arm bounds prefetch, so its risk is latency rather than bytes — fetching 0.46× the
+  bytes could be faster, neutral or slower, and a byte count cannot separate those. #309's 11×
+  regression came from a prefetch-depth change that looked clean on totals.
+
 ## [1.15.0] - 2026-10-12
 
 ### Changed
