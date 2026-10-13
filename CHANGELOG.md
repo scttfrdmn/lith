@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/knobs.md` says what to do about unfair concurrent readers on a cross-region mount**
+  ([#391](https://github.com/scttfrdmn/lith/issues/391)), from a cell run for the purpose:
+  us-west-2 reading us-east-1, lith v1.18.0, scripts and raw data in `bench/x391/`. With the
+  evidence gate off — the cross-region default — 16 concurrent readers against a contended tier
+  came out at spread **2.70–3.18**, reproducing #391; **any** evidence ratio from 2 to 64 brought
+  it to **1.17–1.63** and finished the job 15–30% sooner, on identical bytes.
+
+  **The default is unchanged, and the reason is the instrument.** The gate is off cross-region
+  because one fast whole-object reader measured 1.96× slower with it on. This cell's box streams
+  ~375 MB/s per reader, latency-bound rather than NIC-bound, which is the configuration least able
+  to show a ramp penalty — so its single-reader null (ratio 16 at 0.94–1.00×) does not refute it.
+  Ratio 64 *did* show a penalty, ~3× in 3 of 5 reps, so the documented range is 2–16.
+
+  **And the first run missed the regime, which is recorded rather than dropped.** Its working set
+  fit in the tier, nothing was contended, and gate-off came out fair at 1.27–1.32. #391's
+  unfairness needs the tier to be contended; the second run used `--mem-cache 1GiB` to make it so.
+  Cost $6.33, of which $6.02 was inter-region transfer.
+
 ### Fixed
 
 - **`lith_prefetch_evidence_clamped_total`'s help said it was "zero unless

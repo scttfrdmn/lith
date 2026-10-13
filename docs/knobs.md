@@ -324,6 +324,30 @@ What the region pair encodes is a measured split: in-region, forcing the gate on
 
 **When the region cannot be determined the gate is off** — off-EC2, IMDS blocked, or a custom `--endpoint` with no AWS region. Off is correct in every case measured, since off-EC2 is far and non-AWS endpoints cost 1.6–2.8× at every ratio tested. An on-prem MinIO is near and loses the saving; `--readahead-evidence-ratio 4` is for that. `lith_ttfb_median_seconds`, `lith_ttfb_floor_seconds` and the `lith_ttfb_seconds` histogram remain as **diagnostics** — they are good at describing an endpoint and were not good at deciding this.
 
+#### Cross-region with several concurrent readers: set the ratio yourself
+
+**With the gate off, concurrent readers are not served evenly once the memory tier is contended**
+([#391](https://github.com/scttfrdmn/lith/issues/391)). The only bound left is the tier-pressure
+gate, and that is a ceiling on the *total*: it bounds waste and admits first-come, so the first
+readers to establish take the budget. Measured cross-region (us-west-2 reading us-east-1), 16
+concurrent readers with demand 8× the tier:
+
+| | spread (slowest ÷ fastest) | last reader |
+|---|---|---|
+| gate off (the cross-region default) | **2.70–3.18** | 17.7–22.4 s |
+| `--readahead-evidence-ratio` 2, 4 or 16 | **1.17–1.63** | 15.2–16.5 s |
+
+Same bytes; the job simply finishes sooner because the last reader is no longer starved. **When the
+tier is not contended there is no unfairness to fix** — the same 16 readers against a tier that
+holds their working set came out at 1.27–1.32 gate-off.
+
+So if a cross-region mount runs **many readers at once against a tier small relative to what they
+read**, set `--readahead-evidence-ratio` in the **2–16** range. **Not 64**: that was ~3× slower for a
+single reader in 3 of 5 reps. It is not the default because the reason the gate is off cross-region
+— a measured 1.96× slowdown for one fast whole-object reader — was not refuted by this cell: the box
+it ran on is latency-bound at ~375 MB/s per stream, which is the configuration least able to show a
+ramp penalty. Raw data and scripts: `bench/x391/`.
+
 **The cost is fixed, not proportional.** Across a 14.5× object-size range the penalty stayed at +0.07–0.18 s; proportional would have made the 3.78 GB case +2.0 s and it measured +0.14 s. The *ratio* stays bounded (~+24% worst case in the exposed band) because the baseline carries its own fixed cost of roughly 0.5 s per object — which is **unexplained**, is 72% of a 260 MB read's wall, and is not the GET count: a cold sequential 64 MiB read issues 22 GETs, about 48 ms even fully serialized at 2.2 ms ([#233](https://github.com/scttfrdmn/lith/issues/233)).
 
 **What it does not touch.** Objects at or below `--parts-max` take the whole-file parts fetch and never reach the windowed path. A handle the detector has not established never consults the cap, so a scattered or random reader is unaffected — and `evidence_held = 0` in a trace can mean the [#221](https://github.com/scttfrdmn/lith/issues/221) coverage gate got there first rather than that this one did not bind. The two are in series, coverage first.
