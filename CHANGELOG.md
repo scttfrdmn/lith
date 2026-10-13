@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--demand-precise-nontiling`: a demand read can be served its extents when the coverage
+  signal has judged the handle scattered** ([#408](https://github.com/scttfrdmn/lith/issues/408)).
+  Experimental, **off by default**, and the reason it is off is the interesting part.
+
+  **The finding corrects the diagnosis on the issue.** A ZIP read of a 10 MB archive — central
+  directory, then 20 random 20 KiB entries — fetches the whole archive, confirmed externally
+  against a CloudTrail ledger. The report concluded this was a demand-chunk-size floor and not
+  fixable by prefetch policy. The second half is right; the first is not. lith *has* a byte-exact
+  demand lane and these reads are far under its threshold (32 KiB against 1 MiB). What blocked it
+  is the lane's predicate, `Random || Strided` — states denominated in **blocks**. A 10 MB object
+  over 8 MiB blocks is 1.25 blocks, and measured, **20 of 22 reads land in the same block**, 1
+  adjacent, 0 further. The handle sits in `Cold` forever. Its trailing coverage meanwhile is
+  **0.056** against the 0.50 threshold with the window full: the block-space machine has nothing
+  to say and the byte-space signal is emphatic.
+
+  So `prefetch.NotTiling` is a third qualifying claim rather than a loosening of the first two —
+  not "we have not decided" and not "the block deltas are wild", but "the bytes this handle
+  touched do not tile". It is byte-denominated, so object size cannot defeat it. With it on, the
+  ZIP shape fetches **3.3 MB instead of 9.4 MB**.
+
+  **★ And it is off by default because it trades bytes for round trips, with the arithmetic against
+  it.** The same shape's fills go **9 → 16**: whole-chunk fetching *amortizes* faults for a
+  scattered reader whose entries cluster — 20 entries across 10 chunks means two often share one
+  fetch. 6.2 MB saved buys **5–20 ms** of transfer; **7 extra round trips cost 210–990 ms** at a
+  30–141 ms first byte, a loss in every regime. That is the same bytes-for-wall shape as the
+  default rolled back one release earlier, caught here before shipping rather than after, by
+  reading the GET count in my own test output.
+
+  So the right reading of #408 is **not a defect but a deliberate latency-versus-bytes trade**,
+  which lith currently makes in favour of latency — correctly for most mounts. The flag is for the
+  case where egress cost dominates: a cross-region or cross-cloud mount reading archives it
+  touches sparsely.
+
+  **What it cannot reach, and the guard is pre-existing.** A tiling stream has coverage ~1 and
+  never matches; `TestColdSequentialGetShape`, the #233 witness, catches a version that drops the
+  window-full requirement, so the safety property was already pinned rather than invented for
+  this. And a handle with a committed window cannot match either: the coverage judgement and
+  establishment are **mutually exclusive by construction**, which also means nothing is
+  prefetching for a handle this matches, so a precise read cannot land on top of a whole-block
+  prefetch — #222's measured-worse case.
+
+### Fixed
+
+- **`TestStreamingByteIdentical`'s fixture was not a stream.** It read 64 KiB at every 1 MiB
+  boundary — 1/16 density — and asserted that a "strictly sequential read run" never goes
+  byte-exact. Measured, that handle never leaves `Cold`, never establishes, has window 0 and
+  prefetches nothing, and its trailing coverage is 0.0625. The name and the premise described a
+  reader the fixture did not contain, and the chunk-alignment assertion was protecting a property
+  that reader does not have.
+
+  Found by #408: extending the demand lane took that reader from **16× to 2.4×** and the test
+  failed — correctly reporting a change, incorrectly calling it a leak. The fixture now reads
+  whole chunks, which is what its intent requires, with preconditions asserting the handle
+  actually establishes and is judged tiling. The 1/16 case is now its own test, recording that it
+  is served precisely and why that is safe there.
+
 ## [1.17.1] - 2026-10-12
 
 ### Fixed

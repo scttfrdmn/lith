@@ -185,22 +185,96 @@ func TestDetectorStillGovernsPosture(t *testing.T) {
 	}
 }
 
-// TestStreamingByteIdentical: a strictly sequential read run never reaches Random,
-// so no read goes byte-exact — every S3 fetch is chunk-aligned (whole-chunk
-// fills only), identical to the pre-change behavior.
+// TestStreamingByteIdentical: a TILING sequential read run never goes byte-exact — every S3
+// fetch is chunk-aligned, identical to the pre-change behaviour.
+//
+// ★ THE FIXTURE READS WHOLE CHUNKS, AND IT DID NOT USED TO. It read 64 KiB at every 1 MiB
+// boundary, which is 1/16 density and NOT a stream: measured, that handle never leaves Cold,
+// never establishes, has window 0 and prefetches nothing, and its trailing coverage is 0.0625
+// against the 0.50 threshold. The test's name and its stated premise ("a strictly sequential read
+// run never reaches Random") described a reader its own fixture did not contain, and the
+// chunk-alignment assertion was protecting a property that reader does not have.
+//
+// It was #408 that exposed this: extending the byte-exact lane to a coverage-judged
+// non-tiling handle took that 1/16 reader from 16x to 2.4x, and this test failed -- correctly
+// reporting a change, incorrectly calling it a leak. The 1/16 case is now its own test below.
+// This one keeps the original intent with a fixture that actually tiles.
 func TestStreamingByteIdentical(t *testing.T) {
 	raw, srv := newByteExactFS(t, 32<<20) // exact multiple of ChunkSize
 	node, fh := openBig(t, raw)
 	for i := int64(0); i < 32; i++ {
-		readAt(t, raw, node, fh, i*chunk, 64<<10) // sequential 64 KiB reads
+		readAt(t, raw, node, fh, i*chunk, chunk) // WHOLE chunks: a stream that tiles
 		if st := raw.handleOf(fh).pf.state(); st == prefetch.Random {
 			t.Fatalf("sequential run reached Random at chunk %d", i)
 		}
 	}
-	// Every fetch was a whole chunk: total S3 bytes are chunk-aligned (no 64 KiB
-	// partial fetch leaked in). A byte-exact fetch would leave a non-chunk residue.
+	h := raw.handleOf(fh)
+	// The precondition the old fixture silently lacked: this handle must actually look like a
+	// stream to the detector, or the assertion below is about a different kind of reader.
+	if !h.pf.isEstablished() {
+		t.Fatalf("a whole-chunk sequential run did not establish (state %v); this fixture is "+
+			"not the tiling stream the assertion below is about", h.pf.state())
+	}
+	if h.pf.notTiling() {
+		t.Fatal("a whole-chunk sequential run was judged not-tiling; the coverage signal is " +
+			"wrong about a reader that covers every byte it passes")
+	}
+	// Every fetch was a whole chunk: total S3 bytes are chunk-aligned.
 	if gb := quiesce(srv); gb%chunk != 0 {
 		t.Fatalf("streaming fetched %d bytes, not chunk-aligned — a byte-exact fill leaked into the sequential path", gb)
+	}
+}
+
+// ★ #408: A READER THAT TOUCHES A FRACTION OF EVERY CHUNK IS SERVED PRECISELY, and this records
+// the case the old streaming fixture was accidentally testing.
+//
+// 64 KiB at every 1 MiB boundary. Block-space deltas say "sequential" (d == 1 every read), but
+// in byte space it is 1/16 density, so the coverage signal judges it not-tiling and the demand
+// lane serves its extents. Measured 16x -> 2.4x.
+//
+// WHY THIS IS SAFE HERE AND WAS NOT SAFE FOR #222's SHAPE: this handle never establishes, so its
+// window is 0 and it dispatches NO prefetch -- there is nothing for a precise read to land on top
+// of. #222's strided reader had a window, and adding byte-exact demand there measured bytes going
+// UP by ~14.9 KB per read until the prediction was bounded too.
+func TestFractionalChunkReaderIsServedPrecisely(t *testing.T) {
+	raw, srv, _ := newWalkFS(t, 32<<20, 1<<20, 0, false, false, true)
+	node, fh := openBig(t, raw)
+	h := raw.handleOf(fh)
+
+	var toolBytes int64
+	for i := int64(0); i < 32; i++ {
+		readAt(t, raw, node, fh, i*chunk, 64<<10)
+		toolBytes += 64 << 10
+	}
+	got := quiesce(srv)
+	t.Logf("64 KiB at every %d B chunk: fetched %d B for %d B read = %.1fx; state=%v "+
+		"established=%v notTiling=%v window=%d",
+		int64(chunk), got, toolBytes, float64(got)/float64(toolBytes), h.pf.state(),
+		h.pf.isEstablished(), h.pf.notTiling(), h.pf.window())
+
+	// THE PRECONDITIONS, so this cannot pass for an unrelated reason: the judgement fired, and
+	// nothing was prefetching when it did.
+	if !h.pf.notTiling() {
+		t.Fatal("the coverage signal did not judge a 1/16-density reader as not-tiling, so the " +
+			"demand lane is not being exercised by this fixture")
+	}
+	if h.pf.window() != 0 || h.pf.peakWindow() != 0 {
+		t.Errorf("this handle committed a window (now %d, peak %d). A byte-exact demand read on "+
+			"a handle that is also being prefetched is #222's measured-worse case; the safety of "+
+			"this test's claim depends on the window being zero",
+			h.pf.window(), h.pf.peakWindow())
+	}
+
+	// AND THE RESULT: far below one chunk per read, which is what it used to pay.
+	whole := int64(32) * int64(chunk)
+	if got >= whole {
+		t.Errorf("fetched %d B, no better than %d B of whole chunks — the reader touches 1/16 of "+
+			"each chunk and should be served its extents", got, whole)
+	}
+	// A floor, so a fixture serving from cache cannot pass quietly.
+	if got < toolBytes {
+		t.Errorf("fetched %d B for %d B of reads — below what was demanded, so this measures "+
+			"cache hits rather than fetches", got, toolBytes)
 	}
 }
 

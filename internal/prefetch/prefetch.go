@@ -196,6 +196,10 @@ type Prefetcher struct {
 	// an establishment that existed, and these handles are rejected while still provisional,
 	// so the purest #316 cell incremented ZERO counters (reported from a 48-rank GCHP run).
 	coverageHeld int64
+	// lastCov is the trailing coverage ratio the most recent read produced. recordRead computes
+	// it on EVERY read, before the same-block early return, so it is available even for a
+	// handle whose block-space deltas never change -- which is the case NotTiling exists for.
+	lastCov float64
 }
 
 // covSpan is one read's byte range [off, end).
@@ -582,9 +586,54 @@ const strideRun = 2
 // handle is treated as not-yet-established and served precise.
 const covReads = 3
 
+// NotTiling reports that the coverage signal has JUDGED this handle's access as scattered: the
+// trailing window is full enough to judge, and the coverage it measured is below the threshold.
+//
+// ★ WHY THIS EXISTS SEPARATELY FROM State(). The byte-exact demand lane keys on Random or
+// Strided -- "confirmed not a contiguous stream" -- and deliberately excludes Cold, which means
+// "not yet known" (#222, #233). But those states are denominated in BLOCKS, and an object barely
+// larger than one block cannot produce block-space evidence at all: a ZIP read of a 10 MB archive
+// over 8 MiB blocks was measured at 20 of 22 reads in the SAME block, 1 adjacent, 0 further, and
+// the handle sat in Cold for every one of them. Meanwhile its trailing coverage was 0.056 against
+// a 0.50 threshold with the window full. The block-space machine had nothing to say and the
+// byte-space signal was emphatic.
+//
+// So this is a THIRD claim, not a relaxation of the second: not "we have not decided" and not
+// "the block deltas are wild", but "the bytes this handle touched do not tile". It is
+// byte-denominated, so it works on an object of any size.
+//
+// ★★ IT IS MUTUALLY EXCLUSIVE WITH Established() BY CONSTRUCTION, so no extra guard is needed
+// and I added a redundant one before checking. `established` is set only in the branch where
+// coverageOK(cov) has just passed, which requires cov >= covMin, and lastCov is that same cov; a
+// later low-coverage read takes the coverage-held branch, which clears `established`. So a
+// handle cannot be established and judged not-tiling at the same moment.
+//
+// WHICH MEANS NOTHING IS PREFETCHING for a handle this matches: an unestablished handle has
+// window 0 and dispatches nothing. That is the property that makes a byte-exact demand read safe
+// here -- it cannot land on top of a whole-block prefetch, which is #222's measured-worse case
+// (+1.1% bytes) and the reason that lane was never extended by state alone.
+//
+// My first version returned the coverage judgement alone, on the reasoning that a cold
+// SEQUENTIAL reader tiles and so could not match. TestStreamingByteIdentical failed: its fixture
+// reads 64 KiB at every 1 MiB boundary, which is sequential in BLOCK space and 94% holes in byte
+// space, so its coverage is 0.0625 and the judgement fires. That handle is ESTABLISHED and is
+// being prefetched WHOLE BLOCKS -- so serving its demand reads byte-exact puts extents on top of
+// a whole-block prefetch, which is #222's measured-worse case (+1.1% bytes) arriving by a new
+// route.
+//
+// So the claim this predicate makes is narrower and is the one the demand lane actually needs:
+// the bytes do not tile AND nothing is prefetching for this handle, so a precise read cannot
+// land inside a fetch that is happening anyway. The ZIP shape satisfies both -- it never
+// establishes and issues zero prefetch. A tiling stream fails the first test; a strided slice
+// reader with a window fails the second, and is #222's business rather than this one's.
+func (p *Prefetcher) NotTiling() bool {
+	return p.covMin > 0 && len(p.covSpans) >= covReads && p.lastCov < p.covMin
+}
+
 // coverageOK reports whether the coverage signal confirms tiling: the gate is on,
 // enough reads have accumulated to judge, and the trailing coverage clears the
 // threshold. cov is the ratio just returned by recordRead.
+
 func (p *Prefetcher) coverageOK(cov float64) bool {
 	if p.covMin <= 0 {
 		return true // gate disabled: behaviour-preserving
@@ -693,6 +742,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		p.runConsumed += length
 	}
 	cov := p.recordRead(off, length)
+	p.lastCov = cov
 	if !p.haveLast {
 		p.haveLast = true
 		p.lastBlock = blockIdx

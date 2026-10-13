@@ -38,6 +38,7 @@ var serveInapplicable = map[string]string{
 	"readahead-evidence-ratio":    "FUSE per-handle window evidence gate (#256); internal/nfs has no prefetcher at all",
 	"readahead-evidence-per-run":  "which consumption figure that same gate reads (#407); internal/nfs has no prefetcher at all",
 	"readahead-subblock-dispatch": "the same gate's sub-block residual (#407 arm B); internal/nfs has no prefetcher at all, so it has no block-denominated window to bound",
+	"demand-precise-nontiling":    "the demand lane's granularity for a coverage-judged scattered handle (#408); internal/nfs has no prefetch detector, so it has no coverage signal to judge with",
 	"prefetch-coverage-min":       "FUSE per-handle coverage gate (#221/#316); internal/nfs has no prefetcher at all",
 	"bgzf-whole-file-max":         "FUSE bgzf prefetch (#107); gateway read path does not use it",
 	// Diagnostics / internal.

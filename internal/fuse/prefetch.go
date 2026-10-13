@@ -224,6 +224,15 @@ func (w *pfWrapper) state() prefetch.State {
 	return w.pf.State()
 }
 
+// notTiling reports that the coverage signal has judged this handle's access scattered. See
+// prefetch.NotTiling: it is the byte-denominated form of the claim the demand lane needs, and
+// the only form available on an object too small to produce block-space evidence.
+func (w *pfWrapper) notTiling() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pf.NotTiling()
+}
+
 func (w *pfWrapper) resets() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
