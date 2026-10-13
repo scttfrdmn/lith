@@ -42,8 +42,8 @@ func walkArms(t *testing.T, perRun, subBlock bool, fieldBytes, readBytes, spacin
 
 	add := func(ds []Dispatch) {
 		for _, d := range ds {
-			if d.Span > 0 {
-				bytes += d.Span
+			if d.SpanLen > 0 {
+				bytes += d.SpanLen
 				spans++
 				continue
 			}
@@ -220,8 +220,8 @@ func TestSubBlockCannotReachASequentialCopy(t *testing.T) {
 		for i := int64(0); i < 400; i++ {
 			off := i * read
 			for _, d := range p.Observe(off/testBlock, off, read, 0) {
-				if d.Span > 0 {
-					bytes += d.Span
+				if d.SpanLen > 0 {
+					bytes += d.SpanLen
 					spans++
 					continue
 				}
@@ -294,7 +294,7 @@ func TestSubBlockRequiresAFinishedRun(t *testing.T) {
 	}
 
 	p := newP()
-	if ds, ok := p.subBlockSpan(7); ok {
+	if ds, ok := p.subBlockSpan(7, 1<<30); ok {
 		t.Errorf("a handle with runsEnded=0 was given %v; the cold-ramp protection is gone", ds)
 	}
 
@@ -303,25 +303,25 @@ func TestSubBlockRequiresAFinishedRun(t *testing.T) {
 	// only the finished-run route existed, and the real tools finish ~no runs.
 	pr := newP()
 	pr.resetRandom = 1
-	if dsr, okr := pr.subBlockSpan(7); !okr {
+	if dsr, okr := pr.subBlockSpan(7, 1<<30); !okr {
 		t.Error("a handle with a Random history was refused a span; that route is what makes " +
 			"this arm reach the measured shapes at all")
-	} else if len(dsr) != 1 || dsr[0].Span <= 0 {
+	} else if len(dsr) != 1 || dsr[0].SpanLen <= 0 {
 		t.Errorf("Random-history route produced %v, want one span dispatch", dsr)
 	}
 
 	p = newP()
 	p.runsEnded = 1
-	ds, ok := p.subBlockSpan(7)
+	ds, ok := p.subBlockSpan(7, 1<<30)
 	if !ok {
 		t.Fatal("a handle that HAS finished a run was refused a span, so the precondition " +
 			"rejects the case it is supposed to admit and arm B can never fire")
 	}
-	if len(ds) != 1 || ds[0].Span <= 0 {
+	if len(ds) != 1 || ds[0].SpanLen <= 0 {
 		t.Fatalf("expected one span dispatch, got %v", ds)
 	}
-	if want := int64(float64(1<<20) * testRatio); ds[0].Span != want {
-		t.Errorf("span is %d B, want %d B (one run's %d B at ratio %g)", ds[0].Span, want,
+	if want := int64(float64(1<<20) * testRatio); ds[0].SpanLen != want {
+		t.Errorf("span is %d B, want %d B (one run's %d B at ratio %g)", ds[0].SpanLen, want,
 			int64(1)<<20, testRatio)
 	}
 	if ds[0].Block != 7 {
@@ -343,7 +343,7 @@ func TestSubBlockIsOffUntilSet(t *testing.T) {
 	p.SetEvidence(testRatio, testBlock)
 	p.established, p.runsEnded = true, 3
 	p.consumed, p.runConsumed = 1<<20, 1<<20
-	if ds, ok := p.subBlockSpan(1); ok {
+	if ds, ok := p.subBlockSpan(1, 1<<30); ok {
 		t.Errorf("sub-block dispatch acted without SetSubBlockDispatch: %v", ds)
 	}
 }
@@ -355,7 +355,7 @@ func TestSubBlockNeedsTheEvidenceGate(t *testing.T) {
 	p.SetSubBlockDispatch(true)
 	p.established, p.runsEnded = true, 3
 	p.consumed, p.runConsumed = 1<<20, 1<<20
-	if ds, ok := p.subBlockSpan(1); ok {
+	if ds, ok := p.subBlockSpan(1, 1<<30); ok {
 		t.Errorf("sub-block dispatch acted with the evidence gate off: %v", ds)
 	}
 }

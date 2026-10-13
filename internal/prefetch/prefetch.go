@@ -154,7 +154,12 @@ type Prefetcher struct {
 	// ways of making it fetch sooner refuted in #231. A genuine sequential copy never ends a
 	// run, so this is zero for it forever and the arm cannot reach it. That is the same witness
 	// perRunEvidence is built on, used here as a precondition rather than a basis.
-	runsEnded    int64
+	runsEnded int64
+	// spanTo is the byte offset the furthest issued span reaches. It is the span path's
+	// frontier, in BYTES, exactly as `frontier` is the whole-block path's frontier in blocks --
+	// and it exists for the same reason: so a dispatch is issued once and the lead is
+	// maintained as the reader advances, rather than once per establishment.
+	spanTo       int64
 	spansIssued  int64 // dispatches bounded to a sub-block span
 	evidenceHeld int64 // times the gate held the window below maxReadahead
 	evidenceCut  int64 // cumulative blocks withheld by those holds
@@ -331,6 +336,10 @@ func (p *Prefetcher) endRun() {
 		p.runsEnded++
 	}
 	p.runConsumed = 0
+	// The span frontier belongs to the run, like runConsumed: a new run starts with no lead,
+	// and leaving it set would make the next run's first span look already-covered and dispatch
+	// nothing at all.
+	p.spanTo = 0
 }
 
 // windowCap is the largest window, in blocks, this handle's demonstrated
@@ -404,7 +413,7 @@ func (p *Prefetcher) evidenceBasis() int64 {
 // whole-block dispatch. The span's start offset is deliberately not expressed here: the
 // detector reports how MUCH, and the FUSE layer -- which owns the read's byte offsets -- places
 // it immediately after the read that produced it. Same split as Dispatch.ReadLen.
-func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
+func (p *Prefetcher) subBlockSpan(blockIdx, readEnd int64) ([]Dispatch, bool) {
 	if !p.subBlock || p.evidenceRatio <= 0 || p.evidenceBlock <= 0 {
 		return nil, false
 	}
@@ -414,10 +423,10 @@ func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
 	//   resetRandom > 0 -- it has collapsed to Random at least once
 	//
 	// The second was added because the first is almost never true of the real tools. An
-	// external 2x2 on v1.14.0 found this arm inert on every measured shape, and the per-handle
-	// trace said why: a GRIB handle establishes ONCE, in its last 12 of 90 reads, and finishes
-	// no runs at all; 67 of its 90 reads are random->random. So "has finished a run" described
-	// a fixture, and "has been Random" describes the tools.
+	// external 2x2 found this arm inert on every measured shape, and the per-handle trace said
+	// why: a GRIB handle establishes ONCE, in its last 12 of 90 reads, and finishes no runs at
+	// all; 67 of its 90 reads are random->random. So "has finished a run" described a fixture,
+	// and "has been Random" describes the tools.
 	//
 	// A plain sequential copy satisfies NEITHER. Verified in the detector: a copy reaches only
 	// Cold then Sequential, with resetRandom 0 -- the #221 coverage gate holds its first reads
@@ -432,8 +441,7 @@ func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
 	// contiguous appetite -- GRIB's 11.8 MB lifetime earns 23.6 MB, above the floor, so a
 	// lifetime basis declines on exactly the shape this exists for. The claim being bounded is
 	// "how much contiguous reading has this handle shown in THIS stretch", so the basis has to
-	// be the stretch. It also means this arm no longer depends on --readahead-evidence-per-run,
-	// which is what made the earlier 2x2 need four cells to say nothing.
+	// be the stretch.
 	basis := p.runConsumed
 	if basis <= 0 {
 		return nil, false
@@ -444,8 +452,31 @@ func (p *Prefetcher) subBlockSpan(blockIdx int64) ([]Dispatch, bool) {
 		// the normal whole-block path is already no larger than the evidence allows.
 		return nil, false
 	}
+
+	// ★★ THE LEAD IS MAINTAINED, NOT PLACED ONCE. This is the correction a shipped regression
+	// bought: the first version dispatched one span at establishment and nothing until the
+	// reader crossed a block boundary, so a handle that went on STREAMING faulted through the
+	// remainder. Measured 20% slower on an index-then-stream reader, below both brackets in 8
+	// of 8 bracketed reps, with bytes identical -- the whole cost was faults and wall.
+	//
+	// The rule is the evidence-gate semantic expressed in bytes rather than blocks: keep the
+	// frontier `earned` bytes ahead of the reader. `earned` grows with the run, so a handle
+	// that keeps reading contiguously earns a deepening lead and converges on what the
+	// whole-block path would have given it, while a handle that stops has committed only what
+	// it had read when it stopped.
+	want := readEnd + earned
+	if want <= p.spanTo {
+		// Already led this far. Returning ok=true matters: the bound is IN FORCE, so the caller
+		// must not fall through and dispatch whole blocks instead.
+		return nil, true
+	}
+	from := p.spanTo
+	if from < readEnd {
+		from = readEnd
+	}
+	p.spanTo = want
 	p.spansIssued++
-	return []Dispatch{{Block: blockIdx, Span: earned}}, true
+	return []Dispatch{{Block: blockIdx, SpanOff: from, SpanLen: want - from}}, true
 }
 
 // recordRead pushes a read's byte range into the trailing ring and returns the
@@ -622,15 +653,24 @@ type Dispatch struct {
 	// is every sequential-ramp and seek-re-anchor dispatch: there, the reader has demonstrated
 	// contiguous progress and the whole block is what it is going to consume.
 	ReadLen int64
-	// Span, when > 0, is a number of bytes to prefetch CONTIGUOUSLY FROM THE END OF THE READ
-	// that produced this dispatch, in place of any whole block (#407 arm B). It is an amount
-	// the handle's evidence has already earned, NOT a read length to be judged against a
-	// threshold -- which is the difference from ReadLen, and the reason it is a separate field.
-	// Applying ReadLen's small-read threshold to it would silently drop every span above that
-	// threshold back to a whole-block fetch, i.e. exactly the shapes this arm is for.
+	// SpanOff and SpanLen, when SpanLen > 0, are an ABSOLUTE byte range to prefetch in place of
+	// any whole block (#407 arm B). The length is an amount the handle's evidence has already
+	// earned, NOT a read length to be judged against a threshold -- which is the difference from
+	// ReadLen, and the reason these are separate fields. Applying ReadLen's small-read threshold
+	// here would drop every span above that threshold back to a whole-block fetch, i.e. exactly
+	// the shapes this arm is for.
+	//
+	// AN ABSOLUTE RANGE, NOT AN IMPLICIT "AFTER THIS READ". The first version carried only a
+	// length and let the FUSE layer place it at the read's end, on the principle that the
+	// detector reports how much and the layer owns offsets. That is elegant until a span has to
+	// be EXTENDED as the reader consumes it -- the extension starts at the end of the previous
+	// span, which only the detector knows. Keeping the lead required the detector to name the
+	// range, and a shipped regression is what established that it has to keep the lead:
+	// one span placed at establishment and never extended left a streaming reader faulting
+	// until the next block crossing, measured 20% slower.
 	//
 	// Block is still set, for tracing and so a dispatch always says where it is.
-	Span int64
+	SpanOff, SpanLen int64
 }
 
 // Observe records a demand read at blockIdx, byteGap bytes from the end of the
@@ -662,8 +702,21 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 	d := blockIdx - p.lastBlock
 	p.lastBlock = blockIdx
 
-	// Re-read of the same block: no state change, no dispatch.
+	// Re-read of the same block: no state change, and no WHOLE-BLOCK dispatch -- the frontier is
+	// denominated in blocks and cannot move without a block advance.
+	//
+	// ★ BUT THE SPAN PATH IS DENOMINATED IN BYTES AND MUST STILL LEAD HERE. At the default
+	// 8 MiB block a 128 KiB reader takes 64 reads to cross one, so returning early for all of
+	// them is precisely what left a streaming handle faulting after its one span: the next
+	// dispatch could not come until the crossing. Extending the lead needs forward progress,
+	// which byteGap >= 0 is: a re-read of bytes already behind the reader gives a negative gap
+	// and must not earn anything.
 	if d == 0 {
+		if byteGap >= 0 && p.established {
+			if ds, ok := p.subBlockSpan(blockIdx, off+length); ok {
+				return ds
+			}
+		}
 		return nil
 	}
 
@@ -808,7 +861,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		// #407 arm B: a handle that has proved it takes short runs gets a span of what it
 		// earned rather than the floor's two whole blocks. Inert unless the flag is on AND the
 		// handle has ended a run AND the floor is what binds -- see subBlockSpan.
-		if ds, ok := p.subBlockSpan(p.cursor); ok {
+		if ds, ok := p.subBlockSpan(p.cursor, off+length); ok {
 			return ds
 		}
 		return p.advance(p.cursor + 1 + p.window)
@@ -876,7 +929,7 @@ func (p *Prefetcher) Observe(blockIdx, off, length, byteGap int64) []Dispatch {
 		// two arms would then compose to nothing on the branch where they matter most. The
 		// evidence for this landing is the run that just finished, which is what runConsumed
 		// still holds here.
-		ds, bounded := p.subBlockSpan(blockIdx)
+		ds, bounded := p.subBlockSpan(blockIdx, off+length)
 		p.endRun()
 		if bounded {
 			return ds

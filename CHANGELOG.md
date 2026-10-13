@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A sub-block span now keeps a lead instead of being placed once**
+  ([#407](https://github.com/scttfrdmn/lith/issues/407)). This is the cause of v1.16.0's rolled-back
+  regression, fixed; the flag stays off by default.
+
+  The span bounded the dispatch a handle got at establishment and was never extended. The
+  whole-block frontier cannot move again until the reader crosses a block — **64 reads at the
+  default 8 MiB block and a 128 KiB read** — so a handle that went on *streaming* faulted through
+  everything the one span did not cover. Measured externally at median **0.798** throughput with
+  **bytes identical**: the entire cost was faults and wall.
+
+  The span now holds the frontier `earned` bytes ahead of the reader and is extended as the reader
+  consumes it, **including within a block**, which is where the detector previously returned
+  early for every read that did not cross a boundary. That is the evidence-gate rule expressed in
+  bytes rather than blocks: a handle that keeps reading contiguously earns a deepening lead and
+  converges on what the whole-block path would have given it, while one that stops has committed
+  only what it had read.
+
+  `Dispatch` now carries an **absolute** span range (`SpanOff`, `SpanLen`) rather than a length the
+  FUSE layer placed at the read's end. An extension begins where the previous span ended, which
+  only the detector knows — the original split was elegant and could not express the fix.
+
+  **The cost is some of the byte saving**, which is the right trade and is stated rather than
+  elided: a 64-field walk fixture goes from 12.1× to **8.6×** less dispatch, and the end-to-end
+  figure from 2.03× to **1.87×** fewer bytes.
+
+### Added
+
+- **A deterministic guard for the axis the previous witness missed.** The earlier
+  scatter-then-stream test asserted bytes and span count; bytes were identical and the whole cost
+  was faults and wall, so it passed and the regression shipped. Fault counters are too noisy in a
+  fake-server fixture to assert on, but **dispatch coverage in byte space is deterministic** — it
+  is a function of the decisions, not of timing — so that is what the new test asserts.
+
+  It **sweeps the stream's phase relative to the block grid**, which is not decoration. At a
+  block-aligned start the handle establishes 64 reads in with a near-floor span and the gap does
+  not appear at all; a first version of the probe used an aligned base and reported the two arms
+  identical, which reads exactly like "no regression". The gap is largest when the handle
+  establishes *early*, having earned little:
+
+  | stream phase | established at read | uncovered, whole-block | uncovered, span placed once |
+  |---|---|---|---|
+  | +0 MiB | 64 | 65 | 65 *(invisible)* |
+  | +2 MiB | 48 | 49 | 73 |
+  | +6 MiB | 16 | 17 | **105** |
+  | +7 MiB | 72 | 73 | 73 *(invisible)* |
+
+  With the lead maintained, every phase matches the whole-block arm. Three further properties are
+  pinned because a revert sweep found each one ungated: dispatches stay a small fraction of reads
+  and never re-cover ground; a walk read **backward** gets as many spans as the same walk read
+  forward (the span frontier is absolute, so failing to reset it at a run boundary silently
+  starves every subsequent run — 35 spans became 7); and the FUSE layer passes the dispatch's own
+  offset, checked by an AST walk because no behavioural test in that package can see it.
+
+  One honest note recorded in the test: the frontier's early-return is **defensive and not
+  exercised** by any measured shape. Removing it left the dispatch count at 48 of 512, unchanged,
+  because `earned` grows twice as fast as the reader advances. The dispatch-count assertion guards
+  the floor check, which is load-bearing, rather than the frontier.
+
 ## [1.17.0] - 2026-10-12
 
 ### Changed

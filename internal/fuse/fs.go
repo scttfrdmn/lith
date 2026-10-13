@@ -1058,14 +1058,17 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		// A strided BULK reader reports a whole-chunk ReadLen, fails the threshold, and keeps
 		// whole blocks -- its next block genuinely is wanted whole.
 		for _, pd := range obs.dispatch {
-			// #407 arm B: a Span is an amount the handle's evidence has ALREADY EARNED, so it
+			// #407 arm B: a span is an amount the handle's evidence has ALREADY EARNED, so it
 			// is fetched as given and no threshold is consulted. Putting it through ReadLen's
 			// small-read threshold would drop every span above that threshold back to a whole
 			// block -- which is most of them, and precisely the shapes this arm exists for.
-			// The detector says how MUCH; this layer owns the byte offsets, so it places the
-			// span immediately after the read that earned it.
-			if pd.Span > 0 {
-				go f.store.PrefetchRange(f.ctx, h.key, end, pd.Span, h.size)
+			//
+			// The RANGE is the detector's, not this layer's. It used to send only a length and
+			// have this layer place it after the read, which cannot express an EXTENSION of an
+			// earlier span -- and extending is what keeps a streaming reader covered. A version
+			// that placed one span and never extended it shipped a 20% wall regression.
+			if pd.SpanLen > 0 {
+				go f.store.PrefetchRange(f.ctx, h.key, pd.SpanOff, pd.SpanLen, h.size)
 				continue
 			}
 			if t := f.byteExactThreshold(); pd.ReadLen > 0 && t > 0 && pd.ReadLen <= t {
