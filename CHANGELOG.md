@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The sub-block witness now covers request count, the third axis** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
+  An external bracketed cell on v1.17.1 confirmed the lead closes the coverage gap — uncovered
+  misses back to the `=false` level, 62–65 against 60–62, where span-once gave 81 — and the real
+  netCDF4 tool came out neutral. But the index-then-stream witness read a median **0.854**, and
+  the only remaining difference between arms was **~+41 GETs** for identical bytes.
+
+  Reproduced locally: **62 → 79–81 GETs** on that shape with bytes unchanged. 41 extra round trips
+  at a 30 ms first byte is 1.23 s against a ~7.4 s stream = **17%**, which brackets the 11–25% of
+  their slow reps.
+
+  **So a witness for this arm has to cover bytes, coverage *and* requests.** It covered bytes,
+  which is how a 20% regression shipped; then coverage, which is how the lead fix was verified;
+  this is the third. The span dispatch count is now asserted rather than the GET count, because it
+  is the deterministic driver — 16 in three consecutive runs while GETs came out 79, 81, 79.
+
+  **The cause is named and not yet fixed**, with the arithmetic for why: 16 dispatches is about 5×
+  what this shape needs. The span phase covers only the first ~8 MB of the stream, and across it
+  the lead grows from ~4 MB to ~16 MB, so the frontier runs *away* from the reader and ~3
+  dispatches would cover it. The extra ones happen because the frontier is recomputed as
+  `readEnd + earned` on every read and `earned` grows faster than the reader advances, so the
+  comparison against the previous frontier never short-circuits. Fixing it needs a trigger tied to
+  the **remaining lead** rather than to the earned amount — a tuning decision better made from a
+  measurement than invented, which is why this release asserts the current count instead.
+
+### Added
+
 - **`--demand-precise-nontiling`: a demand read can be served its extents when the coverage
   signal has judged the handle scattered** ([#408](https://github.com/scttfrdmn/lith/issues/408)).
   Experimental, **off by default**, and the reason it is off is the interesting part.

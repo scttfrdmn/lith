@@ -67,6 +67,7 @@ func TestScatterThenStreamCostDoesNotScaleWithStreamLength(t *testing.T) {
 		raw, srv, rec := newWalkFS(t, objBytes, blockSz, ratio, false, subBlock)
 		node, fh := openBig(t, raw)
 		h := raw.handleOf(fh)
+		gets0 := srv.GetCallCount()
 		before := quiesce(srv)
 		// Phase 1: scattered reads far enough apart to collapse the handle to Random.
 		for i := int64(0); i < 6; i++ {
@@ -78,8 +79,17 @@ func TestScatterThenStreamCostDoesNotScaleWithStreamLength(t *testing.T) {
 			readAt(t, raw, node, fh, off, read)
 		}
 		unc, hit, iss := rec.coverage()
-		t.Logf("    stream %d MiB subBlock=%-5v uncovered=%d prefetchHit=%d prefetchIssued=%d",
-			streamLen>>20, subBlock, unc, hit, iss)
+		// ★ THE REQUEST COUNT IS THE THIRD AXIS, and it is where the residual turned out to
+		// live. After the lead fix closed the coverage gap, an external bracketed cell still
+		// read a median 0.854 on this shape with uncovered back to the `=false` level and bytes
+		// identical -- the only remaining difference was ~+41 GETs. Reproduced here at
+		// 62 -> 79-81 for identical bytes. 41 extra round trips at a 30 ms first byte is 1.23 s
+		// against a ~7.4 s stream = 17%, which brackets the 11-25% of their slow reps.
+		//
+		// So a witness for this arm has to cover BYTES, COVERAGE and REQUESTS. It covered the
+		// first, which is how a 20% regression shipped; then the second; this is the third.
+		t.Logf("    stream %d MiB subBlock=%-5v uncovered=%d prefetchHit=%d prefetchIssued=%d GETs=%d",
+			streamLen>>20, subBlock, unc, hit, iss, srv.GetCallCount()-gets0)
 		return quiesce(srv) - before, h.pf.pf.SpansIssued(), h.pf.state(), reset
 	}
 
@@ -130,6 +140,26 @@ func TestScatterThenStreamCostDoesNotScaleWithStreamLength(t *testing.T) {
 			"That would disqualify the Random-history trigger", shortDelta, longDelta,
 			long.streamLen/short.streamLen)
 	}
+	// ★ AND THE SPAN DISPATCH COUNT IS PINNED, because it is what drives the request count and
+	// it is DETERMINISTIC where the GET count is not: measured 16 in three consecutive runs
+	// while GETs came out 79, 81, 79.
+	//
+	// 16 is more than this shape needs. The span phase covers only the first ~8 MB of the
+	// stream -- beyond that `earned` passes the two-block floor and the whole-block path takes
+	// over -- and across it the lead grows from ~4 MB to ~16 MB, so the frontier runs AWAY from
+	// the reader and ~3 dispatches would cover it. The extra ones happen because the frontier
+	// is recomputed as `readEnd + earned` on every read, and `earned` grows faster than the
+	// reader advances, so the comparison against the previous frontier never short-circuits.
+	// Fixing that needs a trigger tied to the REMAINING LEAD rather than to the earned amount,
+	// which is a tuning decision I would rather make from a measurement than invent. This
+	// assertion holds the line in the meantime.
+	if long.onSp > 20 {
+		t.Errorf("the streaming phase issued %d span dispatches; each costs about one extra "+
+			"GET on the reader's critical path, and an external cell attributed this arm's "+
+			"residual ~15%% wall cost on this shape to exactly that. A rise here is a "+
+			"regression in request count even when bytes are unchanged", long.onSp)
+	}
+
 	// AND THE SPAN COUNT MUST NOT SCALE EITHER, which says the same thing about the mechanism
 	// rather than about the bytes, and is the more direct statement of it.
 	if long.onSp > short.onSp+2 {
