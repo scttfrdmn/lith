@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-10-12
+
 ### Fixed
 
 - **A sub-block span now keeps a lead instead of being placed once**
@@ -3722,7 +3724,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.17.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.17.1...HEAD
+[1.17.1]: https://github.com/scttfrdmn/lith/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/scttfrdmn/lith/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/scttfrdmn/lith/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/scttfrdmn/lith/compare/v1.14.0...v1.15.0
