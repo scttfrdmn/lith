@@ -211,7 +211,7 @@ func New() *Metrics {
 		}),
 		pfEvClamped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "lith_prefetch_evidence_clamped_total",
-			Help: "Times the #256 evidence gate held a readahead window below the configured max, by object size class. Zero unless --readahead-evidence-ratio is set.",
+			Help: "Times the #256 evidence gate held a readahead window below the per-handle share the divisor would otherwise give it, by object size class. When this is high, the evidence gate and not the divisor is what bounds windows on this mount. The gate is ON BY DEFAULT for an in-region mount (ratio derived from the region pair, #368) and off cross-region or when the region is unknown, so this is zero there unless --readahead-evidence-ratio forces it.",
 		}, []string{"size_class"}),
 		pfEvWithheld: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lith_prefetch_evidence_withheld_blocks_total",

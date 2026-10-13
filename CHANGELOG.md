@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lith_prefetch_evidence_clamped_total`'s help said it was "zero unless
+  `--readahead-evidence-ratio` is set"** — stale since #368 made the ratio region-derived and on by
+  default in-region. An operator on an in-region mount reading that help would conclude the
+  counter could not apply to them, on exactly the mounts where it does. It now says what the
+  counter answers: when it is high, the evidence gate and not the divisor bounds windows on that
+  mount. Found while working out whether #312's idle handles cost anything, which is the question
+  this counter decides.
+
+- **`--memory-limit`'s docs row now carries the measurement**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)): the configuration that was OOM-killed
+  before (a 20 GB tier on a 33 GB box) survives in both reps on v1.18.0, RSS plateauing at 28.8 GB
+  against a 29.7 GB limit, with no measurable wall cost on a link-bound workload. Stated as "free
+  on a streaming workload", not "free" — concurrent GC CPU was not captured. Also records that
+  the limit is exported as `go_gc_gomemlimit_bytes`, which the row previously omitted.
+
 ## [1.18.0] - 2026-10-13
 
 ### Added
