@@ -50,6 +50,11 @@ type Config struct {
 	// ReadaheadEvidencePerRun makes the evidence gate read the CURRENT RUN's consumption
 	// instead of the handle's lifetime total (#407). Experimental, off by default.
 	ReadaheadEvidencePerRun bool
+	// DemandPreciseNonTiling serves a demand read precisely when the coverage signal has
+	// judged the handle's access scattered, even though its block-space state is still Cold
+	// (#408). OFF by default: it trades BYTES FOR ROUND TRIPS and the arithmetic favours the
+	// round trips -- see the flag's help.
+	DemandPreciseNonTiling bool
 	// ReadaheadSubBlock lets a dispatch be shorter than one block when that is all the
 	// handle's evidence earns (#407 arm B). Experimental, off by default. It is what makes
 	// ReadaheadEvidencePerRun able to change anything: the window is denominated in blocks
@@ -985,7 +990,20 @@ func (f *rawFS) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (rr
 		//
 		// Only moving both leaves a strided slice reader fetching its extents and nothing else.
 		// That is why #222 was never a one-line change in either file.
-		if st := h.pf.state(); sequential && (st == prefetch.Random || st == prefetch.Strided) {
+		// ★ #408 ADDS A THIRD WAY TO QUALIFY, and it is a different claim rather than a
+		// loosening of the first two. Random and Strided are block-denominated, and an object
+		// barely over one block cannot produce block-space evidence: a ZIP read of a 10 MB
+		// archive over 8 MiB blocks was measured with 20 of 22 reads in the SAME block and the
+		// handle in Cold throughout, while its trailing coverage sat at 0.056 against the 0.50
+		// threshold. Every 32 KiB entry read therefore pulled a whole 1 MiB chunk and the mount
+		// fetched the entire archive.
+		//
+		// notTiling() is that coverage judgement. It cannot match the cold SEQUENTIAL reader
+		// #233 protects, because such a reader tiles and its coverage is ~1 -- the guard here is
+		// the measurement rather than a state exclusion.
+		if st := h.pf.state(); sequential &&
+			(st == prefetch.Random || st == prefetch.Strided ||
+				(f.cfg.DemandPreciseNonTiling && h.pf.notTiling())) {
 			if t := f.byteExactThreshold(); t > 0 && end-off <= t {
 				sequential = false
 			}

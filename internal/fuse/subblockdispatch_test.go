@@ -71,7 +71,7 @@ func (r *kindRec) counts() map[string]int {
 
 // newWalkFS is newByteExactFS with the #407 knobs settable and a kind-counting Recorder, so
 // the arms can be measured end to end on real bytes AND on which path fetched them.
-func newWalkFS(t *testing.T, objBytes, blockSz int64, ratio float64, perRun, subBlock bool) (*rawFS, *fake.Server, *kindRec) {
+func newWalkFS(t *testing.T, objBytes, blockSz int64, ratio float64, perRun, subBlock bool, demandPrecise ...bool) (*rawFS, *fake.Server, *kindRec) {
 	t.Helper()
 	srv := fake.New()
 	srv.Put("big.bin", bytes.Repeat([]byte("A"), int(objBytes)), time.Unix(1_700_000_000, 0))
@@ -94,6 +94,7 @@ func newWalkFS(t *testing.T, objBytes, blockSz int64, ratio float64, perRun, sub
 		ReadaheadEvidenceRatio:  ratio,
 		ReadaheadEvidencePerRun: perRun,
 		ReadaheadSubBlock:       subBlock,
+		DemandPreciseNonTiling:  len(demandPrecise) > 0 && demandPrecise[0],
 	}).(*rawFS)
 	return raw, srv, rec
 }
