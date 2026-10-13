@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--readahead-subblock-dispatch` is off by default again, reverting v1.16.0**
+  ([#407](https://github.com/scttfrdmn/lith/issues/407)). It costs wall clock on an
+  index-then-stream reader, which v1.16.0's evidence did not cover.
+
+  | shape | bytes | wall, median B/D | uncovered misses |
+  |---|---|---|---|
+  | GRIB `.idx` sweep | 3.02× → 1.39× | 1.005 (11 kept reps) | 69 every arm |
+  | HEMCO time-slice | 1.79× → 1.48× | 0.974 (5 kept reps) | 331–333 every arm |
+  | **index-then-stream** | **identical** | **0.798 (5 kept reps)** | **62 → 81** |
+
+  The last row was below *both* of its brackets in **8 of 8** reps. The mechanism is the first
+  dispatch at establishment — one ~5.5 MB span in place of three whole blocks (24 MiB) — after
+  which a streaming reader faults through the uncovered remainder until the next block crossing;
+  the window schedule after that is identical in both arms.
+
+  **The trade is bytes on a walk that *stops* against wall on a walk that *continues*, and which
+  of those a mount is cannot be known at establishment.** That makes it an opt-in, not a default.
+  The 13-shape sweep was otherwise clean and the default did wire through, so nothing else is
+  affected either way; `webdataset_stream` was neutral over 8 kept reps, confirming the default
+  cost nothing where it did nothing.
+
+  Turning it back on wants **a span that still leads the reader** rather than only shrinking the
+  first dispatch — not a re-run of the same cells.
+
+### Fixed
+
+- **The witness built for this exact risk asserted the wrong axis.** `internal/fuse`'s
+  scatter-then-stream test was written before the arm shipped, specifically to catch a handle that
+  scatters and then streams, and it asserts **bytes and span count**. Bytes are identical on that
+  shape; the entire cost is in faults and wall. It passed, the default went on, and the regression
+  shipped.
+
+  **And it cannot be fixed by adding an assertion there.** The fault counts are now logged, and
+  they are too noisy in that fixture to gate on: across three identical runs the arm's extra
+  faults came out +5/+1/+0 on the short stream and +4/+4/+11 on the long one, so even a contrast
+  between the two already fails. `UncoveredMiss` fires when a demand read finds its chunk neither
+  cached nor in flight, so it races the prefetch goroutine, and a fake server has no latency for
+  that race to resolve against. The external cell needed 1 GiB streams and 8 bracketed reps to see
+  62 → 81 cleanly.
+
+  So the figures are logged with a comment that says plainly **a green run of that test does not
+  clear this arm** — the wall and fault axes are external-only. Writing a flaky assertion there
+  would have been worse than writing none.
+
 ## [1.16.0] - 2026-10-12
 
 ### Changed
