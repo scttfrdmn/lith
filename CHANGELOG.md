@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inside a container, lith sized its memory against the host's RAM**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)). `/proc/meminfo` is not namespaced by
+  the memory controller, so a container reads the **host's** `MemTotal`. A container limited to
+  4 GiB on a 256 GiB host therefore defaulted to a **64 GiB** memory tier — sixteen times its
+  whole allowance — and the startup headroom warning, comparing against the same figure, stayed
+  silent. The image's entrypoint is `lith serve nfs` and a Kubernetes pod with a memory limit is
+  the ordinary deployment, so the shipped default was an OOM-kill on the ordinary case.
+
+  The memory **budget** is now the smaller of `MemTotal` and the cgroup limit (v2 `memory.max`,
+  v1 `memory.limit_in_bytes`), with both spellings of "unlimited" recognised rather than parsed —
+  v2's literal `max` and v1's page-rounded near-`MaxInt64`. The default tier, the headroom warning
+  and the new soft limit all read it.
+
+### Added
+
+- **`--memory-limit` (default `auto`): a soft memory limit that engages only where the tier is
+  already predicted not to fit** ([#314](https://github.com/scttfrdmn/lith/issues/314)). On both
+  `mount` and `serve nfs`.
+
+  The tier is live Go heap, and at the default `GOGC=100` the collector lets the heap grow to
+  about twice the live set — measured externally at `next_gc` = **2.03 ×** the tier with RSS
+  within 1% of it. So a tier over half the budget is an OOM-kill on the way to filling it.
+  **`auto` sets a limit at 90% of the budget in exactly that case and changes nothing
+  otherwise**: at the default 25% tier the collector's target is ~50% of the budget, far under
+  any limit. Its boundary is the headroom warning's own condition (`2 × tier ≥ budget`), and a
+  test asserts the two agree.
+
+  **This reverses #314's first-round ruling, for a stated reason.** That round recommended
+  `GOMEMLIMIT` without setting it, because the right value depends on what else is on the box.
+  The objection is sound for imposing a limit on every mount and does not survive the case where
+  the box is already predicted to OOM, where the comparison is not "0.90 versus 0.85" but "a limit
+  under the budget versus the kernel killing the process". The 90% follows the Go team's guidance
+  to leave 5–10% headroom for memory the runtime does not account for; it is not measured here.
+
+  A `GOMEMLIMIT` in the environment is honoured as-is under `auto`; an explicit size wins over
+  both. The limit in force is logged at startup, and a limit at or below `--mem-cache` warns,
+  because the tier is live heap the collector cannot reclaim. Both commands go through one
+  `applyMemoryLimit`, with an AST check that every command sizing a tier applies it — this
+  project has seven recorded cases of mount and gateway wiring one mechanism differently.
+
 ### Added
 
 - **The sub-block witness now covers request count, the third axis** ([#407](https://github.com/scttfrdmn/lith/issues/407)).

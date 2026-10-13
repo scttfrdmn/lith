@@ -45,6 +45,7 @@ type mountFlags struct {
 	readaheadEvidence float64
 	evidencePerRun    bool
 	evidenceSubBlock  bool
+	memoryLimit       string
 	demandPreciseNT   bool
 	coverageMin       float64
 	pfTrace           string
@@ -93,7 +94,8 @@ func newMountCmd() *cobra.Command {
 	fl := cmd.Flags()
 	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built automatically if absent and under --auto-index-limit). A whole-bucket or parent-prefix index can back mounts rooted at any prefix at or below its own root, concurrently")
 	fl.StringVar(&f.cargoship, "cargoship", "", "mount a CargoShip 2.1 archive: build the index in-process from this manifest s3:// URL (.gz transparent) and present the archive's original file tree. Fails closed — a manifest that cannot be resolved is an error, never a fallback to listing the bucket. Mutually exclusive with --index-file")
-	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
+	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of the memory budget -- the smaller of system RAM and the cgroup memory limit, so a container is sized against its own allowance)")
+	fl.StringVar(&f.memoryLimit, "memory-limit", "auto", "soft memory limit for the Go runtime, as a size, \"auto\" or \"off\" (#314). The memory tier is live Go heap and at the default GOGC=100 the collector lets the heap grow to about TWICE the live set, so a tier over half the memory budget is an OOM-kill waiting to happen -- measured at next_gc = 2.03x the tier with RSS within 1%% of it. \"auto\" sets a limit at 90%% of the budget ONLY in that case, and changes nothing for a tier that fits: at the default 25%% the collector's target is ~50%% of the budget, far under any limit. The budget is the smaller of the box's RAM and the cgroup memory limit, so a container is sized against its own allowance and not the host's. A GOMEMLIMIT already in the environment is honoured as-is. With a limit in force the collector works harder instead of the kernel killing the process; it must sit comfortably above --mem-cache or the collector cannot meet it")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables)")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
 	fl.StringVar(&f.blockSize, "block-size", "8MiB", "block size (1MiB-64MiB)")
@@ -190,9 +192,18 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 	}
 	// Checked HERE, before anything is fetched, because the failure it warns about is the
 	// process being killed (#314). A warning that arrives after the mount is serving competes
-	// with the OOM it is predicting.
-	if w := memTierHeadroomWarning(memCache, totalMemBytes()); w != "" {
+	// with the OOM it is predicting. The budget is the cgroup limit when there is one, not the
+	// host's MemTotal -- see memBudgetBytes.
+	budget := memBudgetBytes()
+	memLimit, err := applyMemoryLimit(log, f.memoryLimit, memCache, budget)
+	if err != nil {
+		return err
+	}
+	if w := memTierHeadroomWarning(memCache, budget, memLimit); w != "" {
 		log.Warn("memory tier", "warning", w)
+	}
+	if w := memoryLimitWarning(memLimit, memCache); w != "" {
+		log.Warn("memory limit", "warning", w)
 	}
 	diskCache, err := parseSize(f.diskCache)
 	if err != nil {

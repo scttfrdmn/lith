@@ -55,7 +55,7 @@ func TestMemTierHeadroomWarning(t *testing.T) {
 	const total = int64(33_020_000_000)
 	const reported = int64(20) << 30
 
-	w := memTierHeadroomWarning(reported, total)
+	w := memTierHeadroomWarning(reported, total, 0)
 	if w == "" {
 		t.Fatal("the configuration that OOM-killed a daemon in #314 draws no warning")
 	}
@@ -76,17 +76,17 @@ func TestMemTierHeadroomWarning(t *testing.T) {
 	// ever moves, THIS test moves with it and the boundary assertions below are what decide
 	// whether the new default is survivable.
 	for _, mt := range []int64{1 << 30, 8 << 30, total, 33 << 30, 256 << 30, 2 << 40} {
-		if w := memTierHeadroomWarning(memCacheDefaultFor(mt), mt); w != "" {
+		if w := memTierHeadroomWarning(memCacheDefaultFor(mt), mt, 0); w != "" {
 			t.Errorf("the shipping default on a %d-byte box warns: %q", mt, w)
 		}
 	}
 
 	// THE BOUNDARY IS 50% AND IT IS INCLUSIVE, because at exactly 50% the GC target equals
 	// MemTotal -- no room for the application, the page cache, or transient garbage.
-	if w := memTierHeadroomWarning(total/2, total); w == "" {
+	if w := memTierHeadroomWarning(total/2, total, 0); w == "" {
 		t.Error("a tier at exactly 50% of RAM targets the whole box and draws no warning")
 	}
-	if w := memTierHeadroomWarning(total/2-1, total); w != "" {
+	if w := memTierHeadroomWarning(total/2-1, total, 0); w != "" {
 		t.Errorf("a tier one byte under 50%% warns: %q", w)
 	}
 
@@ -102,7 +102,7 @@ func TestMemTierHeadroomWarning(t *testing.T) {
 		{"both unknown", 0, 0},
 		{"negative total", 20 << 30, -1},
 	} {
-		if w := memTierHeadroomWarning(tc.tier, tc.total); w != "" {
+		if w := memTierHeadroomWarning(tc.tier, tc.total, 0); w != "" {
 			t.Errorf("%s: warned on an input it cannot judge: %q", tc.name, w)
 		}
 	}
@@ -129,7 +129,7 @@ func TestDefaultMemCacheIsAQuarterOfTotal(t *testing.T) {
 	if got := memCacheDefaultFor(0); got != 1<<30 {
 		t.Errorf("memCacheDefaultFor(0) = %d, want the 1 GiB fallback", got)
 	}
-	if w := memTierHeadroomWarning(memCacheDefaultFor(0), 0); w != "" {
+	if w := memTierHeadroomWarning(memCacheDefaultFor(0), 0, 0); w != "" {
 		t.Errorf("fallback default warns when total is unknown: %q", w)
 	}
 	// And the two entry points agree on this box, whichever box it is.

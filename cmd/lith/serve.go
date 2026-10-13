@@ -36,6 +36,7 @@ type serveFlags struct {
 	cargoship        string
 	region           string
 	memCache         string
+	memoryLimit      string
 	diskCache        string
 	diskPath         string
 	blockSize        string
@@ -84,7 +85,8 @@ func newServeNFSCmd() *cobra.Command {
 	fl.StringVar(&f.indexFile, "index-file", "", "index file to load (built by listing if absent)")
 	fl.StringVar(&f.cargoship, "cargoship", "", "export a CargoShip 2.1 archive: build the index in-process from this manifest s3:// URL (fail-closed, never lists)")
 	fl.StringVar(&f.region, "region", "", "bucket region (resolved if empty)")
-	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of system memory)")
+	fl.StringVar(&f.memCache, "mem-cache", "", "memory block cache size (default: 25% of the memory budget -- the smaller of system RAM and the cgroup memory limit, so a container is sized against its own allowance)")
+	fl.StringVar(&f.memoryLimit, "memory-limit", "auto", "soft memory limit for the Go runtime, as a size, \"auto\" or \"off\" (#314); same rule as on mount. \"auto\" sets a limit at 90%% of the memory budget only when the tier is predicted not to fit (twice the tier at or over the budget), and changes nothing otherwise. The budget is the smaller of the box's RAM and the cgroup memory limit -- which matters most here, because this is the command the container image runs, and inside a container /proc/meminfo reports the HOST's RAM. A GOMEMLIMIT already in the environment is honoured as-is")
 	fl.StringVar(&f.diskCache, "disk-cache", "0", "disk block cache size (0 disables); on a gateway, size it to the working set so a warm re-read and a restart serve from local disk, not S3")
 	fl.StringVar(&f.diskPath, "disk-path", "", "disk cache directory (default $TMPDIR/lith-cache)")
 	// Block-store / S3-client tuning — parity with `lith mount` for the flags that
@@ -127,9 +129,19 @@ func runServeNFS(ctx context.Context, f *serveFlags, bucket, prefix string) erro
 		}
 	}
 	// Before anything is fetched: the failure this warns about is the process being killed
-	// (#314), and on a gateway that takes every client's mount down with it.
-	if w := memTierHeadroomWarning(memCache, totalMemBytes()); w != "" {
+	// (#314), and on a gateway that takes every client's mount down with it. The gateway is also
+	// the command the container image runs, which is the case where the cgroup budget and the
+	// host's MemTotal differ -- see memBudgetBytes.
+	budget := memBudgetBytes()
+	memLimit, err := applyMemoryLimit(log, f.memoryLimit, memCache, budget)
+	if err != nil {
+		return err
+	}
+	if w := memTierHeadroomWarning(memCache, budget, memLimit); w != "" {
 		log.Warn("memory tier", "warning", w)
+	}
+	if w := memoryLimitWarning(memLimit, memCache); w != "" {
+		log.Warn("memory limit", "warning", w)
 	}
 
 	var wireMet **metrics.Metrics
