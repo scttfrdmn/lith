@@ -7,20 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Inside a container, lith sized its memory against the host's RAM**
-  ([#314](https://github.com/scttfrdmn/lith/issues/314)). `/proc/meminfo` is not namespaced by
-  the memory controller, so a container reads the **host's** `MemTotal`. A container limited to
-  4 GiB on a 256 GiB host therefore defaulted to a **64 GiB** memory tier — sixteen times its
-  whole allowance — and the startup headroom warning, comparing against the same figure, stayed
-  silent. The image's entrypoint is `lith serve nfs` and a Kubernetes pod with a memory limit is
-  the ordinary deployment, so the shipped default was an OOM-kill on the ordinary case.
-
-  The memory **budget** is now the smaller of `MemTotal` and the cgroup limit (v2 `memory.max`,
-  v1 `memory.limit_in_bytes`), with both spellings of "unlimited" recognised rather than parsed —
-  v2's literal `max` and v1's page-rounded near-`MaxInt64`. The default tier, the headroom warning
-  and the new soft limit all read it.
+## [1.18.0] - 2026-10-13
 
 ### Added
 
@@ -48,34 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because the tier is live heap the collector cannot reclaim. Both commands go through one
   `applyMemoryLimit`, with an AST check that every command sizing a tier applies it — this
   project has seven recorded cases of mount and gateway wiring one mechanism differently.
-
-### Added
-
-- **The sub-block witness now covers request count, the third axis** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
-  An external bracketed cell on v1.17.1 confirmed the lead closes the coverage gap — uncovered
-  misses back to the `=false` level, 62–65 against 60–62, where span-once gave 81 — and the real
-  netCDF4 tool came out neutral. But the index-then-stream witness read a median **0.854**, and
-  the only remaining difference between arms was **~+41 GETs** for identical bytes.
-
-  Reproduced locally: **62 → 79–81 GETs** on that shape with bytes unchanged. 41 extra round trips
-  at a 30 ms first byte is 1.23 s against a ~7.4 s stream = **17%**, which brackets the 11–25% of
-  their slow reps.
-
-  **So a witness for this arm has to cover bytes, coverage *and* requests.** It covered bytes,
-  which is how a 20% regression shipped; then coverage, which is how the lead fix was verified;
-  this is the third. The span dispatch count is now asserted rather than the GET count, because it
-  is the deterministic driver — 16 in three consecutive runs while GETs came out 79, 81, 79.
-
-  **The cause is named and not yet fixed**, with the arithmetic for why: 16 dispatches is about 5×
-  what this shape needs. The span phase covers only the first ~8 MB of the stream, and across it
-  the lead grows from ~4 MB to ~16 MB, so the frontier runs *away* from the reader and ~3
-  dispatches would cover it. The extra ones happen because the frontier is recomputed as
-  `readEnd + earned` on every read and `earned` grows faster than the reader advances, so the
-  comparison against the previous frontier never short-circuits. Fixing it needs a trigger tied to
-  the **remaining lead** rather than to the earned amount — a tuning decision better made from a
-  measurement than invented, which is why this release asserts the current count instead.
-
-### Added
 
 - **`--demand-precise-nontiling`: a demand read can be served its extents when the coverage
   signal has judged the handle scattered** ([#408](https://github.com/scttfrdmn/lith/issues/408)).
@@ -118,7 +77,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefetching for a handle this matches, so a precise read cannot land on top of a whole-block
   prefetch — #222's measured-worse case.
 
+- **The sub-block witness now covers request count, the third axis** ([#407](https://github.com/scttfrdmn/lith/issues/407)).
+  An external bracketed cell on v1.17.1 confirmed the lead closes the coverage gap — uncovered
+  misses back to the `=false` level, 62–65 against 60–62, where span-once gave 81 — and the real
+  netCDF4 tool came out neutral. But the index-then-stream witness read a median **0.854**, and
+  the only remaining difference between arms was **~+41 GETs** for identical bytes.
+
+  Reproduced locally: **62 → 79–81 GETs** on that shape with bytes unchanged. 41 extra round trips
+  at a 30 ms first byte is 1.23 s against a ~7.4 s stream = **17%**, which brackets the 11–25% of
+  their slow reps.
+
+  **So a witness for this arm has to cover bytes, coverage *and* requests.** It covered bytes,
+  which is how a 20% regression shipped; then coverage, which is how the lead fix was verified;
+  this is the third. The span dispatch count is now asserted rather than the GET count, because it
+  is the deterministic driver — 16 in three consecutive runs while GETs came out 79, 81, 79.
+
+  **The cause is named and not yet fixed**, with the arithmetic for why: 16 dispatches is about 5×
+  what this shape needs. The span phase covers only the first ~8 MB of the stream, and across it
+  the lead grows from ~4 MB to ~16 MB, so the frontier runs *away* from the reader and ~3
+  dispatches would cover it. The extra ones happen because the frontier is recomputed as
+  `readEnd + earned` on every read and `earned` grows faster than the reader advances, so the
+  comparison against the previous frontier never short-circuits. Fixing it needs a trigger tied to
+  the **remaining lead** rather than to the earned amount — a tuning decision better made from a
+  measurement than invented, which is why this release asserts the current count instead.
+
 ### Fixed
+
+- **Inside a container, lith sized its memory against the host's RAM**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)). `/proc/meminfo` is not namespaced by
+  the memory controller, so a container reads the **host's** `MemTotal`. A container limited to
+  4 GiB on a 256 GiB host therefore defaulted to a **64 GiB** memory tier — sixteen times its
+  whole allowance — and the startup headroom warning, comparing against the same figure, stayed
+  silent. The image's entrypoint is `lith serve nfs` and a Kubernetes pod with a memory limit is
+  the ordinary deployment, so the shipped default was an OOM-kill on the ordinary case.
+
+  The memory **budget** is now the smaller of `MemTotal` and the cgroup limit (v2 `memory.max`,
+  v1 `memory.limit_in_bytes`), with both spellings of "unlimited" recognised rather than parsed —
+  v2's literal `max` and v1's page-rounded near-`MaxInt64`. The default tier, the headroom warning
+  and the new soft limit all read it.
 
 - **`TestStreamingByteIdentical`'s fixture was not a stream.** It read 64 KiB at every 1 MiB
   boundary — 1/16 density — and asserted that a "strictly sequential read run" never goes
@@ -3850,7 +3846,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.17.1...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/scttfrdmn/lith/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/scttfrdmn/lith/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/scttfrdmn/lith/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/scttfrdmn/lith/compare/v1.15.0...v1.16.0
