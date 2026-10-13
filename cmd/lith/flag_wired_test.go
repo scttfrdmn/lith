@@ -178,37 +178,42 @@ func TestExperimentalFlagsDefaultOff(t *testing.T) {
 	t.Logf("checked %d experimental flag(s)", checked)
 }
 
-// THE SUB-BLOCK DISPATCH DEFAULT IS ON, AND SOMETHING HAS TO PIN IT.
+// THE SUB-BLOCK DISPATCH DEFAULT IS OFF, AND SOMETHING HAS TO PIN IT.
 //
-// Found by a revert sweep: flipping this default back to off left the entire suite green. A
-// default nothing asserts can revert in a refactor and nobody learns until an operator's bytes
-// change, which is the shape #389's sweep caught for the pressure gate's default.
+// It was ON in v1.16.0 and is rolled back. Both directions needed a test for the same reason: a
+// revert sweep showed that flipping this default left the entire suite green, so it can move in a
+// refactor and nobody learns until an operator's bytes or wall change. That is #389's shape.
 //
-// It is on because it was measured, externally, on a release artifact: byte amplification
-// 3.02x -> 1.39x on a GRIB .idx sweep and 1.79x -> 1.48x on a HEMCO time-slice read, with WALL
-// CLOCK NEUTRAL on both (median B/D 1.005 over 11 kept reps and 0.974 over 5, each flagged run
-// bracketed by two default runs) and UNCOVERED DEMAND MISSES FLAT in every arm. A whole-object
-// dd, a scatter-then-stream handle, a FITS cutout and three control shapes were unchanged.
+// WHY OFF, in one line: the arm saves bytes on a walk that STOPS and costs wall on a walk that
+// CONTINUES, and which of those a mount is cannot be known at establishment.
 //
-// If that evidence is ever withdrawn, this test is the place to change -- deliberately, with the
-// reason -- rather than letting the default drift.
-func TestSubBlockDispatchDefaultsOn(t *testing.T) {
+// The measurement, external, on signed artifacts:
+//
+//	GRIB .idx sweep      bytes 3.02x -> 1.39x, wall median 1.005 (11 kept reps), faults flat
+//	HEMCO time-slice     bytes 1.79x -> 1.48x, wall median 0.974 (5 kept reps),  faults flat
+//	index-then-stream    bytes IDENTICAL,      wall median 0.798 (5 kept reps),  faults 62 -> 81
+//
+// The last row is why. It was below both of its brackets in 8 of 8 reps, and the mechanism is the
+// first dispatch at establishment -- one ~5.5 MB span in place of three whole blocks -- after
+// which a streaming reader faults through the uncovered remainder until the next block crossing.
+//
+// ★ AND THE GUARD I BUILT FOR EXACTLY THAT RISK MISSED IT, which is the reason this comment is
+// long. internal/fuse's scatter-then-stream witness was written before the arm shipped,
+// specifically to catch this, and it asserts BYTES and SPAN COUNT. Bytes really are identical
+// here; the whole cost is in faults and wall. The witness carried the fault signal in a counter
+// it did not assert on. Right witness, wrong axis.
+//
+// To turn this default back on, the follow-on is a span that still LEADS the reader rather than
+// only shrinking the first dispatch -- not a re-run of the same cells.
+func TestSubBlockDispatchDefaultsOff(t *testing.T) {
 	fl := newMountCmd().Flags().Lookup("readahead-subblock-dispatch")
 	if fl == nil {
 		t.Fatal("mount has no --readahead-subblock-dispatch flag")
 	}
-	if fl.DefValue != "true" {
-		t.Errorf("--readahead-subblock-dispatch defaults to %q, want \"true\". It is on because "+
-			"an external wall-clock cell measured it neutral on both shapes whose bytes it "+
-			"improves, with faults flat; turning it off silently discards that measurement.",
-			fl.DefValue)
-	}
-	// AND IT MUST NOT CLAIM TO BE EXPERIMENTAL WHILE ON. TestExperimentalFlagsDefaultOff covers
-	// the general rule; this asserts the specific pairing stayed consistent when the word was
-	// dropped, because the two edits are in the same string and one can be made without the other.
-	if strings.Contains(strings.ToUpper(fl.Usage), "EXPERIMENTAL") {
-		t.Error("--readahead-subblock-dispatch defaults on and still says EXPERIMENTAL in its " +
-			"help; an operator reading that is told the behaviour is unmeasured while the " +
-			"binary ships it on")
+	if fl.DefValue != "false" {
+		t.Errorf("--readahead-subblock-dispatch defaults to %q, want \"false\". It is off "+
+			"because an index-then-stream reader measured 20%% slower with it on (median 0.798, "+
+			"below both brackets in 8 of 8 reps) while bytes were identical. Turning it on "+
+			"ships that regression to every in-region mount.", fl.DefValue)
 	}
 }

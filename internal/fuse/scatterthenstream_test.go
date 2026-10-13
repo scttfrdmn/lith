@@ -23,6 +23,26 @@ import (
 // earns less, and does get bounded -- so the protection depends on the stream's phase relative
 // to the blocks, which is not something to reason about. Hence this measures it.
 //
+// ★★★ WHAT THIS WITNESS DOES NOT COVER, AND IT IS THE AXIS THAT MATTERED.
+//
+// This asserts BYTES and SPAN COUNT. It passed, and the arm was defaulted on, and an external
+// bracketed cell then measured an index-then-stream reader **20% slower** with the arm on --
+// median 0.798, below both of its brackets in 8 of 8 reps -- with BYTES IDENTICAL and uncovered
+// demand misses 62 -> 81. The entire cost was in faults and wall, which is precisely what this
+// test does not assert. Right witness, built for the right risk, wrong axis.
+//
+// AND IT CANNOT BE FIXED BY ADDING AN ASSERTION HERE. The fault counts are logged below, and
+// they are too noisy in this fixture to gate on: measured across three identical runs the arm's
+// extra faults came out +5/+1/+0 on the short stream and +4/+4/+11 on the long one, so any
+// contrast between them already fails. UncoveredMiss fires when a demand read finds its chunk
+// neither cached nor in flight, so it races the prefetch goroutine, and a fake server has no
+// latency for the race to resolve against. The external cell needed 1 GiB streams and 8
+// bracketed reps to see 62 -> 81 cleanly.
+//
+// So the figures are logged, not asserted, and this comment is the gate: **a green run of this
+// test does not clear this arm.** The wall and fault axes are external-only, and the default is
+// pinned off in cmd/lith with that measurement as the reason.
+
 // THE ASSERTION IS THAT THE COST DOES NOT SCALE WITH STREAM LENGTH. A bounded first dispatch
 // that the window then ramps back from costs a fixed amount; a mechanism that keeps bounding a
 // streaming handle costs a share of everything it reads. Those differ in kind, and only the
@@ -44,7 +64,7 @@ func TestScatterThenStreamCostDoesNotScaleWithStreamLength(t *testing.T) {
 	const streamBase = int64(70)<<20 + blockSz/2
 
 	run := func(streamLen int64, subBlock bool) (fetched, spans int64, st prefetch.State, reset int64) {
-		raw, srv, _ := newWalkFS(t, objBytes, blockSz, ratio, false, subBlock)
+		raw, srv, rec := newWalkFS(t, objBytes, blockSz, ratio, false, subBlock)
 		node, fh := openBig(t, raw)
 		h := raw.handleOf(fh)
 		before := quiesce(srv)
@@ -57,6 +77,9 @@ func TestScatterThenStreamCostDoesNotScaleWithStreamLength(t *testing.T) {
 		for off := streamBase; off < streamBase+streamLen; off += read {
 			readAt(t, raw, node, fh, off, read)
 		}
+		unc, hit, iss := rec.coverage()
+		t.Logf("    stream %d MiB subBlock=%-5v uncovered=%d prefetchHit=%d prefetchIssued=%d",
+			streamLen>>20, subBlock, unc, hit, iss)
 		return quiesce(srv) - before, h.pf.pf.SpansIssued(), h.pf.state(), reset
 	}
 
