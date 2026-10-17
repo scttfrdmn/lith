@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.1] - 2026-10-16
+
 ### Fixed
 
 - **Temporary credentials in the shared credentials file were read once and never again.**
@@ -24,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SSO and assume-role profiles and `credential_process` already renewed themselves through the SDK
   and are unchanged.
 
+- **`lith_prefetch_evidence_clamped_total`'s help said it was "zero unless
+  `--readahead-evidence-ratio` is set"** — stale since #368 made the ratio region-derived and on by
+  default in-region. An operator on an in-region mount reading that help would conclude the
+  counter could not apply to them, on exactly the mounts where it does. It now says what the
+  counter answers: when it is high, the evidence gate and not the divisor bounds windows on that
+  mount. Found while working out whether #312's idle handles cost anything, which is the question
+  this counter decides.
+
+- **`--memory-limit`'s docs row now carries the measurement**
+  ([#314](https://github.com/scttfrdmn/lith/issues/314)): the configuration that was OOM-killed
+  before (a 20 GB tier on a 33 GB box) survives in both reps on v1.18.0, RSS plateauing at 28.8 GB
+  against a 29.7 GB limit, with no measurable wall cost on a link-bound workload. Stated as "free
+  on a streaming workload", not "free" — concurrent GC CPU was not captured. Also records that
+  the limit is exported as `go_gc_gomemlimit_bytes`, which the row previously omitted.
+
 ### Added
 
 - **A startup warning, a `doctor` warning, and a specific error for expired credentials.** A
@@ -35,8 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source in use — where before it was indistinguishable from any other failure. `RequestExpired`
   is deliberately excluded: it is clock skew, not credentials. `docs/knobs.md` gains a table of
   which sources survive a long mount.
-
-### Added
 
 - **`docs/knobs.md` says what to do about unfair concurrent readers on a cross-region mount**
   ([#391](https://github.com/scttfrdmn/lith/issues/391)), from a cell run for the purpose:
@@ -55,23 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fit in the tier, nothing was contended, and gate-off came out fair at 1.27–1.32. #391's
   unfairness needs the tier to be contended; the second run used `--mem-cache 1GiB` to make it so.
   Cost $6.33, of which $6.02 was inter-region transfer.
-
-### Fixed
-
-- **`lith_prefetch_evidence_clamped_total`'s help said it was "zero unless
-  `--readahead-evidence-ratio` is set"** — stale since #368 made the ratio region-derived and on by
-  default in-region. An operator on an in-region mount reading that help would conclude the
-  counter could not apply to them, on exactly the mounts where it does. It now says what the
-  counter answers: when it is high, the evidence gate and not the divisor bounds windows on that
-  mount. Found while working out whether #312's idle handles cost anything, which is the question
-  this counter decides.
-
-- **`--memory-limit`'s docs row now carries the measurement**
-  ([#314](https://github.com/scttfrdmn/lith/issues/314)): the configuration that was OOM-killed
-  before (a 20 GB tier on a 33 GB box) survives in both reps on v1.18.0, RSS plateauing at 28.8 GB
-  against a 29.7 GB limit, with no measurable wall cost on a link-bound workload. Stated as "free
-  on a streaming workload", not "free" — concurrent GC CPU was not captured. Also records that
-  the limit is exported as `go_gc_gomemlimit_bytes`, which the row previously omitted.
 
 ## [1.18.0] - 2026-10-13
 
@@ -3912,7 +3910,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.1...HEAD
+[1.18.1]: https://github.com/scttfrdmn/lith/compare/v1.18.0...v1.18.1
 [1.18.0]: https://github.com/scttfrdmn/lith/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/scttfrdmn/lith/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/scttfrdmn/lith/compare/v1.16.0...v1.17.0
