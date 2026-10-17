@@ -97,7 +97,11 @@ spec:
 
 Front it with a `Service` on 2049 and mount `<service>:/` from clients with the
 recipe above. AWS credentials come from the pod's IAM role (IRSA/Pod Identity),
-the same resolution `lith doctor` reports.
+the same resolution `lith doctor` reports — and those renew themselves, which matters for a
+gateway that runs for weeks. **Don't pass temporary keys as environment variables** (an exported
+`AWS_SESSION_TOKEN` in the pod spec or a Secret): a running process can't be given new ones, so the
+gateway fails every uncached read when the token expires. See
+[Credentials on a long-running mount](knobs.md#credentials-on-a-long-running-mount).
 
 ### Volumes: index and cache
 

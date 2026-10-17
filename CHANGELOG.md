@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Temporary credentials in the shared credentials file were read once and never again.**
+  lith signs with the AWS SDK's default chain, and the SDK's credentials cache re-retrieves only
+  credentials that report an expiry. Verified against the pinned SDK (config v1.33.4): temporary
+  keys with a session token, whether exported as environment variables or written to
+  `~/.aws/credentials` by a SAML/SSO helper, come back with `CanExpire=false`. So the SDK kept the
+  first set for the life of the process, a helper rotating the file was never seen, and the
+  mount began failing every uncached read with `EIO` when that first set expired — an hour in, for
+  a typical SAML role session.
+
+  **lith now re-reads the credentials file every 5 minutes** when the credentials in it are
+  temporary, so a rotated file is picked up without remounting. The interval is a third of the
+  shortest session STS issues (15 minutes), not a tuned value. Instance roles, IRSA / Pod Identity,
+  SSO and assume-role profiles and `credential_process` already renewed themselves through the SDK
+  and are unchanged.
+
+### Added
+
+- **A startup warning, a `doctor` warning, and a specific error for expired credentials.** A
+  session token in the **environment** cannot be renewed by any running process, so lith now says
+  so at startup and names the sources that do renew; `lith doctor` grades credentials by whether
+  they will survive a long mount instead of passing anything that resolves. And when S3 rejects a
+  request as signed with expired credentials (`ExpiredToken`, `ExpiredTokenException`,
+  `TokenRefreshRequired`), lith logs it at `ERROR` — at most once a minute, with the remedy for the
+  source in use — where before it was indistinguishable from any other failure. `RequestExpired`
+  is deliberately excluded: it is clock skew, not credentials. `docs/knobs.md` gains a table of
+  which sources survive a long mount.
+
 ### Added
 
 - **`docs/knobs.md` says what to do about unfair concurrent readers on a cross-region mount**
