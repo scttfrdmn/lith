@@ -125,6 +125,37 @@ Authentication, endpoint, and how files present to the OS.
 | `--uid` / `--gid` | your uid/gid | Owner reported for every file. |
 | `--exec` | off | Report files as mode `0555` instead of `0444` (executables on the mount). |
 
+### Credentials on a long-running mount
+
+lith takes credentials from the AWS SDK's default chain — the same order the AWS CLI uses — and
+signs with whatever that resolves. What matters for a mount that runs for days is **whether those
+credentials renew themselves**, and that depends on the source, not on lith:
+
+| source | renews itself? | on a long mount |
+|---|---|---|
+| EC2 instance role, IRSA / EKS Pod Identity, ECS task role | **yes** | nothing to do |
+| SSO profile, assume-role profile (`AWS_PROFILE`) | **yes** | an expired *SSO session* needs `aws sso login`; the mount picks it up without remounting |
+| `credential_process` that returns an `Expiration` | **yes** | nothing to do |
+| long-term access key (no session token) | does not expire | nothing to do |
+| temporary keys in `~/.aws/credentials` (written by saml2aws, gimme-aws-creds, a cron job…) | **no, but lith re-reads the file** every 5 minutes | keep the helper rotating the file; no remount |
+| **temporary keys in environment variables** (`AWS_SESSION_TOKEN` exported) | **no, and cannot** | **the mount fails every uncached read with `EIO` when the token expires** |
+
+The last row is the one to avoid. A running process cannot be handed a new environment, so
+exported STS credentials — 15 minutes to 12 hours — put a hard deadline on the mount. lith warns at
+startup when it sees them, and `lith doctor` reports them as a warning rather than a pass. Use any
+of the sources above it instead: the simplest for an interactive user is a profile in
+`~/.aws/config` with `credential_process` or `role_arn`, selected with `AWS_PROFILE`.
+
+The file row is lith's own refresh path. The SDK reads a static credentials file once and keeps the
+result, so before lith re-read it, a helper rotating the file was never seen by a running mount.
+**The 5 minutes is a third of the shortest session STS issues**, so a rotated file is picked up
+with at least two-thirds of even a 15-minute session left.
+
+If S3 does reject a request as signed with expired credentials, lith logs it at `ERROR` — at most
+once a minute, with the remedy for the source in use — rather than leaving it indistinguishable
+from any other failure. `RequestExpired` is deliberately *not* treated as expiry: it means the
+request's timestamp is stale, which is clock skew.
+
 ## Observability
 
 | flag | default | why |

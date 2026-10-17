@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -57,6 +58,10 @@ type Client struct {
 	// bucket's, resolved in New. Kept so callers can read it WITHOUT a second
 	// GetBucketRegion -- New already paid for that lookup (lith#362).
 	region string
+	// alarm logs, rate-limited, when S3 rejects requests as signed with expired credentials --
+	// otherwise indistinguishable from any other failure, every uncached read just returns EIO.
+	// nil for an anonymous client, which has nothing to expire.
+	alarm *credentialAlarm
 }
 
 var _ API = (*Client)(nil)
@@ -181,6 +186,14 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 
+	// Classify the credentials once and install the refresh path where the SDK has none. Done
+	// BEFORE any client is built from awsCfg, because s3.NewFromConfig copies the provider.
+	var alarm *credentialAlarm
+	if !cfg.NoSignRequest {
+		kind, source := assessCredentials(ctx, &awsCfg, region, slog.Default())
+		alarm = &credentialAlarm{kind: kind, source: source, log: slog.Default}
+	}
+
 	s3Opts := func(o *s3.Options) {
 		o.UsePathStyle = cfg.PathStyle
 		if cfg.Endpoint != "" {
@@ -201,6 +214,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	return &Client{
+		alarm:         alarm,
 		s3:            s3.NewFromConfig(awsCfg, s3Opts),
 		bucket:        cfg.Bucket,
 		requesterPays: cfg.RequesterPays,
@@ -230,6 +244,7 @@ func (c *Client) ListObjectsV2(ctx context.Context, prefix, token string, maxKey
 	}
 	out, err := c.s3.ListObjectsV2(ctx, in)
 	if err != nil {
+		c.alarm.note(err)
 		return ListPage{}, err
 	}
 	page := ListPage{IsTruncated: aws.ToBool(out.IsTruncated)}
@@ -256,6 +271,7 @@ func (c *Client) HeadObject(ctx context.Context, key string) (Object, error) {
 		RequestPayer: c.payer(),
 	})
 	if err != nil {
+		c.alarm.note(err)
 		return Object{}, err
 	}
 	return Object{
@@ -281,6 +297,7 @@ func (c *Client) GetObject(ctx context.Context, key string, off, length int64) (
 		RequestPayer: c.payer(),
 	})
 	if err != nil {
+		c.alarm.note(err)
 		return nil, err
 	}
 	return out.Body, nil
@@ -302,6 +319,7 @@ func (c *Client) GetRange(ctx context.Context, key string, off, length int64) ([
 		RequestPayer: c.payer(),
 	})
 	if err != nil {
+		c.alarm.note(err)
 		return nil, "", err
 	}
 	defer func() { _ = out.Body.Close() }()
@@ -333,6 +351,7 @@ func (c *Client) GetRangeReader(ctx context.Context, key string, off, length int
 		RequestPayer: c.payer(),
 	})
 	if err != nil {
+		c.alarm.note(err)
 		return nil, "", err
 	}
 	if rng != nil {

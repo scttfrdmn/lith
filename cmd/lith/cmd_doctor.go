@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -165,7 +166,7 @@ func runDoctor(ctx context.Context, d *doctor, f *doctorFlags, target string) {
 		if err != nil {
 			d.add(fail, "credentials", "no credentials resolved: "+err.Error(), "set AWS_PROFILE (or export keys), or pass --no-sign-request for a public bucket")
 		} else {
-			d.add(pass, "credentials", "source="+credSource(creds), "")
+			d.add(credentialVerdict(creds))
 		}
 	}
 
@@ -487,4 +488,33 @@ func credSource(c aws.Credentials) string {
 		return "unknown"
 	}
 	return c.Source
+}
+
+// credentialVerdict grades resolved credentials by whether they will SURVIVE a long mount, not
+// merely whether they resolved. A mount is a long-running process, and credentials that resolve
+// at startup but lapse in an hour are the configuration that fails overnight with nothing but
+// EIO to show for it (see s3client.CredentialKind).
+func credentialVerdict(c aws.Credentials) (checkStatus, string, string, string) {
+	src := "source=" + credSource(c)
+	switch s3client.ClassifyCredentials(c, false) {
+	case s3client.CredStaticTemporary:
+		if strings.HasPrefix(c.Source, "SharedConfigCredentials") {
+			return pass, "credentials", src + " (temporary; lith re-reads the credentials file, " +
+				"so a helper that rotates it is picked up without remounting)", ""
+		}
+		return warn, "credentials", src + " -- TEMPORARY but STATIC: a session token from the " +
+				"environment, which lith cannot renew. A mount will fail every uncached read with " +
+				"EIO when it expires",
+			"for a long-running mount use a source that renews itself: an instance role, IRSA / " +
+				"Pod Identity, an SSO or assume-role profile (AWS_PROFILE), or a credential_process " +
+				"that returns an Expiration"
+	case s3client.CredRefreshing:
+		detail := src + " (renews itself)"
+		if !c.Expires.IsZero() {
+			detail += ", current set expires " + c.Expires.UTC().Format(time.RFC3339)
+		}
+		return pass, "credentials", detail, ""
+	default:
+		return pass, "credentials", src + " (long-term key; does not expire)", ""
+	}
 }
