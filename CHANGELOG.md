@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.2] - 2026-10-26
+
 ### Security
 
 - **Built with Go 1.27.3** (was 1.27.2) for
   [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809): crypto/x509 now distrusts compromised
   intermediate certificates. lith reaches the affected verification on every HTTPS read from S3.
+
+### Changed
+
+- Dependency updates: aws-sdk-go-v2 config 1.33.10, service/s3 1.114.5, feature/s3/manager
+  1.23.16; prometheus/client_golang 1.25.0; zeebo/xxh3 1.1.0. No behaviour change is intended.
 
 ## [1.18.1] - 2026-10-16
 
@@ -3916,7 +3923,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.1...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.2...HEAD
+[1.18.2]: https://github.com/scttfrdmn/lith/compare/v1.18.1...v1.18.2
 [1.18.1]: https://github.com/scttfrdmn/lith/compare/v1.18.0...v1.18.1
 [1.18.0]: https://github.com/scttfrdmn/lith/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/scttfrdmn/lith/compare/v1.17.0...v1.17.1
