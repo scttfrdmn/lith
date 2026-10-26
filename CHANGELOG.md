@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Built with Go 1.27.3** (was 1.27.2) for
+  [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809): crypto/x509 now distrusts compromised
+  intermediate certificates. lith reaches the affected verification on every HTTPS read from S3.
+
 ## [1.18.1] - 2026-10-16
 
 ### Fixed
