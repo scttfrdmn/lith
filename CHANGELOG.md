@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Built with Go 1.27.4** (was 1.27.3) for
+  [GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859): an HTTP/1 server crash from a
+  `MaxBytesReader` header race in net/http. lith's HTTP servers are the `--metrics` and pprof
+  endpoints.
+
 - **klauspost/compress 1.20.3** (was 1.20.1) for
   [GO-2026-6865](https://pkg.go.dev/vuln/GO-2026-6865), in its zstd FSE/Huffman table decoding.
   lith reaches it through the decoder that reads CargoShip archive frames, so it applies to
