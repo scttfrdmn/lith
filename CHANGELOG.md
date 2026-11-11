@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.3] - 2026-11-10
+
+### Security
+
+- **klauspost/compress 1.20.3** (was 1.20.1) for
+  [GO-2026-6865](https://pkg.go.dev/vuln/GO-2026-6865), in its zstd FSE/Huffman table decoding.
+  lith reaches it through the decoder that reads CargoShip archive frames, so it applies to
+  mounts of CargoShip archives (`mount --cargoship`, or an index built with `index --cargoship`);
+  other mounts never decode zstd (#445).
+
+### Changed
+
+- Dependency updates: aws-sdk-go-v2 1.47.8, feature/s3/manager 1.23.22, service/ec2 1.344.2;
+  smithy-go 1.28.8. No behaviour change is intended.
+
 ## [1.18.2] - 2026-10-26
 
 ### Security
@@ -3923,7 +3938,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.2...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.3...HEAD
+[1.18.3]: https://github.com/scttfrdmn/lith/compare/v1.18.2...v1.18.3
 [1.18.2]: https://github.com/scttfrdmn/lith/compare/v1.18.1...v1.18.2
 [1.18.1]: https://github.com/scttfrdmn/lith/compare/v1.18.0...v1.18.1
 [1.18.0]: https://github.com/scttfrdmn/lith/compare/v1.17.1...v1.18.0
