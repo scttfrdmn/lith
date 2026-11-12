@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.4] - 2026-11-12
+
 ### Added
 
 - **A `memory footprint` line at every start** ([#452](https://github.com/scttfrdmn/lith/issues/452)):
@@ -3970,7 +3972,8 @@ Hardening and docs currency from an external review of v0.2.0. No new mechanisms
 - In-process fake S3 (ListObjectsV2/HeadObject/GetObject with Range) backing all
   unit tests, which run with the race detector and touch no network.
 
-[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.3...HEAD
+[Unreleased]: https://github.com/scttfrdmn/lith/compare/v1.18.4...HEAD
+[1.18.4]: https://github.com/scttfrdmn/lith/compare/v1.18.3...v1.18.4
 [1.18.3]: https://github.com/scttfrdmn/lith/compare/v1.18.2...v1.18.3
 [1.18.2]: https://github.com/scttfrdmn/lith/compare/v1.18.1...v1.18.2
 [1.18.1]: https://github.com/scttfrdmn/lith/compare/v1.18.0...v1.18.1
