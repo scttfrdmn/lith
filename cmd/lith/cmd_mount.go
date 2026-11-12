@@ -529,12 +529,19 @@ func runMount(ctx context.Context, f *mountFlags, bucket, prefix, mountpoint str
 		// and not only by this mount's own concurrency (#301).
 		"full_window_descriptors", fullAt,
 		"floor_at_descriptors", floorAt)
+	// The hint names who can ignore it. #301's cost was streaming readers held at the floor; a
+	// small tier chosen to share the box with many INDEXED REGION readers trips the same
+	// arithmetic and pays nothing for it -- a 3 GiB tier under 64 BAM region readers evicted
+	// nothing unread at 1.001x bytes, matching the EBS copy's wall clock (#452). A warning that
+	// fires on a working configuration with no way to tell teaches operators to ignore it.
 	if fullAt < 2 {
 		log.Warn("the prefetch budget cannot give two concurrent readers a full window",
 			"full_window_descriptors", fullAt,
 			"window_blocks", effW,
 			"prefetch_budget_bytes", bs.PrefetchBudgetBytes(),
-			"hint", "--prefetch-budget is the numerator of each reader's share; raise it, or lower --max-readahead")
+			"hint", "--prefetch-budget is the numerator of each reader's share; raise it, or lower --max-readahead. "+
+				"This costs whole-file STREAMING readers; readers doing indexed region reads do not need full "+
+				"windows, and a small tier for them has measured free (#452)")
 	}
 	if effW != f.maxReadahead {
 		log.Warn("readahead window reduced by a tighter bound",

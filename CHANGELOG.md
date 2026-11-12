@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `memory footprint` line at every start** ([#452](https://github.com/scttfrdmn/lith/issues/452)):
+  the resident memory to expect and what it rests on. With a memory limit in force that is the
+  limit, flagged as soft. Without one it is about twice `--mem-cache`, with a note that
+  `--memory-limit auto` engages only when the tier is at least half the memory budget, and the
+  budget is the whole box or cgroup. A packed DeepVariant job on a 123 GiB box ran lith beside
+  ~112 GiB of its own processes with a 12 GiB tier. No limit was set and the box was OOM-killed,
+  with nothing in lith's log saying it would take ~24 GiB. Measured with explicit caps, a 3–4 GiB
+  tier and a 6–7 GiB limit complete the same job with identical outputs, nothing evicted
+  unread, 1.001× bytes, and the EBS copy's wall clock. `docs/sizing.md` gains a section for
+  this shape.
+
+### Changed
+
+- **The startup warning that the prefetch budget "cannot give two concurrent readers a full
+  window" now says who it costs.** It fired on the #452 configuration above, which paid nothing
+  for it. Its hint now says that streaming readers pay for it, and that indexed region readers
+  do not need full windows.
+
 ## [1.18.3] - 2026-11-11
 
 ### Security

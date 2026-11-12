@@ -303,5 +303,42 @@ func applyMemoryLimit(log *slog.Logger, flag string, tier, budget int64) (int64,
 	if effective > 0 {
 		log.Info("memory limit", "bytes", effective, "budget", budget, "tier", tier, "source", source)
 	}
+	if projected, basis := projectedFootprint(tier, effective); projected > 0 {
+		log.Info("memory footprint", "projected_bytes", projected, "basis", basis,
+			"tier", tier, "limit", effective, "budget", budget)
+	}
 	return effective, nil
+}
+
+// projectedFootprint returns the resident memory this process should be expected to reach, and
+// what that figure rests on, or 0 when there is no tier to project from (#452).
+//
+// Logged on EVERY start, limit or not, because the case that needed it was the quiet one. A packed
+// DeepVariant job on a 123 GiB box ran lith beside ~112 GiB of its own processes. The budget was
+// the whole box, so a 12 GiB tier sat far under the point where `auto` engages, no limit was set,
+// the heap grew toward twice the tier, and the box died -- and nothing lith logged said that it
+// would take ~24 GiB. Learning that `auto` was off took a metrics scrape.
+//
+// Info, not a warning: the uncapped projection is the normal state of every default mount, and
+// lith cannot see what else on the host needs the memory. The operator can, so the line says
+// what to set.
+//
+// Both figures are measured, not derived. Uncapped: next_gc at 2.03x the tier in #314's three
+// arms, and a VmHWM of 49.2 GiB for a 24 GiB tier in #452. Capped: VmHWM at the limit to within
+// 1.5% at 6 and 7 GiB -- but 6.29 GiB against a 5 GiB limit, because a soft limit is a target
+// for the collector and not a cap, so the basis says so rather than promising the limit.
+func projectedFootprint(tier, limit int64) (int64, string) {
+	if tier <= 0 {
+		return 0, ""
+	}
+	if limit > 0 {
+		return limit, "the soft memory limit: the collector works to stay under it, but it is " +
+			"not a cap, and resident memory has measured above it on a tight limit (6.29 GiB " +
+			"against 5 GiB, #452). Leave headroom on the host beyond it"
+	}
+	return 2 * tier, "about twice the tier: no memory limit is in force, and the collector " +
+		"grows the heap to ~2x the live set (measured 2.03x, #314). --memory-limit auto " +
+		"engages only when the tier is at least half the memory budget, and the budget is the " +
+		"whole box or cgroup, not what other processes leave free. On a box shared with a " +
+		"memory-heavy job, set --memory-limit to what the host can spare (#452)"
 }
