@@ -144,8 +144,9 @@ every mount explicitly; on a 768 GB compute node the default would reserve 192 G
 
 Nothing is wrong with 25 % for a single mount. **If you run more than one on a host, set
 `--mem-cache` explicitly so the mounts sum to a sane fraction** — and remember it bounds the
-*tier*, not the process: the footprint is the tier plus outstanding prefetch
-([#314](https://github.com/scttfrdmn/lith/issues/314)), so leave headroom for both. There is
+*tier*, not the process: each mount's footprint is about twice its tier, or its
+`--memory-limit` when one is set ([#314](https://github.com/scttfrdmn/lith/issues/314),
+[#452](https://github.com/scttfrdmn/lith/issues/452)), so leave headroom for that. There is
 no cross-daemon awareness; each mount sizes itself in ignorance of the others.
 
 ### Concurrency under high GETATTR rate (fixed, [#244](https://github.com/scttfrdmn/lith/issues/244))

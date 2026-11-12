@@ -47,9 +47,9 @@ instead of another GET.
 
 !!! warning "`--mem-cache` is the tier, not the process footprint"
 
-    In-flight prefetch is not charged against the cache it is about to land in, so resident memory is the tier **plus** the outstanding burst. Measured additive to 0.2%: a mount asked for a 20 GB tier on a 33.0 GB box and the kernel killed it at 30.56 GB RSS (20 + 13.078 = 33.08 GB against a 33.02 GB `MemTotal`). At stock defaults on that same box the footprint is 8.256 + 13.078 = **21.3 GB** for a flag that reads 8.256.
+    The tier is live Go heap, and at the default `GOGC=100` the collector grows the heap to about **twice** the live set. So with no memory limit in force, budget **~2 × `--mem-cache`** for the process. Measured: `next_gc` at **2.03 × the tier**, with RSS within 1% of it, in three arms whose outstanding prefetch varied 3×. RSS stayed flat across all three, so outstanding prefetch is **not** added on top ([#314](https://github.com/scttfrdmn/lith/issues/314)). Independently, a 24 GiB tier reached a peak RSS of 49.2 GiB ([#452](https://github.com/scttfrdmn/lith/issues/452)). A 20 GB tier on a 33 GB box was OOM-killed at 30.56 GB on its way toward ~40 GB.
 
-    The burst is bounded by `concurrent readers × --max-readahead × --block-size`, and because `--max-readahead` derives from the NIC while the tier derives from RAM, it grows with the link rather than with the memory available to hold it. Budget for both, or lower `--max-readahead` ([#314](https://github.com/scttfrdmn/lith/issues/314), [#313](https://github.com/scttfrdmn/lith/issues/313)).
+    With `--memory-limit` in force, the footprint is about the limit instead. It is a soft target for the collector, not a cap: measured at the limit to within 1.5% at 6 and 7 GiB, and 6.29 GiB against a 5 GiB limit. Every start logs a `memory footprint` line with the projected figure and what it rests on. `lith_prefetch_committed_bytes` is **not** a memory figure: it counts from dispatch and keeps counting a chunk after it lands in the tier.
 
 **Sizing `--mem-cache`: budget ~2.5× your distinct working set, not 1×.** The memory tier is
 **64 independently-evicting shards**, with a chunk assigned by a hash of its key — so capacity
