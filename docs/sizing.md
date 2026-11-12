@@ -39,6 +39,40 @@ un-demanded (`--prefetch-budget`). Two consequences:
     because every read missed the cache and refetched. Warm reuse needs
     **RAM ≥ working set**; plan for it or expect cold economics on every pass.
 
+## Sharing the box with a memory-heavy job
+
+lith sizes itself from the **whole box** (or its cgroup), not from what your job leaves free.
+Uncapped, its footprint is about **twice `--mem-cache`**, because the tier is Go heap and the
+collector targets ~2× the live set. `--memory-limit auto` engages only when the tier is at least
+half the budget, so on a large box running a large job it stays off. Every start logs a
+`memory footprint` line with the projected figure and what it rests on.
+
+When the job itself uses most of the RAM, **cap lith explicitly**: a small `--mem-cache`, and
+`--memory-limit` set to what the host can spare. The limit is soft, so leave headroom beyond it.
+
+Measured ([#452](https://github.com/scttfrdmn/lith/issues/452)): DeepVariant packed three genomes
+deep on a `c8a.16xlarge` (123 GiB). Sixty-four make_examples processes do indexed region reads of
+one 32 GB BAM through lith while earlier genomes' call_variants run, and the job itself peaks at
+~112 GiB.
+
+| lith cap (`--mem-cache` / `--memory-limit`) | Outcome | lith peak RSS | min MemAvailable | S3 bytes vs distinct | Box wall, 3 genomes |
+|---|---|---|---|---|---|
+| 12 GiB / none | OOM when genome 3 started, twice | — | ~1.9 GiB before the kill | — | — |
+| 3 GiB / 6 GiB, 2 reps | all done, gVCFs identical | 6.0 GiB | 5.3–5.7 GiB | 1.001× | 2,689 s, 3,216 s |
+| 4 GiB / 7 GiB, 2 reps | all done, gVCFs identical | 7.0–7.1 GiB | 4.7 GiB | 1.0014× | 2,678 s, 2,682 s |
+| BAM copied to EBS, no lith | all done | — | 11.7 GiB | — | 2,723 s |
+
+The small tier cost nothing measurable: nothing was evicted unread, and make_examples matched
+the EBS copy within run-to-run noise (the slower 3 GiB rep was ~20% slower on all three genomes,
+on a different box). Region readers consume prefetch promptly, so they need the prefetch window,
+not a large cache. With a limit in force, peak RSS sat at the limit at 6 and 7 GiB, but reached
+**6.29 GiB against a 5 GiB limit**.
+
+**For many region readers of one BGZF object**, a few GiB of tier is enough. Set `--memory-limit`
+to what the host can spare, and keep the job's own peak plus that limit plus ~1 GiB under RAM. A
+streaming or re-reading workload is different: size its tier from the working set
+([`--mem-cache` in the knobs reference](knobs.md)).
+
 ## lith's own CPU cost is small
 
 Serving bytes costs lith about **1.3 CPU-seconds per GB**, roughly constant

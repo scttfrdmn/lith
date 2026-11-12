@@ -294,3 +294,19 @@ func TestDefaultTierIsSizedFromTheBudget(t *testing.T) {
 		t.Fatal("no defaultMemCacheBytes in cachecheck.go; this check is broken, not the code")
 	}
 }
+
+// #452: the footprint line projects from what is in force, and its two cases are the two
+// measurements -- ~2x the tier with no limit, the limit with one.
+func TestProjectedFootprint(t *testing.T) {
+	const gib = int64(1) << 30
+	if p, basis := projectedFootprint(12*gib, 0); p != 24*gib || !strings.Contains(basis, "--memory-limit") {
+		t.Errorf("uncapped 12 GiB tier projected %d (%q), want 24 GiB and a hint naming "+
+			"--memory-limit: this is the packed-job case, where nothing said lith would take ~24 GiB", p, basis)
+	}
+	if p, basis := projectedFootprint(3*gib, 6*gib); p != 6*gib || !strings.Contains(basis, "not a cap") {
+		t.Errorf("3 GiB tier under a 6 GiB limit projected %d (%q), want the limit, said to be soft", p, basis)
+	}
+	if p, _ := projectedFootprint(0, 6*gib); p != 0 {
+		t.Errorf("no tier projected %d, want 0 (nothing to log)", p)
+	}
+}
