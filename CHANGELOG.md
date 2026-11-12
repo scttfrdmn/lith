@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Two pages still described the footprint as the tier plus outstanding prefetch**
+  ([#455](https://github.com/scttfrdmn/lith/issues/455)), a model refuted by #392's measurement:
+  RSS stayed flat while outstanding prefetch varied 3×. The `docs/knobs.md` warning box and
+  `docs/serving-a-cluster.md` now say what was measured. The footprint is about 2× the tier with
+  no limit, or about the (soft) limit with one. The box had told operators to budget against
+  `--max-readahead`, which does not set the footprint.
+
 - **The startup warning that the prefetch budget "cannot give two concurrent readers a full
   window" now says who it costs.** It fired on the #452 configuration above, which paid nothing
   for it. Its hint now says that streaming readers pay for it, and that indexed region readers
